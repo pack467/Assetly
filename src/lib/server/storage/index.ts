@@ -1,2 +1,109 @@
-// Modul penyimpanan foto privat S3/MinIO & signed URL (Bagian 9 & 12 PROJECT_SPEC.md).
-export {};
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { getAccessSecret } from '$lib/server/auth/tokens';
+import { AppError } from '$lib/shared/errors';
+
+export const MAX_EVIDENCE_BYTES = 5 * 1024 * 1024; // 5 MB (Bagian 9.1)
+export const SIGNED_URL_TTL_SEC = 5 * 60; // 5 menit (Bagian 12)
+
+const STORAGE_ROOT = resolve(process.cwd(), '.storage', 'evidence');
+
+/**
+ * Validasi bahwa buffer benar-benar berkas JPEG (magic bytes FF D8 FF) dan <= 5 MB (Bagian 9.1 & 12).
+ */
+export function validateJpegBuffer(buffer: Buffer, mimeType?: string | null): void {
+	if (!buffer || buffer.byteLength === 0) {
+		throw new AppError('VALIDATION_ERROR', 'Berkas foto bukti tidak boleh kosong.');
+	}
+
+	if (buffer.byteLength > MAX_EVIDENCE_BYTES) {
+		throw new AppError(
+			'VALIDATION_ERROR',
+			`Ukuran foto bukti melebihi batas maksimum 5 MB (${buffer.byteLength} byte).`
+		);
+	}
+
+	if (mimeType && !['image/jpeg', 'image/jpg'].includes(mimeType.toLowerCase())) {
+		throw new AppError(
+			'VALIDATION_ERROR',
+			'Format berkas foto tidak didukung. Hanya JPEG yang diizinkan.'
+		);
+	}
+
+	// Cek magic bytes JPEG: 0xFF 0xD8 0xFF
+	if (buffer.byteLength < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8 || buffer[2] !== 0xff) {
+		throw new AppError(
+			'VALIDATION_ERROR',
+			'Berkas bukan gambar JPEG yang sah (magic bytes tidak cocok).'
+		);
+	}
+}
+
+export function generateEvidenceImageKey(purpose: string): string {
+	const datePrefix = new Date().toISOString().slice(0, 10);
+	return `${purpose.toLowerCase()}/${datePrefix}/${randomUUID()}.jpg`;
+}
+
+export function savePrivateEvidenceFile(imageKey: string, buffer: Buffer): void {
+	const safeRelPath = imageKey.replace(/\.\./g, '').replace(/^\/+/, '');
+	const fullPath = resolve(STORAGE_ROOT, safeRelPath);
+	if (!fullPath.startsWith(STORAGE_ROOT)) {
+		throw new AppError('VALIDATION_ERROR', 'Kunci objek foto tidak sah.');
+	}
+	mkdirSync(dirname(fullPath), { recursive: true });
+	writeFileSync(fullPath, buffer);
+}
+
+export function readPrivateEvidenceFile(imageKey: string): Buffer {
+	const safeRelPath = imageKey.replace(/\.\./g, '').replace(/^\/+/, '');
+	const fullPath = resolve(STORAGE_ROOT, safeRelPath);
+	if (!fullPath.startsWith(STORAGE_ROOT) || !existsSync(fullPath)) {
+		throw new AppError('NOT_FOUND', 'Berkas foto bukti tidak ditemukan di storage privat.');
+	}
+	return readFileSync(fullPath);
+}
+
+function computeSignature(evidenceId: string, imageKey: string, expiresEpochSec: number): string {
+	const secret = getAccessSecret();
+	return createHmac('sha256', secret)
+		.update(`${evidenceId}:${imageKey}:${expiresEpochSec}`)
+		.digest('hex');
+}
+
+export function createEvidenceSignedUrl(
+	evidenceId: string,
+	imageKey: string,
+	ttlSec = SIGNED_URL_TTL_SEC
+): { url: string; expiresAt: string } {
+	const expiresEpochSec = Math.floor(Date.now() / 1000) + ttlSec;
+	const sig = computeSignature(evidenceId, imageKey, expiresEpochSec);
+	return {
+		url: `/api/v1/evidence/${evidenceId}/file?expires=${expiresEpochSec}&sig=${sig}`,
+		expiresAt: new Date(expiresEpochSec * 1000).toISOString()
+	};
+}
+
+export function verifyEvidenceSignedUrl(params: {
+	evidenceId: string;
+	imageKey: string;
+	expiresParam: string | null;
+	sigParam: string | null;
+	nowEpochSec?: number;
+}): boolean {
+	if (!params.expiresParam || !params.sigParam) return false;
+	const expiresEpochSec = parseInt(params.expiresParam, 10);
+	if (Number.isNaN(expiresEpochSec)) return false;
+
+	const nowSec = params.nowEpochSec ?? Math.floor(Date.now() / 1000);
+	if (nowSec > expiresEpochSec) {
+		return false;
+	}
+
+	const expectedSig = computeSignature(params.evidenceId, params.imageKey, expiresEpochSec);
+	const expectedBuf = Buffer.from(expectedSig, 'utf8');
+	const actualBuf = Buffer.from(params.sigParam, 'utf8');
+	if (expectedBuf.length !== actualBuf.length) return false;
+
+	return timingSafeEqual(expectedBuf, actualBuf);
+}

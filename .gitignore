@@ -1,8 +1,9 @@
 # Dependencies
 node_modules/
 
-# Local PostgreSQL data cluster
+# Local PostgreSQL data cluster & private evidence storage
 .pgdata/
+.storage/
 
 # Build & framework output
 .svelte-kit/

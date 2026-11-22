@@ -21,3 +21,11 @@ Dokumen ini mencatat penyesuaian teknis terhadap lingkungan pengembangan atau pe
 
 - **Konteks:** Contoh `.env.example` pada Bagian 16.4 mencantumkan `JWT_REFRESH_SECRET=`, sedangkan Bagian 5.1 (`Session.refreshTokenHash`) dan Bagian 12 menetapkan bahwa refresh token disimpan sebagai hash di tabel `Session` dan dapat dicabut.
 - **Keputusan:** Refresh token diimplementasikan sebagai _opaque token_ acak kriptografis 48 byte (`randomBytes(48).toString('base64url')`) yang di-hash dengan SHA-256 (`refreshTokenHash`), bukan JWT. Oleh karena itu `JWT_REFRESH_SECRET` tidak diperlukan dan dihapus dari `.env.example` serta `docs/DEPLOY.md`.
+
+## 4. Storage Foto Privat Lokal Tanpa Docker di Windows (M2 Tahap 2A)
+
+- **Konteks:** Bagian 4.2, 9.1, dan 12 menetapkan bahwa foto bukti disimpan di storage privat (bukan URL publik), divalidasi hanya JPEG (maks 5 MB), dan ditampilkan melalui _signed URL_ berumur pendek (5 menit).
+- **Kondisi Lingkungan Host:** Pada mesin Windows pengembangan tanpa Docker, menjalankan container MinIO belum dapat dilakukan langsung.
+- **Solusi & Mitigasi:**
+  1. Modul `src/lib/server/storage/index.ts` menyimpan berkas JPEG tervalidasi (cek magic bytes `FF D8 FF` dan ukuran `<= 5 MB`) di direktori privat `.storage/evidence/` (dikecualikan oleh `.gitignore` dan berada di luar folder statis web).
+  2. _Signed URL_ dibuat dengan tanda tangan kriptografis HMAC-SHA256 berumur 5 menit (`/api/v1/evidence/{id}/file?expires=...&sig=...`) dan diverifikasi dengan `timingSafeEqual`. Akses tanpa tanda tangan atau setelah kedaluwarsa ditolak dengan `403 FORBIDDEN`.

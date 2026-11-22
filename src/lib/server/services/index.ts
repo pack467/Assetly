@@ -3,3 +3,5 @@ export * from './categoryService';
 export * from './locationService';
 export * from './assetService';
 export * from './auditService';
+export * from './evidenceService';
+export * from './loanService';
