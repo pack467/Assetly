@@ -14,7 +14,7 @@ export interface WatermarkMetadata {
 }
 
 export interface Canvas2DWatermarkTarget {
-	fillStyle: string;
+	fillStyle: string | CanvasGradient | CanvasPattern;
 	font: string;
 	textBaseline?: string;
 	fillRect(x: number, y: number, w: number, h: number): void;

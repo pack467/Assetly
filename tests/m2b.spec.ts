@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
 	computeCompressedDimensions,
@@ -9,6 +9,8 @@ import {
 	formatWatermarkLines,
 	type Canvas2DWatermarkTarget
 } from '../src/lib/shared/mobile/watermark';
+import { createMobileApiClient } from '../src/lib/client/api';
+import { createMemoryTokenStorage } from '../src/lib/client/tokenStorage';
 import * as mobileLayoutConfig from '../src/routes/m/+layout';
 
 function collectFilesRecursive(dir: string): string[] {
@@ -25,16 +27,14 @@ function collectFilesRecursive(dir: string): string[] {
 	return results;
 }
 
-describe('M2 Tahap 2B: UI Mobile (/m/*), Watermark Canvas, Kompresi 1280px, GPS Fallback, & Pesan Error Awam', () => {
+describe('M2 Tahap 2B: UI Mobile (/m/*), Watermark Canvas, Kompresi 1280px, GPS Fallback, & Mobile API Client', () => {
 	describe('1. Kompresi Dimensi Gambar <= 1280 px (Bagian 9.1)', () => {
 		it('mengecilkan gambar landscape dan portrait agar sisi terpanjang tepat 1280 px dengan rasio aspek terjaga', () => {
-			// Landscape 4000 x 3000 -> 1280 x 960
 			expect(computeCompressedDimensions(4000, 3000, 1280)).toEqual({
 				width: 1280,
 				height: 960
 			});
 
-			// Portrait 2160 x 3840 -> 720 x 1280
 			expect(computeCompressedDimensions(2160, 3840, 1280)).toEqual({
 				width: 720,
 				height: 1280
@@ -192,8 +192,8 @@ describe('M2 Tahap 2B: UI Mobile (/m/*), Watermark Canvas, Kompresi 1280px, GPS 
 		});
 	});
 
-	describe('4. Kepatuhan Arsitektur SPA Mobile (/m/* — Bagian 4.4)', () => {
-		it('menjalankan /m/* dengan ssr = false dan tanpa file +page.server.ts atau +layout.server.ts', () => {
+	describe('4. Kepatuhan Arsitektur SPA Mobile (/m/*) & Tidak Ada fetch() Langsung', () => {
+		it('menjalankan /m/* dengan ssr = false, tanpa +page.server.ts, dan semua request memakai mobileApi', () => {
 			expect(mobileLayoutConfig.ssr).toBe(false);
 
 			const mobileRoutesDir = resolve(process.cwd(), 'src/routes/m');
@@ -202,6 +202,199 @@ describe('M2 Tahap 2B: UI Mobile (/m/*), Watermark Canvas, Kompresi 1280px, GPS 
 				(f) => f.endsWith('+page.server.ts') || f.endsWith('+layout.server.ts')
 			);
 			expect(serverFiles).toEqual([]);
+
+			// Pastikan tidak ada pemanggilan fetch( langsung di seluruh file di bawah src/routes/m/
+			for (const filePath of allMobileFiles) {
+				const content = readFileSync(filePath, 'utf8');
+				expect(content).not.toMatch(/\bfetch\s*\(/);
+			}
+		});
+	});
+
+	describe('5. Manajemen Sesi & Klien API Terpusat (src/lib/client/api.ts)', () => {
+		it('otomatis memanggil /api/v1/auth/refresh satu kali saat menerima 401, lalu mengulang request asli dengan Bearer token baru', async () => {
+			const storage = createMemoryTokenStorage({
+				accessToken: 'expired-access-token',
+				refreshToken: 'valid-refresh-token-1'
+			});
+
+			const calls: Array<{ url: string; authHeader: string | null }> = [];
+			let unauthorizedCount = 0;
+
+			const mockFetch: typeof fetch = async (input, init) => {
+				const url = String(input);
+				const headers = new Headers(init?.headers ?? {});
+				const authHeader = headers.get('authorization');
+				calls.push({ url, authHeader });
+
+				if (url === 'https://api.itam.test/api/v1/auth/refresh') {
+					const body = JSON.parse(String(init?.body ?? '{}'));
+					expect(body.refreshToken).toBe('valid-refresh-token-1');
+					return new Response(
+						JSON.stringify({
+							accessToken: 'fresh-access-token-2',
+							refreshToken: 'fresh-refresh-token-2'
+						}),
+						{ status: 200, headers: { 'content-type': 'application/json' } }
+					);
+				}
+
+				if (authHeader === 'Bearer expired-access-token') {
+					return new Response(
+						JSON.stringify({ error: { code: 'UNAUTHENTICATED', message: 'Expired' } }),
+						{ status: 401, headers: { 'content-type': 'application/json' } }
+					);
+				}
+
+				if (authHeader === 'Bearer fresh-access-token-2') {
+					return new Response(JSON.stringify({ ok: true, data: 'loan-saved' }), {
+						status: 201,
+						headers: { 'content-type': 'application/json' }
+					});
+				}
+
+				return new Response('Unexpected', { status: 500 });
+			};
+
+			const client = createMobileApiClient({
+				baseUrl: 'https://api.itam.test',
+				fetchFn: mockFetch,
+				storage,
+				onUnauthorized: () => {
+					unauthorizedCount += 1;
+				}
+			});
+
+			const res = await client.post('/api/v1/loans', { purpose: 'Seminar' });
+			expect(res.status).toBe(201);
+			const body = await res.json();
+			expect(body.data).toBe('loan-saved');
+			expect(unauthorizedCount).toBe(0);
+
+			// Urutan panggilan: 1) POST /loans (401) -> 2) POST /auth/refresh (200) -> 3) POST /loans retry (201)
+			expect(calls).toHaveLength(3);
+			expect(calls[0]).toEqual({
+				url: 'https://api.itam.test/api/v1/loans',
+				authHeader: 'Bearer expired-access-token'
+			});
+			expect(calls[1].url).toBe('https://api.itam.test/api/v1/auth/refresh');
+			expect(calls[2]).toEqual({
+				url: 'https://api.itam.test/api/v1/loans',
+				authHeader: 'Bearer fresh-access-token-2'
+			});
+
+			// Token baru tersimpan di storage
+			const stored = await storage.getTokens();
+			expect(stored).toEqual({
+				accessToken: 'fresh-access-token-2',
+				refreshToken: 'fresh-refresh-token-2'
+			});
+		});
+
+		it('hanya memicu tepat SATU refresh (single-flight) ketika banyak request paralel terkena 401 bersamaan', async () => {
+			const storage = createMemoryTokenStorage({
+				accessToken: 'expired-token-parallel',
+				refreshToken: 'refresh-token-parallel-1'
+			});
+
+			let refreshCallCount = 0;
+
+			const mockFetch: typeof fetch = async (input, init) => {
+				const url = String(input);
+				const headers = new Headers(init?.headers ?? {});
+				const auth = headers.get('authorization');
+
+				if (url.endsWith('/api/v1/auth/refresh')) {
+					refreshCallCount += 1;
+					await new Promise((r) => setTimeout(r, 30));
+					return new Response(
+						JSON.stringify({
+							accessToken: 'new-parallel-access-token',
+							refreshToken: 'new-parallel-refresh-token'
+						}),
+						{ status: 200, headers: { 'content-type': 'application/json' } }
+					);
+				}
+
+				if (auth === 'Bearer expired-token-parallel') {
+					return new Response(JSON.stringify({ error: { code: 'UNAUTHENTICATED' } }), {
+						status: 401
+					});
+				}
+
+				if (auth === 'Bearer new-parallel-access-token') {
+					return new Response(JSON.stringify({ url, status: 'ok' }), { status: 200 });
+				}
+
+				return new Response('Unexpected', { status: 500 });
+			};
+
+			const client = createMobileApiClient({
+				baseUrl: 'http://localhost:5173',
+				fetchFn: mockFetch,
+				storage
+			});
+
+			// Jalankan 5 request secara paralel yang semuanya gagal 401 pada percobaan pertama
+			const responses = await Promise.all([
+				client.get('/api/v1/assets/by-code/AST-0001'),
+				client.get('/api/v1/locations?onlyActive=true'),
+				client.get('/api/v1/auth/me'),
+				client.get('/api/v1/loans?pageSize=20'),
+				client.get('/api/v1/categories')
+			]);
+
+			for (const res of responses) {
+				expect(res.status).toBe(200);
+			}
+
+			// Meskipun ada 5 request paralel yang kena 401, endpoint /api/v1/auth/refresh wajib hanya dipanggil 1 kali
+			expect(refreshCallCount).toBe(1);
+		});
+
+		it('menghapus token dan memicu redirect/callback ke login saat refresh gagal (401)', async () => {
+			const storage = createMemoryTokenStorage({
+				accessToken: 'expired-access-token',
+				refreshToken: 'revoked-refresh-token'
+			});
+
+			let redirectedToLogin = false;
+			let refreshCalls = 0;
+
+			const mockFetch: typeof fetch = async (input) => {
+				const url = String(input);
+				if (url.endsWith('/api/v1/auth/refresh')) {
+					refreshCalls += 1;
+					return new Response(
+						JSON.stringify({
+							error: { code: 'UNAUTHENTICATED', message: 'Sesi telah dicabut.' }
+						}),
+						{ status: 401, headers: { 'content-type': 'application/json' } }
+					);
+				}
+
+				return new Response(
+					JSON.stringify({
+						error: { code: 'UNAUTHENTICATED', message: 'Token expired.' }
+					}),
+					{ status: 401, headers: { 'content-type': 'application/json' } }
+				);
+			};
+
+			const client = createMobileApiClient({
+				baseUrl: 'http://localhost:5173',
+				fetchFn: mockFetch,
+				storage,
+				onUnauthorized: () => {
+					redirectedToLogin = true;
+				}
+			});
+
+			const res = await client.get('/api/v1/loans');
+			expect(res.status).toBe(401);
+			expect(refreshCalls).toBe(1);
+			expect(redirectedToLogin).toBe(true);
+			expect(await storage.getTokens()).toBeNull();
 		});
 	});
 });

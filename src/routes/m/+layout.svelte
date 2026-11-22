@@ -1,6 +1,9 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { mobileApi, onMobileUnauthorized } from '$lib/client/api';
+	import { getTokenStorage } from '$lib/client/tokenStorage';
 	import { RoleLabels } from '$lib/shared/enums';
 	import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
 
@@ -24,10 +27,18 @@
 	let submitting = $state(false);
 	let isOnline = $state(true);
 
+	let unsubscribeUnauthorized: (() => void) | null = null;
+	let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
+
 	async function checkSession() {
 		loadingAuth = true;
 		try {
-			const res = await fetch('/api/v1/auth/me');
+			const stored = await getTokenStorage().getTokens();
+			if (!stored?.accessToken && !stored?.refreshToken) {
+				currentUser = null;
+				return;
+			}
+			const res = await mobileApi.get('/api/v1/auth/me');
 			if (res.ok) {
 				const data = await res.json();
 				currentUser = data.user;
@@ -46,14 +57,10 @@
 		loginError = '';
 		submitting = true;
 		try {
-			const res = await fetch('/api/v1/auth/login', {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({
-					email: email.trim(),
-					password,
-					...(totpCode.trim() ? { totpCode: totpCode.trim() } : {})
-				})
+			const res = await mobileApi.login({
+				email: email.trim(),
+				password,
+				...(totpCode.trim() ? { totpCode: totpCode.trim() } : {})
 			});
 			const data = await res.json();
 			if (!res.ok) {
@@ -78,7 +85,7 @@
 	}
 
 	async function handleLogout() {
-		await fetch('/api/v1/auth/logout', { method: 'POST' });
+		await mobileApi.logout();
 		currentUser = null;
 	}
 
@@ -88,11 +95,42 @@
 		const onOffline = () => (isOnline = false);
 		window.addEventListener('online', onOnline);
 		window.addEventListener('offline', onOffline);
+
+		unsubscribeUnauthorized = onMobileUnauthorized(() => {
+			currentUser = null;
+			loginError = 'Sesi Anda telah berakhir. Silakan masuk kembali.';
+			if (page.url.pathname !== '/m') {
+				goto('/m').catch(() => {});
+			}
+		});
+
+		// Perbarui access token secara proaktif tiap 12 menit agar sesi tidak habis di tengah pengisian form (TTL token 15 menit)
+		keepAliveInterval = setInterval(
+			() => {
+				if (currentUser && navigator.onLine) {
+					mobileApi.refreshSession().catch(() => {});
+				}
+			},
+			12 * 60 * 1000
+		);
+
 		checkSession();
+
 		return () => {
 			window.removeEventListener('online', onOnline);
 			window.removeEventListener('offline', onOffline);
 		};
+	});
+
+	onDestroy(() => {
+		if (unsubscribeUnauthorized) {
+			unsubscribeUnauthorized();
+			unsubscribeUnauthorized = null;
+		}
+		if (keepAliveInterval) {
+			clearInterval(keepAliveInterval);
+			keepAliveInterval = null;
+		}
 	});
 
 	const tabs = [

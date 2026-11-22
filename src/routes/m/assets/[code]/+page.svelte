@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { page } from '$app/state';
+	import { mobileApi } from '$lib/client/api';
 	import { AssetStatusLabels, type AssetStatusKey } from '$lib/shared/enums';
 	import {
 		computeCompressedDimensions,
@@ -146,11 +147,11 @@
 		loading = true;
 		errorMsg = '';
 		try {
-			const codeParam = page.params.code;
+			const codeParam = page.params.code ?? '';
 			const [assetRes, locRes, meRes] = await Promise.all([
-				fetch(`/api/v1/assets/by-code/${encodeURIComponent(codeParam)}`),
-				fetch('/api/v1/locations?onlyActive=true'),
-				fetch('/api/v1/auth/me')
+				mobileApi.get(`/api/v1/assets/by-code/${encodeURIComponent(codeParam)}`),
+				mobileApi.get('/api/v1/locations?onlyActive=true'),
+				mobileApi.get('/api/v1/auth/me')
 			]);
 
 			if (meRes.ok) {
@@ -317,23 +318,19 @@
 
 		submitting = true;
 		try {
-			// 1. Unggah Evidence CHECKOUT
-			const evRes = await fetch('/api/v1/evidence', {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({
-					purpose: 'CHECKOUT',
-					captureSource: 'CAMERA',
-					takenAtDevice: capturedTakenAt,
-					gpsAvailable,
-					latitude: gpsAvailable ? latitude : null,
-					longitude: gpsAvailable ? longitude : null,
-					accuracyM: gpsAvailable ? accuracyM : null,
-					isMockLocation: false,
-					locationId: selectedLocationId || null,
-					imageBase64: capturedDataUrl,
-					mimeType: 'image/jpeg'
-				})
+			// 1. Unggah Evidence CHECKOUT melalui mobileApi (otomatis refresh bila token kedaluwarsa di tengah pengisian form)
+			const evRes = await mobileApi.post('/api/v1/evidence', {
+				purpose: 'CHECKOUT',
+				captureSource: 'CAMERA',
+				takenAtDevice: capturedTakenAt,
+				gpsAvailable,
+				latitude: gpsAvailable ? latitude : null,
+				longitude: gpsAvailable ? longitude : null,
+				accuracyM: gpsAvailable ? accuracyM : null,
+				isMockLocation: false,
+				locationId: selectedLocationId || null,
+				imageBase64: capturedDataUrl,
+				mimeType: 'image/jpeg'
 			});
 			const evData = await evRes.json();
 			if (!evRes.ok) {
@@ -342,22 +339,18 @@
 			}
 
 			// 2. Buat Peminjaman
-			const loanRes = await fetch('/api/v1/loans', {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({
-					purpose: purposeChoice,
-					purposeNote: purposeNote.trim() || null,
-					expectedReturnAt: new Date(expectedReturnDate).toISOString(),
-					clientOpId: crypto.randomUUID(),
-					items: [
-						{
-							assetId: scanData.asset.id,
-							checkoutEvidenceId: evData.evidence.id,
-							accessoryChecks: borrowChecks
-						}
-					]
-				})
+			const loanRes = await mobileApi.post('/api/v1/loans', {
+				purpose: purposeChoice,
+				purposeNote: purposeNote.trim() || null,
+				expectedReturnAt: new Date(expectedReturnDate).toISOString(),
+				clientOpId: crypto.randomUUID(),
+				items: [
+					{
+						assetId: scanData.asset.id,
+						checkoutEvidenceId: evData.evidence.id,
+						accessoryChecks: borrowChecks
+					}
+				]
 			});
 			const loanData = await loanRes.json();
 			if (!loanRes.ok) {
@@ -402,23 +395,19 @@
 
 		submitting = true;
 		try {
-			// 1. Unggah Evidence RETURN
-			const evRes = await fetch('/api/v1/evidence', {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({
-					purpose: 'RETURN',
-					captureSource: 'CAMERA',
-					takenAtDevice: capturedTakenAt,
-					gpsAvailable,
-					latitude: gpsAvailable ? latitude : null,
-					longitude: gpsAvailable ? longitude : null,
-					accuracyM: gpsAvailable ? accuracyM : null,
-					isMockLocation: false,
-					locationId: selectedLocationId || null,
-					imageBase64: capturedDataUrl,
-					mimeType: 'image/jpeg'
-				})
+			// 1. Unggah Evidence RETURN melalui mobileApi (otomatis refresh bila token kedaluwarsa di tengah pengisian form)
+			const evRes = await mobileApi.post('/api/v1/evidence', {
+				purpose: 'RETURN',
+				captureSource: 'CAMERA',
+				takenAtDevice: capturedTakenAt,
+				gpsAvailable,
+				latitude: gpsAvailable ? latitude : null,
+				longitude: gpsAvailable ? longitude : null,
+				accuracyM: gpsAvailable ? accuracyM : null,
+				isMockLocation: false,
+				locationId: selectedLocationId || null,
+				imageBase64: capturedDataUrl,
+				mimeType: 'image/jpeg'
 			});
 			const evData = await evRes.json();
 			if (!evRes.ok) {
@@ -427,10 +416,9 @@
 			}
 
 			// 2. Proses Pengembalian
-			const retRes = await fetch(`/api/v1/loan-items/${scanData.activeLoanItem.id}/return`, {
-				method: 'POST',
-				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({
+			const retRes = await mobileApi.post(
+				`/api/v1/loan-items/${scanData.activeLoanItem.id}/return`,
+				{
 					returnCondition,
 					evidenceId: evData.evidence.id,
 					damageNote: returnCondition === 'DAMAGED' ? damageNote.trim() : null,
@@ -440,8 +428,8 @@
 						returnOk: c.returnOk
 					})),
 					clientOpId: crypto.randomUUID()
-				})
-			});
+				}
+			);
 			const retData = await retRes.json();
 			if (!retRes.ok) {
 				errorMsg = formatFriendlyErrorMessage(retData, 'Gagal memproses pengembalian barang.');

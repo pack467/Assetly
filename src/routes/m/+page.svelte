@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { mobileApi } from '$lib/client/api';
 	import { LoanStatusLabels } from '$lib/shared/enums';
 
 	interface ActiveLoanItem {
@@ -29,7 +30,7 @@
 	async function loadMyActiveLoans() {
 		loading = true;
 		try {
-			const res = await fetch('/api/v1/loans?pageSize=20');
+			const res = await mobileApi.get('/api/v1/loans?pageSize=20');
 			if (res.ok) {
 				const data = await res.json();
 				const all: LoanEntry[] = data.items ?? [];

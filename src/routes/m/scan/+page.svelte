@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { mobileApi } from '$lib/client/api';
 	import { AssetStatusLabels, type AssetStatusKey } from '$lib/shared/enums';
 	import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
 
@@ -28,7 +29,7 @@
 	async function loadQuickAssets() {
 		loadingAssets = true;
 		try {
-			const res = await fetch('/api/v1/assets?pageSize=20');
+			const res = await mobileApi.get('/api/v1/assets?pageSize=20');
 			if (res.ok) {
 				const data = await res.json();
 				quickAssets = data.items ?? [];
@@ -113,7 +114,7 @@
 		errorMsg = '';
 		try {
 			// 1. Coba cari sebagai qrToken terlebih dahulu
-			const resQr = await fetch(`/api/v1/assets/by-qr/${encodeURIComponent(rawValue)}`);
+			const resQr = await mobileApi.get(`/api/v1/assets/by-qr/${encodeURIComponent(rawValue)}`);
 			if (resQr.ok) {
 				const data = await resQr.json();
 				stopQrCamera();
@@ -122,7 +123,7 @@
 			}
 
 			// 2. Jalur cadangan: cari sebagai kode barang (mis. AST-0001) atau nomor seri
-			const resCode = await fetch(`/api/v1/assets/by-code/${encodeURIComponent(rawValue)}`);
+			const resCode = await mobileApi.get(`/api/v1/assets/by-code/${encodeURIComponent(rawValue)}`);
 			const dataCode = await resCode.json();
 			if (resCode.ok) {
 				stopQrCamera();
