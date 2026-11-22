@@ -239,6 +239,7 @@ export async function getAssetScanInfo(
 						where: { returnedAt: null },
 						take: 1,
 						include: {
+							accessoryChecks: true,
 							loan: {
 								include: {
 									borrower: { select: { id: true, name: true, email: true } }
@@ -263,6 +264,7 @@ export async function getAssetScanInfo(
 						where: { returnedAt: null },
 						take: 1,
 						include: {
+							accessoryChecks: true,
 							loan: {
 								include: {
 									borrower: { select: { id: true, name: true, email: true } }
@@ -308,7 +310,17 @@ export async function getAssetScanInfo(
 			activeLoanItem?.loan.borrowerId ?? null
 		),
 		currentHolder: activeLoanItem?.loan.borrower.name ?? null,
-		requiresApproval: asset.category.requiresApproval
+		requiresApproval: asset.category.requiresApproval,
+		activeLoanItem: activeLoanItem
+			? {
+					id: activeLoanItem.id,
+					loanId: activeLoanItem.loanId,
+					borrowerId: activeLoanItem.loan.borrowerId,
+					purpose: activeLoanItem.loan.purpose,
+					expectedReturnAt: activeLoanItem.loan.expectedReturnAt,
+					accessoryChecks: activeLoanItem.accessoryChecks
+				}
+			: null
 	};
 }
 
