@@ -1,0 +1,419 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import { prisma } from '../src/lib/server/db';
+import type { PolicyUser } from '../src/lib/server/policy';
+import {
+	createUser,
+	listUsers,
+	updateUser,
+	listUserSessions
+} from '../src/lib/server/services/userService';
+import {
+	createCategory,
+	listCategories,
+	updateCategory
+} from '../src/lib/server/services/categoryService';
+import {
+	createLocation,
+	listLocations,
+	updateLocation
+} from '../src/lib/server/services/locationService';
+import {
+	createAsset,
+	listAssets,
+	getAssetDetail,
+	getAssetScanInfo,
+	updateAsset,
+	changeAssetSpecialStatus,
+	reprintAssetQr,
+	importAssetsFromCsv
+} from '../src/lib/server/services/assetService';
+import { listAuditLogs } from '../src/lib/server/services/auditService';
+
+describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-19, & Otorisasi', () => {
+	let adminActor: PolicyUser;
+	let officerActor: PolicyUser;
+	let borrowerActor: PolicyUser;
+	let categoryId: string;
+	let categoryName: string;
+	let locationId: string;
+	let locationName: string;
+
+	beforeAll(async () => {
+		await prisma.$connect();
+		const suffix = randomUUID().slice(0, 8);
+
+		const seedAdmin = await prisma.user.create({
+			data: {
+				name: 'Seed Admin M1',
+				email: `m1-admin-${suffix}@example.com`,
+				passwordHash: 'hash',
+				role: 'ADMIN',
+				isActive: true
+			}
+		});
+		adminActor = { id: seedAdmin.id, role: 'ADMIN', isActive: true };
+
+		const seedOfficer = await prisma.user.create({
+			data: {
+				name: 'Seed Officer M1',
+				email: `m1-officer-${suffix}@example.com`,
+				passwordHash: 'hash',
+				role: 'OFFICER',
+				isActive: true
+			}
+		});
+		officerActor = { id: seedOfficer.id, role: 'OFFICER', isActive: true };
+
+		const seedBorrower = await prisma.user.create({
+			data: {
+				name: 'Seed Borrower M1',
+				email: `m1-borrower-${suffix}@example.com`,
+				passwordHash: 'hash',
+				role: 'BORROWER',
+				isActive: true
+			}
+		});
+		borrowerActor = { id: seedBorrower.id, role: 'BORROWER', isActive: true };
+	});
+
+	afterAll(async () => {
+		await prisma.$disconnect();
+	});
+
+	describe('1. Otorisasi Endpoint Admin (Non-Admin Ditolak di Semua Operasi Admin)', () => {
+		it('menolak OFFICER dan BORROWER pada pengelolaan user, kategori, lokasi, barang, impor CSV, cetak QR, dan audit log', async () => {
+			for (const nonAdmin of [officerActor, borrowerActor]) {
+				await expect(listUsers(nonAdmin)).rejects.toMatchObject({
+					code: 'FORBIDDEN',
+					status: 403
+				});
+
+				await expect(
+					createUser(nonAdmin, {
+						name: 'Illegal User',
+						email: 'illegal@example.com',
+						password: 'Password123!',
+						role: 'BORROWER',
+						isActive: true
+					})
+				).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 });
+
+				await expect(
+					createCategory(nonAdmin, {
+						name: 'Illegal Category',
+						requiresApproval: false
+					})
+				).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 });
+
+				await expect(
+					createLocation(nonAdmin, {
+						name: 'Illegal Location',
+						radiusM: 100,
+						isActive: true
+					})
+				).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 });
+
+				await expect(
+					createAsset(nonAdmin, {
+						name: 'Illegal Asset',
+						categoryId: randomUUID()
+					})
+				).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 });
+
+				await expect(
+					importAssetsFromCsv(nonAdmin, {
+						csvText: 'name,category\nA,B',
+						mode: 'preview'
+					})
+				).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 });
+
+				await expect(
+					reprintAssetQr(nonAdmin, randomUUID(), { rotateToken: false })
+				).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 });
+
+				await expect(
+					changeAssetSpecialStatus(nonAdmin, randomUUID(), {
+						status: 'LOST',
+						note: 'Tidak boleh'
+					})
+				).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 });
+
+				await expect(listAuditLogs(nonAdmin)).rejects.toMatchObject({
+					code: 'FORBIDDEN',
+					status: 403
+				});
+			}
+		});
+	});
+
+	describe('2. Master Kategori & Lokasi Resmi', () => {
+		it('Admin dapat membuat dan mengubah Kategori serta Lokasi Resmi, dan semua role dapat membacanya', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			categoryName = `Laptop Seminar ${suffix}`;
+			locationName = `Ruang Utama ${suffix}`;
+
+			const createdCat = await createCategory(adminActor, {
+				name: categoryName,
+				requiresApproval: true,
+				maintenanceIntervalDays: 180
+			});
+			categoryId = createdCat.category.id;
+			expect(createdCat.category.requiresApproval).toBe(true);
+
+			const updatedCat = await updateCategory(adminActor, categoryId, {
+				maintenanceIntervalDays: 90
+			});
+			expect(updatedCat.category.maintenanceIntervalDays).toBe(90);
+
+			const createdLoc = await createLocation(adminActor, {
+				name: locationName,
+				latitude: -6.201,
+				longitude: 106.816,
+				radiusM: 120,
+				isActive: true
+			});
+			locationId = createdLoc.location.id;
+			expect(createdLoc.location.radiusM).toBe(120);
+
+			const updatedLoc = await updateLocation(adminActor, locationId, {
+				radiusM: 150
+			});
+			expect(updatedLoc.location.radiusM).toBe(150);
+
+			// BORROWER dan OFFICER boleh membaca daftar kategori & lokasi
+			const catsForBorrower = await listCategories(borrowerActor);
+			expect(catsForBorrower.items.some((c) => c.id === categoryId)).toBe(true);
+
+			const locsForOfficer = await listLocations(officerActor);
+			expect(locsForOfficer.items.some((l) => l.id === locationId)).toBe(true);
+		});
+	});
+
+	describe('3. Kelola Pengguna, Setup TOTP Admin (BR-19), & Proteksi Nonaktif Pemegang Barang (BR-16)', () => {
+		it('Otomatis menyiapkan mfaSecret TOTP saat Admin baru dibuat (BR-19)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const res = await createUser(adminActor, {
+				name: 'Admin Baru TOTP',
+				email: `new-admin-${suffix}@example.com`,
+				password: 'StrongPassword!123',
+				role: 'ADMIN',
+				isActive: true
+			});
+
+			expect(res.user.hasTotp).toBe(true);
+			expect(res.totpSetup?.secret).toBeTruthy();
+			expect(res.totpSetup?.uri).toContain('otpauth://totp/');
+
+			const sessions = await listUserSessions(adminActor, res.user.id);
+			expect(Array.isArray(sessions.items)).toBe(true);
+		});
+
+		it('Menolak penonaktifan pengguna yang masih memegang barang aktif dengan USER_HOLDS_ASSETS (BR-16)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const holder = await createUser(adminActor, {
+				name: 'Pemegang Barang Aktif',
+				email: `holder-${suffix}@example.com`,
+				password: 'StrongPassword!123',
+				role: 'BORROWER',
+				isActive: true
+			});
+
+			const assetRes = await createAsset(adminActor, {
+				name: 'Proyektor Pinjaman Aktif',
+				categoryId
+			});
+
+			const loan = await prisma.loan.create({
+				data: {
+					borrowerId: holder.user.id,
+					createdById: adminActor.id,
+					purpose: 'Seminar',
+					expectedReturnAt: new Date(Date.now() + 86400_000),
+					status: 'ACTIVE'
+				}
+			});
+
+			const loanItem = await prisma.loanItem.create({
+				data: {
+					loanId: loan.id,
+					assetId: assetRes.asset.id,
+					returnedAt: null
+				}
+			});
+
+			// Percobaan menonaktifkan holder saat barang belum kembali wajib ditolak (BR-16)
+			await expect(
+				updateUser(adminActor, holder.user.id, { isActive: false })
+			).rejects.toMatchObject({
+				code: 'USER_HOLDS_ASSETS',
+				status: 409
+			});
+
+			// Setelah barang dikembalikan, user boleh dinonaktifkan
+			await prisma.loanItem.update({
+				where: { id: loanItem.id },
+				data: { returnedAt: new Date(), returnCondition: 'NORMAL' }
+			});
+
+			const deactivated = await updateUser(adminActor, holder.user.id, { isActive: false });
+			expect(deactivated.user.isActive).toBe(false);
+		});
+	});
+
+	describe('4. CRUD Barang, Kode & QR Token Acak (BR-23), Cetak Ulang QR (BR-24), & Status Khusus (BR-11)', () => {
+		let createdAssetId: string;
+		let createdAssetCode: string;
+		let createdQrToken: string;
+
+		it('Membuat barang dengan kode AST-xxxx, qrToken acak, dan kelengkapan AccessoryTemplate', async () => {
+			const res = await createAsset(adminActor, {
+				name: 'Laptop ThinkPad X1 Carbon',
+				categoryId,
+				homeLocationId: locationId,
+				serialNumber: `TP-X1-${randomUUID().slice(0, 6)}`,
+				notes: 'Unit seminar utama',
+				accessories: [
+					{ name: 'Charger USB-C 65W', quantity: 1 },
+					{ name: 'Tas Laptop', quantity: 1 }
+				]
+			});
+
+			createdAssetId = res.asset.id;
+			createdAssetCode = res.asset.code;
+			createdQrToken = res.asset.qrToken;
+
+			expect(createdAssetCode).toMatch(/^AST-\d{4,}$/);
+			expect(createdQrToken.length).toBeGreaterThanOrEqual(20);
+			expect(createdQrToken).not.toBe(createdAssetCode);
+			expect(res.asset.accessories).toHaveLength(2);
+		});
+
+		it('Mendukung pencarian via QR token, pencarian manual via kode, dan detail barang', async () => {
+			const byQr = await getAssetScanInfo(borrowerActor, { qrToken: createdQrToken });
+			expect(byQr.asset.id).toBe(createdAssetId);
+			expect(byQr.allowedActions).toContain('BORROW');
+			expect(byQr.requiresApproval).toBe(true);
+
+			const byCode = await getAssetScanInfo(officerActor, { code: createdAssetCode });
+			expect(byCode.asset.id).toBe(createdAssetId);
+
+			const detail = await getAssetDetail(adminActor, createdAssetId);
+			expect(detail.asset.qrSvg).toContain('<svg');
+
+			const listed = await listAssets(borrowerActor, { search: createdAssetCode });
+			expect(listed.items.some((a) => a.id === createdAssetId)).toBe(true);
+		});
+
+		it('Mengubah barang dengan optimistic locking dan mencetak ulang label QR beserta AuditLog (BR-24)', async () => {
+			const updated = await updateAsset(adminActor, createdAssetId, {
+				name: 'Laptop ThinkPad X1 Carbon Gen 11',
+				version: 0
+			});
+			expect(updated.asset.version).toBe(1);
+
+			// Versi usang harus ditolak (optimistic locking)
+			await expect(
+				updateAsset(adminActor, createdAssetId, {
+					name: 'Stale Update',
+					version: 0
+				})
+			).rejects.toMatchObject({ status: 409 });
+
+			// Cetak ulang QR tanpa rotasi token
+			const reprint1 = await reprintAssetQr(adminActor, createdAssetId, {
+				rotateToken: false,
+				reason: 'Label lecet'
+			});
+			expect(reprint1.qrSvg).toContain('<svg');
+			expect(reprint1.asset.qrToken).toBe(createdQrToken);
+
+			// Cetak ulang QR dengan rotasi token
+			const reprint2 = await reprintAssetQr(adminActor, createdAssetId, {
+				rotateToken: true,
+				reason: 'Label hilang'
+			});
+			expect(reprint2.asset.qrToken).not.toBe(createdQrToken);
+
+			// Pastikan tercatat di AuditLog
+			const logs = await listAuditLogs(adminActor, {
+				entityType: 'Asset',
+				entityId: createdAssetId,
+				action: 'ASSET_QR_REPRINTED'
+			});
+			expect(logs.items.length).toBeGreaterThanOrEqual(2);
+		});
+
+		it('Menegakkan aturan perubahan status khusus LOST / AVAILABLE / RETIRED (BR-11 & Bagian 5.3)', async () => {
+			// AVAILABLE -> LOST valid
+			const lostRes = await changeAssetSpecialStatus(adminActor, createdAssetId, {
+				status: 'LOST',
+				note: 'Tidak ditemukan saat pengecekan ruang seminar'
+			});
+			expect(lostRes.asset.status).toBe('LOST');
+
+			// LOST -> RETIRED tidak ada di tabel Bagian 5.3 -> wajib ditolak INVALID_STATUS_TRANSITION
+			await expect(
+				changeAssetSpecialStatus(adminActor, createdAssetId, {
+					status: 'RETIRED',
+					note: 'Langsung afkir dari hilang'
+				})
+			).rejects.toMatchObject({
+				code: 'INVALID_STATUS_TRANSITION',
+				status: 422
+			});
+
+			// LOST -> AVAILABLE (barang ditemukan) valid
+			const foundRes = await changeAssetSpecialStatus(adminActor, createdAssetId, {
+				status: 'AVAILABLE',
+				note: 'Barang ditemukan kembali di ruang panitia'
+			});
+			expect(foundRes.asset.status).toBe('AVAILABLE');
+		});
+	});
+
+	describe('5. Impor CSV dengan Pratinjau, Laporan Baris Gagal, & Idempotensi Nomor Seri (Bagian 18)', () => {
+		it('Menampilkan pratinjau dengan baris valid dan baris gagal, lalu menyimpan secara idempoten saat commit', async () => {
+			const sn1 = `CSV-SN-${randomUUID().slice(0, 8)}`;
+			const sn2 = `CSV-SN-${randomUUID().slice(0, 8)}`;
+
+			const csvText = [
+				'name,category,serialNumber,homeLocation,purchasedAt,notes',
+				`Kamera Sony Alpha,${categoryName},${sn1},${locationName},2026-01-15,Unit A`,
+				`Microphone Wireless,${categoryName},${sn2},${locationName},2026-02-01,Unit B`,
+				`Barang Kategori Salah,KategoriTidakAda,SN-ERR-1,${locationName},2026-02-01,Harus gagal`,
+				`A,${categoryName},SN-ERR-2,LokasiTidakAda,tanggal-salah,Banyak error`
+			].join('\n');
+
+			// 1. Pratinjau (tidak menulis ke database)
+			const preview = await importAssetsFromCsv(adminActor, {
+				csvText,
+				mode: 'preview'
+			});
+
+			expect(preview.mode).toBe('preview');
+			expect(preview.totalRows).toBe(4);
+			expect(preview.validCount).toBe(2);
+			expect(preview.failedCount).toBe(2);
+			expect(preview.errors).toHaveLength(2);
+			expect(preview.errors[0].rowNumber).toBe(4);
+			expect(preview.errors[1].rowNumber).toBe(5);
+
+			// 2. Commit pertama: membuat 2 barang valid
+			const commit1 = await importAssetsFromCsv(adminActor, {
+				csvText,
+				mode: 'commit'
+			});
+			expect(commit1.mode).toBe('commit');
+			expect(commit1.createdCount).toBe(2);
+
+			// 3. Commit kedua dengan CSV yang sama: idempoten berdasarkan serialNumber (0 dibuat, 2 dilewati)
+			const commit2 = await importAssetsFromCsv(adminActor, {
+				csvText,
+				mode: 'commit'
+			});
+			expect(commit2.createdCount).toBe(0);
+			expect(commit2.skippedDuplicateCount).toBe(2);
+		});
+	});
+});
