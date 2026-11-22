@@ -16,3 +16,8 @@ Dokumen ini mencatat penyesuaian teknis terhadap lingkungan pengembangan atau pe
 
 - **Konteks:** Bagian 5.1 menyebutkan bahwa blok `datasource db { provider = "postgresql" url = env("DATABASE_URL") }` mengikuti gaya Prisma yang umum.
 - **Keputusan:** Proyek menggunakan **Prisma v6 (`^6.6.0`)** agar `prisma/schema.prisma` tetap 100% kompatibel dengan skema pada Bagian 5.1 tanpa memerlukan perubahan struktur konfigurasi baru pada Prisma 7.
+
+## 3. Penghapusan `JWT_REFRESH_SECRET` dari `.env.example`
+
+- **Konteks:** Contoh `.env.example` pada Bagian 16.4 mencantumkan `JWT_REFRESH_SECRET=`, sedangkan Bagian 5.1 (`Session.refreshTokenHash`) dan Bagian 12 menetapkan bahwa refresh token disimpan sebagai hash di tabel `Session` dan dapat dicabut.
+- **Keputusan:** Refresh token diimplementasikan sebagai _opaque token_ acak kriptografis 48 byte (`randomBytes(48).toString('base64url')`) yang di-hash dengan SHA-256 (`refreshTokenHash`), bukan JWT. Oleh karena itu `JWT_REFRESH_SECRET` tidak diperlukan dan dihapus dari `.env.example` serta `docs/DEPLOY.md`.

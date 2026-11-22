@@ -14,6 +14,8 @@ import {
 	resolveAuthenticatedSession
 } from '../src/lib/server/auth/service';
 import { clearLoginRateLimit } from '../src/lib/server/auth/rateLimit';
+import { signAccessToken, verifyAccessToken, getAccessSecret } from '../src/lib/server/auth/tokens';
+import { SignJWT } from 'jose';
 import { GET as healthHandler } from '../src/routes/api/v1/health/+server';
 
 describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
@@ -411,6 +413,93 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 			).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429 });
 
 			clearLoginRateLimit(key);
+		});
+
+		it('Menolak JWT_ACCESS_SECRET yang kosong atau terlalu pendek (< 32 karakter)', async () => {
+			const originalSecret = process.env.JWT_ACCESS_SECRET;
+			try {
+				process.env.JWT_ACCESS_SECRET = '';
+				expect(() => getAccessSecret()).toThrowError(/wajib diatur.*tidak boleh kosong/i);
+				await expect(
+					signAccessToken({
+						sub: 'u-1',
+						sid: 's-1',
+						role: 'ADMIN',
+						email: 'a@b.com',
+						name: 'Admin'
+					})
+				).rejects.toThrowError(/wajib diatur.*tidak boleh kosong/i);
+
+				process.env.JWT_ACCESS_SECRET = 'terlalu-pendek-123';
+				expect(() => getAccessSecret()).toThrowError(/terlalu pendek.*minimal 32 karakter/i);
+				await expect(
+					signAccessToken({
+						sub: 'u-1',
+						sid: 's-1',
+						role: 'ADMIN',
+						email: 'a@b.com',
+						name: 'Admin'
+					})
+				).rejects.toThrowError(/terlalu pendek.*minimal 32 karakter/i);
+			} finally {
+				process.env.JWT_ACCESS_SECRET = originalSecret;
+			}
+		});
+
+		it('Menolak token kedaluwarsa, token dengan signature salah, dan token dengan role tidak sah', async () => {
+			// 1. Token kedaluwarsa (expiresInSec negatif)
+			const expiredToken = await signAccessToken(
+				{
+					sub: 'u-1',
+					sid: 's-1',
+					role: 'BORROWER',
+					email: 'b@example.com',
+					name: 'Borrower'
+				},
+				{ expiresInSec: -10 }
+			);
+			expect(await verifyAccessToken(expiredToken)).toBeNull();
+
+			// 2. Token dengan signature salah (ditandatangani dengan secret berbeda)
+			const wrongSecret = new TextEncoder().encode(
+				'wrong-secret-that-is-at-least-32-characters-long!!'
+			);
+			const wrongSigToken = await new SignJWT({
+				sid: 's-1',
+				role: 'BORROWER',
+				email: 'b@example.com',
+				name: 'Borrower'
+			})
+				.setProtectedHeader({ alg: 'HS256' })
+				.setSubject('u-1')
+				.setIssuedAt()
+				.setExpirationTime('15m')
+				.sign(wrongSecret);
+			expect(await verifyAccessToken(wrongSigToken)).toBeNull();
+
+			// 3. Token dengan role tidak sah (bukan ADMIN | OFFICER | BORROWER)
+			await expect(
+				signAccessToken({
+					sub: 'u-1',
+					sid: 's-1',
+					role: 'SUPERUSER' as never,
+					email: 'b@example.com',
+					name: 'Invalid Role'
+				})
+			).rejects.toThrowError(/Role tidak sah/);
+
+			const forgedInvalidRoleToken = await new SignJWT({
+				sid: 's-1',
+				role: 'SUPERUSER',
+				email: 'b@example.com',
+				name: 'Forged Role'
+			})
+				.setProtectedHeader({ alg: 'HS256' })
+				.setSubject('u-1')
+				.setIssuedAt()
+				.setExpirationTime('15m')
+				.sign(getAccessSecret());
+			expect(await verifyAccessToken(forgedInvalidRoleToken)).toBeNull();
 		});
 	});
 });
