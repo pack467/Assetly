@@ -1,0 +1,430 @@
+// =====================================================================
+// SISTEM MANAJEMEN ASET IT - Skema Database (Prisma + PostgreSQL)
+// Cakupan: Versi 1 + 1.5 (inti, keranjang, kelengkapan, perbaikan, risiko GPS)
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// ENUM
+// ---------------------------------------------------------------------
+
+enum Role {
+  ADMIN       // kelola barang & user, setujui, lihat semua laporan
+  OFFICER     // petugas: serah terima, pengembalian, tutup shift
+  BORROWER    // peminjam: scan dan pinjam
+}
+
+enum AssetStatus {
+  AVAILABLE         // Tersedia
+  PENDING_APPROVAL  // Menunggu persetujuan
+  BORROWED          // Dipinjam
+  DAMAGED           // Rusak (menunggu keputusan admin)
+  IN_MAINTENANCE    // Dalam perbaikan
+  LOST              // Hilang (hanya ditetapkan admin)
+  RETIRED           // Afkir (status akhir, tidak dihapus)
+}
+
+enum LoanStatus {
+  PENDING_APPROVAL
+  REJECTED
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum ItemCondition {
+  NORMAL
+  DAMAGED
+}
+
+enum EvidencePurpose {
+  CHECKOUT      // foto saat pinjam
+  RETURN        // foto saat kembali
+  DAMAGE        // foto detail kerusakan
+  HANDOVER      // foto serah terima
+  MAINTENANCE   // foto terkait perbaikan
+}
+
+enum RiskLevel {
+  NORMAL
+  NEEDS_REVIEW  // Perlu dicek
+  SUSPICIOUS    // Mencurigakan
+}
+
+enum MaintenanceKind {
+  REPAIR
+  PERIODIC
+}
+
+enum MaintenanceStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+}
+
+enum MaintenanceHandler {
+  INTERNAL
+  VENDOR
+}
+
+enum MaintenanceOutcome {
+  REPAIRED   // kembali Tersedia
+  RETIRED    // Afkir
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum SyncStatus {
+  ACCEPTED
+  CONFLICT   // mis. barang sudah dipinjam orang lain saat offline
+  REJECTED
+}
+
+// ---------------------------------------------------------------------
+// PENGGUNA & SESI
+// ---------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(uuid())
+  name          String
+  email         String   @unique
+  passwordHash  String   // argon2 / bcrypt, jangan simpan password asli
+  role          Role     @default(BORROWER)
+  isActive      Boolean  @default(true)
+  mfaSecret     String?  // verifikasi dua langkah (wajib untuk ADMIN)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  sessions              Session[]
+  loansBorrowed         Loan[]              @relation("LoanBorrower")
+  loansCreated          Loan[]              @relation("LoanCreatedBy")
+  loansApproved         Loan[]              @relation("LoanApprovedBy")
+  handoversGiven        Handover[]          @relation("HandoverGiver")
+  handoversReceived     Handover[]          @relation("HandoverReceiver")
+  evidences             Evidence[]
+  shifts                Shift[]
+  shiftItemsResponsible ShiftItem[]         @relation("ShiftItemResponsible")
+  ticketsOpened         MaintenanceTicket[]
+  auditLogs             AuditLog[]
+  syncOperations        SyncOperation[]
+}
+
+model Session {
+  id               String    @id @default(uuid())
+  userId           String
+  refreshTokenHash String    @unique
+  deviceInfo       String?
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  revokedAt        DateTime? // admin bisa mencabut sesi (HP hilang)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------
+// LOKASI RESMI & KATEGORI
+// ---------------------------------------------------------------------
+
+model Location {
+  id        String  @id @default(uuid())
+  name      String  @unique
+  latitude  Float?
+  longitude Float?
+  radiusM   Int     @default(100)
+  isActive  Boolean @default(true)
+
+  assets    Asset[]
+  evidences Evidence[]
+}
+
+model Category {
+  id                      String  @id @default(uuid())
+  name                    String  @unique
+  requiresApproval        Boolean @default(false) // barang mahal butuh persetujuan admin
+  maintenanceIntervalDays Int?                    // servis berkala (mis. 180)
+
+  assets Asset[]
+}
+
+// ---------------------------------------------------------------------
+// BARANG
+// ---------------------------------------------------------------------
+
+model Asset {
+  id                String      @id @default(uuid())
+  code              String      @unique   // kode terbaca manusia, mis. AST-0042
+  qrToken           String      @unique   // isi QR: token acak, bukan kode berurutan
+  name              String
+  categoryId        String
+  serialNumber      String?
+  status            AssetStatus @default(AVAILABLE)
+  homeLocationId    String?
+  photoUrl          String?
+  purchasedAt       DateTime?
+  notes             String?
+  lastMaintenanceAt DateTime?
+  nextMaintenanceAt DateTime?
+  version           Int         @default(0) // untuk optimistic locking
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  category     Category            @relation(fields: [categoryId], references: [id])
+  homeLocation Location?           @relation(fields: [homeLocationId], references: [id])
+  accessories  AccessoryTemplate[]
+  loanItems    LoanItem[]
+  tickets      MaintenanceTicket[]
+
+  @@index([status])
+  @@index([categoryId])
+}
+
+model AccessoryTemplate {
+  id       String @id @default(uuid())
+  assetId  String
+  name     String
+  quantity Int    @default(1)
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([assetId])
+}
+
+// ---------------------------------------------------------------------
+// BUKTI FOTO + LOKASI + WAKTU
+// ---------------------------------------------------------------------
+
+model Evidence {
+  id               String          @id @default(uuid())
+  purpose          EvidencePurpose
+  imageKey         String          // kunci di storage privat, tampilkan lewat signed URL
+  userId           String
+
+  // Waktu: simpan dua-duanya, selisihnya jadi sinyal risiko
+  takenAtDevice    DateTime
+  receivedAtServer DateTime        @default(now())
+  clockSkewSec     Int?
+
+  // Lokasi
+  gpsAvailable        Boolean      @default(false)
+  latitude            Float?
+  longitude           Float?
+  accuracyM           Float?
+  isMockLocation      Boolean      @default(false)
+  locationId          String?      // lokasi resmi yang dipilih / terdekat
+  locationNote        String?      // keterangan manual
+  distanceToLocationM Float?
+
+  // Penilaian risiko (diisi server)
+  riskLevel   RiskLevel @default(NORMAL)
+  riskReasons Json?     // daftar alasan, mis. ["MOCK_LOCATION","CLOCK_SKEW"]
+
+  user     User      @relation(fields: [userId], references: [id])
+  location Location? @relation(fields: [locationId], references: [id])
+
+  loanItemsCheckout LoanItem[] @relation("LoanItemCheckout")
+  loanItemsReturn   LoanItem[] @relation("LoanItemReturn")
+  handovers         Handover[]
+
+  @@index([userId, receivedAtServer])
+  @@index([riskLevel])
+}
+
+// ---------------------------------------------------------------------
+// PEMINJAMAN (satu peminjaman bisa berisi banyak barang / keranjang)
+// ---------------------------------------------------------------------
+
+model Loan {
+  id               String     @id @default(uuid())
+  borrowerId       String
+  createdById      String     // petugas/peminjam yang memproses
+  purpose          String     // mis. "Seminar", "Meeting", "Lainnya"
+  purposeNote      String?
+  expectedReturnAt DateTime
+  status           LoanStatus @default(ACTIVE)
+  approvedById     String?
+  approvedAt       DateTime?
+  rejectedReason   String?
+  clientOpId       String?    @unique // anti-duplikasi untuk antrean offline
+  createdAt        DateTime   @default(now())
+  completedAt      DateTime?
+
+  borrower   User       @relation("LoanBorrower", fields: [borrowerId], references: [id])
+  createdBy  User       @relation("LoanCreatedBy", fields: [createdById], references: [id])
+  approvedBy User?      @relation("LoanApprovedBy", fields: [approvedById], references: [id])
+  items      LoanItem[]
+  handovers  Handover[]
+
+  @@index([status, expectedReturnAt])
+  @@index([borrowerId])
+}
+
+model LoanItem {
+  id                 String         @id @default(uuid())
+  loanId             String
+  assetId            String
+  checkoutEvidenceId String?
+  returnEvidenceId   String?
+  returnedAt         DateTime?      // NULL = barang masih keluar
+  returnCondition    ItemCondition?
+  damageNote         String?
+
+  loan             Loan                @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  asset            Asset               @relation(fields: [assetId], references: [id])
+  checkoutEvidence Evidence?           @relation("LoanItemCheckout", fields: [checkoutEvidenceId], references: [id])
+  returnEvidence   Evidence?           @relation("LoanItemReturn", fields: [returnEvidenceId], references: [id])
+  accessoryChecks  AccessoryCheck[]
+  shiftItems       ShiftItem[]
+  tickets          MaintenanceTicket[]
+
+  @@index([assetId])
+  @@index([loanId])
+}
+
+model AccessoryCheck {
+  id         String   @id @default(uuid())
+  loanItemId String
+  name       String
+  quantity   Int      @default(1)
+  outOk      Boolean  @default(true)  // ikut saat dipinjam
+  returnOk   Boolean?                 // kembali lengkap? (NULL = belum dicek)
+
+  loanItem LoanItem @relation(fields: [loanItemId], references: [id], onDelete: Cascade)
+
+  @@index([loanItemId])
+}
+
+model Handover {
+  id                  String    @id @default(uuid())
+  loanId              String
+  giverId             String
+  receiverId          String
+  giverConfirmedAt    DateTime?
+  receiverConfirmedAt DateTime?
+  evidenceId          String?
+  documentNo          String?   @unique // nomor berita acara (untuk PDF)
+  createdAt           DateTime  @default(now())
+
+  loan     Loan      @relation(fields: [loanId], references: [id], onDelete: Cascade)
+  giver    User      @relation("HandoverGiver", fields: [giverId], references: [id])
+  receiver User      @relation("HandoverReceiver", fields: [receiverId], references: [id])
+  evidence Evidence? @relation(fields: [evidenceId], references: [id])
+
+  @@index([loanId])
+}
+
+// ---------------------------------------------------------------------
+// SHIFT
+// ---------------------------------------------------------------------
+
+model Shift {
+  id       String      @id @default(uuid())
+  userId   String
+  status   ShiftStatus @default(OPEN)
+  openedAt DateTime    @default(now())
+  closedAt DateTime?
+  note     String?
+
+  user  User        @relation(fields: [userId], references: [id])
+  items ShiftItem[]
+
+  @@index([userId, status])
+}
+
+model ShiftItem {
+  id                String  @id @default(uuid())
+  shiftId           String
+  loanItemId        String
+  reason            String
+  responsibleUserId String?
+
+  shift       Shift    @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  loanItem    LoanItem @relation(fields: [loanItemId], references: [id])
+  responsible User?    @relation("ShiftItemResponsible", fields: [responsibleUserId], references: [id])
+
+  @@index([shiftId])
+}
+
+// ---------------------------------------------------------------------
+// PERBAIKAN & PERAWATAN
+// ---------------------------------------------------------------------
+
+model MaintenanceTicket {
+  id               String              @id @default(uuid())
+  assetId          String
+  kind             MaintenanceKind     @default(REPAIR)
+  status           MaintenanceStatus   @default(OPEN)
+  handler          MaintenanceHandler?
+  vendorName       String?
+  sentToVendorAt   DateTime?
+  problem          String
+  priority         Int                 @default(2) // 1 tinggi, 2 sedang, 3 rendah
+  sourceLoanItemId String?             // kalau berawal dari barang rusak saat dikembalikan
+  openedById       String
+  openedAt         DateTime            @default(now())
+  expectedDoneAt   DateTime?
+  completedAt      DateTime?
+  cost             Decimal?            @db.Decimal(14, 2)
+  result           String?
+  outcome          MaintenanceOutcome?
+
+  asset          Asset     @relation(fields: [assetId], references: [id])
+  openedBy       User      @relation(fields: [openedById], references: [id])
+  sourceLoanItem LoanItem? @relation(fields: [sourceLoanItemId], references: [id])
+
+  @@index([assetId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------
+// LOG AKTIVITAS (hanya ditambah, tidak boleh diubah atau dihapus)
+// ---------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  action     String   // mis. "ASSET_STATUS_CHANGED", "LOAN_CREATED"
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------
+// ANTREAN SINKRONISASI (offline)
+// ---------------------------------------------------------------------
+
+model SyncOperation {
+  id              String     @id @default(uuid())
+  clientOpId      String     @unique   // ID unik dibuat di HP, mencegah data ganda
+  userId          String
+  type            String     // mis. "LOAN_CREATE", "LOAN_RETURN"
+  payload         Json
+  status          SyncStatus
+  conflictReason  String?
+  clientCreatedAt DateTime
+  receivedAt      DateTime   @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, status])
+}
