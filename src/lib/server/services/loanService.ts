@@ -1,6 +1,6 @@
 import { Prisma, type LoanStatus } from '@prisma/client';
 import { prisma } from '$lib/server/db';
-import { writeAuditLog } from '$lib/server/audit';
+import { writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, can, type PolicyUser } from '$lib/server/policy';
 import { createEvidenceSignedUrl } from '$lib/server/storage';
 import { isValidAssetStatusTransition } from '$lib/shared/enums';
@@ -37,6 +37,33 @@ const LOAN_DETAIL_INCLUDE = {
 	},
 	handovers: true
 } satisfies Prisma.LoanInclude;
+
+async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Promise<void> {
+	const [usedInLoanItem, usedInHandover] = await Promise.all([
+		tx.loanItem.findFirst({
+			where: {
+				OR: [{ checkoutEvidenceId: { in: evidenceIds } }, { returnEvidenceId: { in: evidenceIds } }]
+			},
+			select: { id: true, checkoutEvidenceId: true, returnEvidenceId: true }
+		}),
+		tx.handover.findFirst({
+			where: { evidenceId: { in: evidenceIds } },
+			select: { id: true, evidenceId: true }
+		})
+	]);
+
+	if (usedInLoanItem || usedInHandover) {
+		const duplicateId =
+			usedInLoanItem?.checkoutEvidenceId ??
+			usedInLoanItem?.returnEvidenceId ??
+			usedInHandover?.evidenceId;
+		throw new AppError(
+			'DUPLICATE_OPERATION',
+			'Foto bukti (Evidence) ini sudah pernah digunakan dan tidak boleh dipakai ulang.',
+			{ evidenceId: duplicateId }
+		);
+	}
+}
 
 export async function createLoan(
 	actor: PolicyUser | null | undefined,
@@ -95,8 +122,8 @@ export async function createLoan(
 		throw new AppError('VALIDATION_ERROR', 'Tanggal rencana pengembalian tidak valid.');
 	}
 
-	// Setiap item wajib punya bukti foto CHECKOUT (dari item.checkoutEvidenceId atau input.evidenceId)
-	const evidenceIdsToVerify = new Set<string>();
+	// Setiap item wajib punya bukti foto CHECKOUT tersendiri (satu Evidence hanya boleh dipakai sekali)
+	const evidenceIdsList: string[] = [];
 	for (const item of normalizedItems) {
 		const evId = item.checkoutEvidenceId ?? input.evidenceId;
 		if (!evId) {
@@ -105,28 +132,57 @@ export async function createLoan(
 				'Foto bukti kondisi barang saat meminjam (evidenceId) wajib disertakan.'
 			);
 		}
-		evidenceIdsToVerify.add(evId);
+		if (evidenceIdsList.includes(evId)) {
+			throw new AppError(
+				'DUPLICATE_OPERATION',
+				'Satu foto bukti (Evidence) hanya boleh dipakai sekali dan tidak boleh dibagi untuk beberapa item.',
+				{ evidenceId: evId }
+			);
+		}
+		evidenceIdsList.push(evId);
 	}
 
 	const evidences = await prisma.evidence.findMany({
-		where: { id: { in: Array.from(evidenceIdsToVerify) } }
+		where: { id: { in: evidenceIdsList } }
 	});
-	if (evidences.length !== evidenceIdsToVerify.size) {
+	if (evidences.length !== evidenceIdsList.length) {
 		throw new AppError('EVIDENCE_REQUIRED', 'Data foto bukti (Evidence) tidak ditemukan.');
 	}
 
 	const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
 	for (const ev of evidences) {
+		// 1. Saat pinjam, foto bukti harus ber-purpose CHECKOUT
+		if (ev.purpose !== 'CHECKOUT') {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				`Foto bukti untuk peminjaman wajib ber-purpose CHECKOUT (diterima: ${ev.purpose}).`,
+				{ evidenceId: ev.id, expectedPurpose: 'CHECKOUT', actualPurpose: ev.purpose }
+			);
+		}
+
+		// 2. Foto bukti harus diunggah oleh user yang sedang melakukan aksi
+		if (ev.userId !== actor.id) {
+			throw new AppError(
+				'FORBIDDEN',
+				'Foto bukti peminjaman harus diunggah oleh pengguna yang sedang melakukan aksi.',
+				{ evidenceId: ev.id }
+			);
+		}
+
+		// 4. Aturan MOCK_LOCATION (BR-07)
 		if (ev.isMockLocation && blockOnMock) {
 			throw new AppError(
 				'MOCK_LOCATION_BLOCKED',
-				'Bukti menggunakan lokasi palsu (mock location) dan tidak dapat dipakai meminjam.'
+				'Bukti menggunakan lokasi palsu (mock location) dan tidak dapat dipakai meminjam (BR-07).'
 			);
 		}
 	}
 
 	try {
 		const createdLoan = await prisma.$transaction(async (tx) => {
+			// 3. Satu Evidence hanya boleh dipakai sekali
+			await assertEvidenceNotUsed(tx, evidenceIdsList);
+
 			const assets = await tx.asset.findMany({
 				where: { id: { in: Array.from(uniqueAssetIds) } },
 				include: {
@@ -357,6 +413,34 @@ export async function returnLoanItem(
 		throw new AppError('EVIDENCE_REQUIRED', 'Foto bukti pengembalian tidak ditemukan.');
 	}
 
+	// 1. Saat kembali, foto bukti harus ber-purpose RETURN
+	if (evidence.purpose !== 'RETURN') {
+		throw new AppError(
+			'VALIDATION_ERROR',
+			`Foto bukti untuk pengembalian wajib ber-purpose RETURN (diterima: ${evidence.purpose}).`,
+			{ evidenceId: evidence.id, expectedPurpose: 'RETURN', actualPurpose: evidence.purpose }
+		);
+	}
+
+	// 2. Foto bukti harus diunggah oleh user yang sedang melakukan aksi
+	if (evidence.userId !== actor.id) {
+		throw new AppError(
+			'FORBIDDEN',
+			'Foto bukti pengembalian harus diunggah oleh pengguna yang sedang memproses pengembalian.',
+			{ evidenceId: evidence.id }
+		);
+	}
+
+	// 4. Terapkan aturan MOCK_LOCATION (BR-07) juga pada alur pengembalian
+	const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
+	if (evidence.isMockLocation && blockOnMock) {
+		throw new AppError(
+			'MOCK_LOCATION_BLOCKED',
+			'Bukti pengembalian menggunakan lokasi palsu (mock location) dan diblokir sesuai kebijakan keamanan (BR-07).',
+			{ evidenceId: evidence.id, riskLevel: evidence.riskLevel }
+		);
+	}
+
 	const nextAssetStatus = input.returnCondition === 'DAMAGED' ? 'DAMAGED' : 'AVAILABLE';
 	if (!isValidAssetStatusTransition(existingItem.asset.status, nextAssetStatus)) {
 		throw new AppError(
@@ -368,6 +452,9 @@ export async function returnLoanItem(
 	const now = new Date();
 
 	const result = await prisma.$transaction(async (tx) => {
+		// 3. Satu Evidence hanya boleh dipakai sekali (tidak boleh sudah terpakai untuk pinjam atau kembali lain)
+		await assertEvidenceNotUsed(tx, [input.evidenceId]);
+
 		const updatedItem = await tx.loanItem.update({
 			where: { id: loanItemId },
 			data: {

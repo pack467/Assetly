@@ -24,6 +24,8 @@ Dokumen ini mencatat semua keputusan terbuka pada **Bagian 21 `PROJECT_SPEC.md`*
 
 1. **Masa berlaku token & pencabutan sesi instan (Bagian 12):**
    - Access token (JWT HS256) berlaku **15 menit** dan memuat klaim `sid` (`Session.id`). Variabel `JWT_ACCESS_SECRET` dimuat melalui `$env/dynamic/private` SvelteKit dan divalidasi wajib minimal **32 karakter**.
+   - Penandatanganan _signed URL_ foto bukti (`Evidence`) dipisahkan dari kunci JWT menggunakan variabel khusus `EVIDENCE_SIGNING_SECRET` (HMAC-SHA256, wajib minimal **32 karakter**).
+   - Penandatanganan _signed URL_ foto bukti (`Evidence`) dipisahkan dari kunci JWT menggunakan variabel khusus `EVIDENCE_SIGNING_SECRET` (HMAC-SHA256, wajib minimal **32 karakter**).
    - Refresh token berlaku **30 hari**, dibangkitkan sebagai token acak kriptografis 48 byte (`randomBytes(48).toString('base64url')`), disimpan sebagai hash SHA-256 (`refreshTokenHash`) di tabel `Session`, dan dirotasi setiap kali `/api/v1/auth/refresh` dipanggil. Karena refresh token bersifat _opaque_ (bukan JWT), variabel `JWT_REFRESH_SECRET` dihapus dari `.env.example` agar tidak membingungkan.
    - Setiap request terautentikasi memverifikasi status `Session` (`revokedAt IS NULL` dan `expiresAt > now()`) serta `User.isActive = true` sehingga pencabutan sesi oleh admin berlaku **segera** pada permintaan berikutnya.
 2. **Pembatasan percobaan login (Rate Limit - Bagian 12):**

@@ -1,13 +1,33 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { getAccessSecret } from '$lib/server/auth/tokens';
+import { env } from '$env/dynamic/private';
 import { AppError } from '$lib/shared/errors';
 
 export const MAX_EVIDENCE_BYTES = 5 * 1024 * 1024; // 5 MB (Bagian 9.1)
 export const SIGNED_URL_TTL_SEC = 5 * 60; // 5 menit (Bagian 12)
+const MIN_SIGNING_SECRET_LENGTH = 32;
 
 const STORAGE_ROOT = resolve(process.cwd(), '.storage', 'evidence');
+
+export function getEvidenceSigningSecret(): Uint8Array {
+	const rawSecret = (
+		process.env.EVIDENCE_SIGNING_SECRET ??
+		env.EVIDENCE_SIGNING_SECRET ??
+		''
+	).trim();
+	if (!rawSecret) {
+		throw new Error(
+			'EVIDENCE_SIGNING_SECRET wajib diatur pada variabel lingkungan (.env) dan tidak boleh kosong.'
+		);
+	}
+	if (rawSecret.length < MIN_SIGNING_SECRET_LENGTH) {
+		throw new Error(
+			`EVIDENCE_SIGNING_SECRET terlalu pendek (${rawSecret.length} karakter). Gunakan minimal ${MIN_SIGNING_SECRET_LENGTH} karakter.`
+		);
+	}
+	return new TextEncoder().encode(rawSecret);
+}
 
 /**
  * Validasi bahwa buffer benar-benar berkas JPEG (magic bytes FF D8 FF) dan <= 5 MB (Bagian 9.1 & 12).
@@ -65,7 +85,7 @@ export function readPrivateEvidenceFile(imageKey: string): Buffer {
 }
 
 function computeSignature(evidenceId: string, imageKey: string, expiresEpochSec: number): string {
-	const secret = getAccessSecret();
+	const secret = getEvidenceSigningSecret();
 	return createHmac('sha256', secret)
 		.update(`${evidenceId}:${imageKey}:${expiresEpochSec}`)
 		.digest('hex');

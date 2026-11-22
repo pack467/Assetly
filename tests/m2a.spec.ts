@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { prisma } from '../src/lib/server/db';
 import type { PolicyUser } from '../src/lib/server/policy';
 import { evaluateEvidenceRisk } from '../src/lib/server/risk';
-import { verifyEvidenceSignedUrl } from '../src/lib/server/storage';
+import { verifyEvidenceSignedUrl, getEvidenceSigningSecret } from '../src/lib/server/storage';
 import { uploadEvidence, getEvidenceDetail } from '../src/lib/server/services/evidenceService';
 import {
 	createLoan,
@@ -508,11 +508,12 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				(rejected[0].reason as { code?: string })?.code
 			);
 
-			// Barang kini berstatus BORROWED dan tidak bisa dipinjam lagi sebelum dikembalikan
+			// Barang kini berstatus BORROWED dan tidak bisa dipinjam lagi sebelum dikembalikan (pakai Evidence baru)
+			const ev3 = await createTestEvidence(borrower2, 'CHECKOUT');
 			await expect(
 				createLoan(borrower2, {
 					assetId: contestedAsset.id,
-					evidenceId: ev2.id,
+					evidenceId: ev3.id,
 					purpose: 'Coba lagi saat masih dipinjam',
 					expectedReturnAt
 				})
@@ -614,6 +615,182 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			const approved = await approveLoan(adminActor, pendingLoanRes.loan.id);
 			expect(approved.loan.status).toBe('ACTIVE');
 			expect(approved.loan.items[0].asset.status).toBe('BORROWED');
+		});
+
+		it('Menegakkan 5 aturan ketat Evidence: purpose CHECKOUT vs RETURN, pemilik Evidence, pemakaian sekali (DUPLICATE_OPERATION), MOCK_LOCATION pada return, dan validasi EVIDENCE_SIGNING_SECRET', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const [assetA, assetB] = await Promise.all([
+				prisma.asset.create({
+					data: {
+						code: `AST-EV1-${suffix}`,
+						qrToken: `qr-ev1-${randomUUID()}`,
+						name: 'Barang Uji Aturan Evidence A',
+						categoryId: standardCategoryId,
+						status: 'AVAILABLE'
+					}
+				}),
+				prisma.asset.create({
+					data: {
+						code: `AST-EV2-${suffix}`,
+						qrToken: `qr-ev2-${randomUUID()}`,
+						name: 'Barang Uji Aturan Evidence B',
+						categoryId: standardCategoryId,
+						status: 'AVAILABLE'
+					}
+				})
+			]);
+
+			const expectedReturnAt = new Date(Date.now() + 86400_000).toISOString();
+
+			// 1. Foto ber-purpose RETURN ditolak saat dipakai untuk meminjam (createLoan)
+			const returnEvForCheckout = await createTestEvidence(borrower1, 'RETURN');
+			await expect(
+				createLoan(borrower1, {
+					assetId: assetA.id,
+					evidenceId: returnEvForCheckout.id,
+					purpose: 'Coba pakai foto RETURN untuk pinjam',
+					expectedReturnAt
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			// 2. Foto milik borrower2 ditolak jika dipakai oleh borrower1 saat meminjam
+			const b2CheckoutEv = await createTestEvidence(borrower2, 'CHECKOUT');
+			await expect(
+				createLoan(borrower1, {
+					assetId: assetA.id,
+					evidenceId: b2CheckoutEv.id,
+					purpose: 'Coba pakai foto orang lain',
+					expectedReturnAt
+				})
+			).rejects.toMatchObject({
+				code: 'FORBIDDEN',
+				status: 403
+			});
+
+			// Pinjam assetA dengan foto CHECKOUT milik borrower1 yang sah
+			const validCheckoutEv = await createTestEvidence(borrower1, 'CHECKOUT');
+			const createdLoanRes = await createLoan(borrower1, {
+				assetId: assetA.id,
+				evidenceId: validCheckoutEv.id,
+				purpose: 'Peminjaman Sah',
+				expectedReturnAt
+			});
+			const loanItemId = createdLoanRes.loan.items[0].id;
+
+			// 3a. Satu Evidence hanya boleh dipakai sekali: memakai ulang validCheckoutEv untuk meminjam assetB wajib ditolak DUPLICATE_OPERATION
+			await expect(
+				createLoan(borrower1, {
+					assetId: assetB.id,
+					evidenceId: validCheckoutEv.id,
+					purpose: 'Coba pakai ulang foto CHECKOUT yang sama',
+					expectedReturnAt
+				})
+			).rejects.toMatchObject({
+				code: 'DUPLICATE_OPERATION',
+				status: 409
+			});
+
+			// 1b. Foto CHECKOUT ditolak bila dipakai untuk RETURN
+			const anotherCheckoutEv = await createTestEvidence(borrower1, 'CHECKOUT');
+			await expect(
+				returnLoanItem(borrower1, loanItemId, {
+					returnCondition: 'NORMAL',
+					evidenceId: anotherCheckoutEv.id
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			// 2b. Foto RETURN yang diunggah oleh borrower2 ditolak bila dipakai borrower1 untuk mengembalikan
+			const b2ReturnEv = await createTestEvidence(borrower2, 'RETURN');
+			await expect(
+				returnLoanItem(borrower1, loanItemId, {
+					returnCondition: 'NORMAL',
+					evidenceId: b2ReturnEv.id
+				})
+			).rejects.toMatchObject({
+				code: 'FORBIDDEN',
+				status: 403
+			});
+
+			// 4. Aturan MOCK_LOCATION (BR-07) juga menolak pengembalian bila bukti RETURN berstatus isMockLocation = true dan RISK_BLOCK_ON_MOCK=true
+			const prevMockSetting = process.env.RISK_BLOCK_ON_MOCK;
+			let mockReturnEvId: string;
+			try {
+				process.env.RISK_BLOCK_ON_MOCK = 'false';
+				const mockReturnUploaded = await uploadEvidence(borrower1, {
+					meta: {
+						purpose: 'RETURN',
+						captureSource: 'CAMERA',
+						takenAtDevice: new Date().toISOString(),
+						gpsAvailable: true,
+						latitude: -6.2,
+						longitude: 106.8166,
+						isMockLocation: true,
+						locationId: location1Id
+					},
+					fileBuffer: VALID_JPEG_BUFFER
+				});
+				mockReturnEvId = mockReturnUploaded.evidence.id;
+
+				process.env.RISK_BLOCK_ON_MOCK = 'true';
+				await expect(
+					returnLoanItem(borrower1, loanItemId, {
+						returnCondition: 'NORMAL',
+						evidenceId: mockReturnEvId
+					})
+				).rejects.toMatchObject({
+					code: 'MOCK_LOCATION_BLOCKED',
+					status: 422
+				});
+			} finally {
+				process.env.RISK_BLOCK_ON_MOCK = prevMockSetting ?? 'true';
+			}
+
+			// Kembalikan assetA dengan foto RETURN yang sah
+			const validReturnEv = await createTestEvidence(borrower1, 'RETURN');
+			const returnedOk = await returnLoanItem(borrower1, loanItemId, {
+				returnCondition: 'NORMAL',
+				evidenceId: validReturnEv.id
+			});
+			expect(returnedOk.loan.status).toBe('COMPLETED');
+
+			// 3b. Foto RETURN yang sudah dipakai sekali tidak boleh dipakai ulang untuk pengembalian lain
+			const loanBRes = await createLoan(borrower1, {
+				assetId: assetB.id,
+				evidenceId: anotherCheckoutEv.id,
+				purpose: 'Pinjam Barang B',
+				expectedReturnAt
+			});
+			await expect(
+				returnLoanItem(borrower1, loanBRes.loan.items[0].id, {
+					returnCondition: 'NORMAL',
+					evidenceId: validReturnEv.id
+				})
+			).rejects.toMatchObject({
+				code: 'DUPLICATE_OPERATION',
+				status: 409
+			});
+
+			// 5. Validasi EVIDENCE_SIGNING_SECRET terpisah dari JWT_ACCESS_SECRET (wajib & minimal 32 karakter)
+			const origSigningSecret = process.env.EVIDENCE_SIGNING_SECRET;
+			try {
+				process.env.EVIDENCE_SIGNING_SECRET = '';
+				expect(() => getEvidenceSigningSecret()).toThrowError(
+					/EVIDENCE_SIGNING_SECRET wajib diatur.*tidak boleh kosong/i
+				);
+
+				process.env.EVIDENCE_SIGNING_SECRET = 'pendek-12345';
+				expect(() => getEvidenceSigningSecret()).toThrowError(
+					/EVIDENCE_SIGNING_SECRET terlalu pendek.*minimal 32 karakter/i
+				);
+			} finally {
+				process.env.EVIDENCE_SIGNING_SECRET = origSigningSecret;
+			}
 		});
 	});
 });
