@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { prisma } from '../src/lib/server/db';
 import type { PolicyUser } from '../src/lib/server/policy';
 import { uploadEvidence } from '../src/lib/server/services/evidenceService';
+import { createLoan, returnLoanItem } from '../src/lib/server/services/loanService';
 import { processSyncBatch, listSyncOperations } from '../src/lib/server/services/syncService';
 
 const VALID_JPEG_BUFFER = Buffer.from([
@@ -398,5 +399,156 @@ describe('M4 Tahap 4A: Backend Sinkronisasi Offline (POST /api/v1/sync) — Idem
 		expect(batchRes.results[2].code).toBe('FORBIDDEN');
 		expect(batchRes.results[3].status).toBe('REJECTED');
 		expect(batchRes.results[3].code).toBe('DUPLICATE_OPERATION');
+	});
+
+	it('5. Konkurensi paralel dengan clientOpId yang sama pada LOAN_CREATE dan LOAN_RETURN: terkunci per clientOpId, diproses tepat sekali, hasil konsisten tanpa 500/CONFLICT palsu', async () => {
+		const suffix = randomUUID().slice(0, 8);
+		const asset = await prisma.asset.create({
+			data: {
+				code: `AST-M4PR-${suffix}`,
+				qrToken: `qr-m4pr-${randomUUID()}`,
+				name: 'Laptop Uji Paralel clientOpId Sama',
+				categoryId,
+				status: 'AVAILABLE'
+			}
+		});
+
+		const checkoutEv = await createEvidenceForActor(borrower1, 'CHECKOUT');
+		const returnEv = await createEvidenceForActor(borrower1, 'RETURN');
+		const createOpId = `par-create-${randomUUID()}`;
+		const returnOpId = `par-return-${randomUUID()}`;
+		const expectedReturnAt = new Date(Date.now() + 86400_000).toISOString();
+
+		const createOpPayload = {
+			clientOpId: createOpId,
+			type: 'LOAN_CREATE' as const,
+			clientCreatedAt: new Date().toISOString(),
+			payload: {
+				assetId: asset.id,
+				evidenceId: checkoutEv.id,
+				purpose: 'Paralel Create Idempoten',
+				expectedReturnAt
+			}
+		};
+
+		// 1. Dua request paralel dengan clientOpId yang sama untuk LOAN_CREATE
+		const [createResA, createResB] = await Promise.all([
+			processSyncBatch(borrower1, { operations: [createOpPayload] }),
+			processSyncBatch(borrower1, { operations: [createOpPayload] })
+		]);
+
+		expect(createResA.results[0].status).toBe('ACCEPTED');
+		expect(createResB.results[0].status).toBe('ACCEPTED');
+		expect(createResA.results[0].syncOperationId).toBe(createResB.results[0].syncOperationId);
+
+		// Tepat satu yang mengeksekusi pertama (idempotentReplay: false) dan satu lagi membaca hasil tersimpan (idempotentReplay: true)
+		const createReplays = [
+			createResA.results[0].idempotentReplay,
+			createResB.results[0].idempotentReplay
+		];
+		expect(createReplays.sort()).toEqual([false, true]);
+
+		// Hanya ada 1 baris SyncOperation dan 1 Loan di database
+		const syncCreateCount = await prisma.syncOperation.count({
+			where: { clientOpId: createOpId }
+		});
+		expect(syncCreateCount).toBe(1);
+
+		// 2. Dua request paralel dengan clientOpId yang sama untuk LOAN_RETURN
+		const returnOpPayload = {
+			clientOpId: returnOpId,
+			type: 'LOAN_RETURN' as const,
+			clientCreatedAt: new Date().toISOString(),
+			payload: {
+				assetId: asset.id,
+				returnCondition: 'NORMAL',
+				evidenceId: returnEv.id
+			}
+		};
+
+		const [returnResA, returnResB] = await Promise.all([
+			processSyncBatch(borrower1, { operations: [returnOpPayload] }),
+			processSyncBatch(borrower1, { operations: [returnOpPayload] })
+		]);
+
+		expect(returnResA.results[0].status).toBe('ACCEPTED');
+		expect(returnResB.results[0].status).toBe('ACCEPTED');
+		expect(returnResA.results[0].syncOperationId).toBe(returnResB.results[0].syncOperationId);
+
+		const returnReplays = [
+			returnResA.results[0].idempotentReplay,
+			returnResB.results[0].idempotentReplay
+		];
+		expect(returnReplays.sort()).toEqual([false, true]);
+	});
+
+	it('6. Pemulihan pengiriman ulang jika server berhenti setelah operasi domain sukses tetapi sebelum SyncOperation dicatat (tidak menghasilkan CONFLICT palsu)', async () => {
+		const suffix = randomUUID().slice(0, 8);
+		const asset = await prisma.asset.create({
+			data: {
+				code: `AST-M4RC-${suffix}`,
+				qrToken: `qr-m4rc-${randomUUID()}`,
+				name: 'Proyektor Uji Recovery Crash Sebelum SyncOperation',
+				categoryId,
+				status: 'AVAILABLE'
+			}
+		});
+
+		const checkoutEv = await createEvidenceForActor(borrower1, 'CHECKOUT');
+		const returnEv = await createEvidenceForActor(borrower1, 'RETURN');
+		const createOpId = `rec-create-${randomUUID()}`;
+		const returnOpId = `rec-return-${randomUUID()}`;
+		const expectedReturnAt = new Date(Date.now() + 86400_000).toISOString();
+
+		// Simulasikan operasi domain LOAN_CREATE sudah berhasil tersimpan di DB, tetapi SyncOperation belum ada
+		const directLoan = await createLoan(borrower1, {
+			assetId: asset.id,
+			evidenceId: checkoutEv.id,
+			purpose: 'Simulasi Crash Setelah CreateLoan',
+			expectedReturnAt,
+			clientOpId: createOpId
+		});
+
+		// Kirim ulang LOAN_CREATE lewat /sync -> harus ACCEPTED (bukan CONFLICT / DUPLICATE_OPERATION palsu!)
+		const syncCreateRecovery = await processSyncBatch(borrower1, {
+			operations: [
+				{
+					clientOpId: createOpId,
+					type: 'LOAN_CREATE',
+					clientCreatedAt: new Date().toISOString(),
+					payload: {
+						assetId: asset.id,
+						evidenceId: checkoutEv.id,
+						purpose: 'Simulasi Crash Setelah CreateLoan',
+						expectedReturnAt
+					}
+				}
+			]
+		});
+		expect(syncCreateRecovery.results[0].status).toBe('ACCEPTED');
+
+		// Simulasikan operasi domain LOAN_RETURN sudah berhasil tersimpan di DB, tetapi SyncOperation belum ada
+		await returnLoanItem(borrower1, directLoan.loan.items[0].id, {
+			returnCondition: 'NORMAL',
+			evidenceId: returnEv.id,
+			clientOpId: returnOpId
+		});
+
+		// Kirim ulang LOAN_RETURN lewat /sync -> harus ACCEPTED (bukan CONFLICT palsu!)
+		const syncReturnRecovery = await processSyncBatch(borrower1, {
+			operations: [
+				{
+					clientOpId: returnOpId,
+					type: 'LOAN_RETURN',
+					clientCreatedAt: new Date().toISOString(),
+					payload: {
+						assetId: asset.id,
+						returnCondition: 'NORMAL',
+						evidenceId: returnEv.id
+					}
+				}
+			]
+		});
+		expect(syncReturnRecovery.results[0].status).toBe('ACCEPTED');
 	});
 });

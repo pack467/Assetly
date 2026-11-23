@@ -13,6 +13,7 @@ import type {
 } from '$lib/shared/schemas/handoverShift';
 
 const HANDOVER_CONFIRMATION_SLA_MS = 24 * 60 * 60 * 1000; // 24 jam (Bagian 21 No. 10)
+const SUPERSEDED_PREFIX = 'SUPERSEDED-';
 
 const HANDOVER_INCLUDE = {
 	giver: {
@@ -44,6 +45,11 @@ function generateHandoverDocumentNo(): string {
 	const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, '');
 	const randPart = randomBytes(3).toString('hex').toUpperCase();
 	return `BA-${datePart}-${randPart}`;
+}
+
+function generateSupersededMarker(handoverId: string): string {
+	const randPart = randomBytes(2).toString('hex').toUpperCase();
+	return `${SUPERSEDED_PREFIX}${handoverId.slice(0, 8)}-${randPart}`;
 }
 
 async function validateHandoverEvidence(
@@ -92,15 +98,39 @@ async function validateHandoverEvidence(
 }
 
 function formatHandoverRecord(h: Prisma.HandoverGetPayload<{ include: typeof HANDOVER_INCLUDE }>) {
-	const isConfirmed = Boolean(h.giverConfirmedAt && h.receiverConfirmedAt);
+	const isSuperseded = Boolean(h.documentNo?.startsWith(SUPERSEDED_PREFIX));
+	const isConfirmed = !isSuperseded && Boolean(h.giverConfirmedAt && h.receiverConfirmedAt);
 	const ageMs = Date.now() - h.createdAt.getTime();
 	return {
 		...h,
 		isConfirmed,
-		isOverdueConfirmation: !isConfirmed && ageMs > HANDOVER_CONFIRMATION_SLA_MS,
+		isSuperseded,
+		isOverdueConfirmation: !isConfirmed && !isSuperseded && ageMs > HANDOVER_CONFIRMATION_SLA_MS,
 		evidenceSignedUrl: h.evidence
 			? createEvidenceSignedUrl(h.evidence.id, h.evidence.imageKey).url
 			: null
+	};
+}
+
+/**
+ * Memeriksa apakah pasangan (giver, receiver) sah terhadap pemegang Loan saat ini:
+ * - Pemberi adalah pemegang saat ini (giverId === currentHolderId), ATAU
+ * - Kasus petugas/admin menyerahkan fisik barang ke peminjam yang memang sudah tercatat sebagai peminjam (receiverId === currentHolderId).
+ */
+function verifyGiverEligibility(params: {
+	giverId: string;
+	giverRole: string;
+	receiverId: string;
+	currentHolderId: string;
+}): { valid: boolean; isOfficerInitialDelivery: boolean } {
+	const isCurrentHolder = params.giverId === params.currentHolderId;
+	const isOfficerInitialDelivery =
+		(params.giverRole === 'OFFICER' || params.giverRole === 'ADMIN') &&
+		params.receiverId === params.currentHolderId;
+
+	return {
+		valid: isCurrentHolder || isOfficerInitialDelivery,
+		isOfficerInitialDelivery
 	};
 }
 
@@ -124,10 +154,12 @@ export async function createHandover(
 		throw new AppError('NOT_FOUND', 'Data peminjaman tidak ditemukan.');
 	}
 
-	if (loan.status !== 'ACTIVE') {
+	if (loan.status !== 'ACTIVE' || loan.items.length === 0) {
 		throw new AppError(
 			'INVALID_STATUS_TRANSITION',
-			`Serah terima hanya dapat dibuat untuk peminjaman berstatus ACTIVE (saat ini: ${loan.status}).`
+			`Serah terima hanya dapat dibuat untuk peminjaman berstatus ACTIVE yang masih memiliki barang keluar (saat ini: ${loan.status}).`,
+			{ loanId: loan.id, loanStatus: loan.status },
+			409
 		);
 	}
 
@@ -158,6 +190,25 @@ export async function createHandover(
 	}
 	if (!receiverUser || !receiverUser.isActive) {
 		throw new AppError('VALIDATION_ERROR', 'Pengguna penerima tidak ditemukan atau tidak aktif.');
+	}
+
+	const eligibility = verifyGiverEligibility({
+		giverId,
+		giverRole: giverUser.role,
+		receiverId,
+		currentHolderId: loan.borrowerId
+	});
+
+	if (!eligibility.valid) {
+		throw new AppError(
+			'INVALID_STATUS_TRANSITION',
+			'Konflik serah terima: pihak pemberi bukan pemegang barang saat ini.',
+			{
+				giverId,
+				currentHolderId: loan.borrowerId
+			},
+			409
+		);
 	}
 
 	const now = new Date();
@@ -216,7 +267,14 @@ export async function confirmHandover(
 
 	const existing = await prisma.handover.findUnique({
 		where: { id: handoverId },
-		include: { loan: true }
+		include: {
+			giver: { select: { id: true, role: true } },
+			loan: {
+				include: {
+					items: { where: { returnedAt: null } }
+				}
+			}
+		}
 	});
 
 	if (!existing) {
@@ -240,22 +298,139 @@ export async function confirmHandover(
 		);
 	}
 
-	const now = new Date();
-	const nextGiverConfirmedAt = isGiver
-		? (existing.giverConfirmedAt ?? now)
-		: existing.giverConfirmedAt;
-	const nextReceiverConfirmedAt = isReceiver
-		? (existing.receiverConfirmedAt ?? now)
-		: existing.receiverConfirmedAt;
+	// Tolak bila serah terima ini sudah dibatalkan/kedaluwarsa karena pemegang telah berpindah pada serah terima lain
+	if (existing.documentNo?.startsWith(SUPERSEDED_PREFIX)) {
+		throw new AppError(
+			'INVALID_STATUS_TRANSITION',
+			'Konflik serah terima: serah terima ini sudah kedaluwarsa karena barang telah diserahterimakan ke pihak lain.',
+			{
+				handoverId: existing.id,
+				currentHolderId: existing.loan.borrowerId
+			},
+			409
+		);
+	}
 
-	const bothConfirmed = Boolean(nextGiverConfirmedAt && nextReceiverConfirmedAt);
-	const nextDocumentNo =
-		bothConfirmed && !existing.documentNo ? generateHandoverDocumentNo() : existing.documentNo;
+	// 1. Loan wajib masih ACTIVE dan masih memiliki barang yang belum dikembalikan saat konfirmasi
+	if (existing.loan.status !== 'ACTIVE' || existing.loan.items.length === 0) {
+		throw new AppError(
+			'INVALID_STATUS_TRANSITION',
+			`Serah terima tidak dapat dikonfirmasi karena peminjaman sudah tidak aktif atau barang telah dikembalikan (status: ${existing.loan.status}).`,
+			{
+				loanId: existing.loanId,
+				loanStatus: existing.loan.status
+			},
+			409
+		);
+	}
+
+	const preCheckEligibility = verifyGiverEligibility({
+		giverId: existing.giverId,
+		giverRole: existing.giver.role,
+		receiverId: existing.receiverId,
+		currentHolderId: existing.loan.borrowerId
+	});
+
+	if (!preCheckEligibility.valid) {
+		// Batalkan serah terima menggantung yang tidak lagi valid untuk loan ini sebelum menolak konfirmasi sebagai konflik
+		await prisma.$transaction(async (tx) => {
+			const staleHandovers = await tx.handover.findMany({
+				where: {
+					loanId: existing.loanId,
+					documentNo: null,
+					OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
+				}
+			});
+			for (const stale of staleHandovers) {
+				if (stale.giverId !== existing.loan.borrowerId) {
+					const marker = generateSupersededMarker(stale.id);
+					await tx.handover.update({
+						where: { id: stale.id },
+						data: { documentNo: marker }
+					});
+					await writeAuditLog(tx, {
+						actorId: actor.id,
+						action: 'HANDOVER_SUPERSEDED',
+						entityType: 'Handover',
+						entityId: stale.id,
+						before: { documentNo: null },
+						after: {
+							documentNo: marker,
+							reason: 'GIVER_NOT_CURRENT_HOLDER',
+							currentHolderId: existing.loan.borrowerId
+						},
+						ip: ip ?? null
+					});
+				}
+			}
+		});
+
+		throw new AppError(
+			'INVALID_STATUS_TRANSITION',
+			'Konflik serah terima: pihak pemberi bukan lagi pemegang barang saat ini.',
+			{
+				handoverId: existing.id,
+				giverId: existing.giverId,
+				currentHolderId: existing.loan.borrowerId
+			},
+			409
+		);
+	}
 
 	const updated = await prisma.$transaction(async (tx) => {
-		if (input.evidenceId) {
+		// Baca ulang Loan di dalam transaksi untuk menjamin konsistensi konkurensi
+		const freshLoan = await tx.loan.findUniqueOrThrow({
+			where: { id: existing.loanId },
+			include: {
+				items: { where: { returnedAt: null } }
+			}
+		});
+
+		if (freshLoan.status !== 'ACTIVE' || freshLoan.items.length === 0) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				'Serah terima tidak dapat dikonfirmasi karena barang sudah dikembalikan.',
+				{ loanId: existing.loanId, loanStatus: freshLoan.status },
+				409
+			);
+		}
+
+		// 2. Pastikan pemberi adalah pemegang saat ini, kecuali kasus petugas menyerahkan ke peminjam yang memang sudah tercatat sebagai peminjam
+		const eligibility = verifyGiverEligibility({
+			giverId: existing.giverId,
+			giverRole: existing.giver.role,
+			receiverId: existing.receiverId,
+			currentHolderId: freshLoan.borrowerId
+		});
+
+		if (!eligibility.valid) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				'Konflik serah terima: pihak pemberi bukan lagi pemegang barang saat ini.',
+				{
+					handoverId: existing.id,
+					giverId: existing.giverId,
+					currentHolderId: freshLoan.borrowerId
+				},
+				409
+			);
+		}
+
+		if (input.evidenceId && input.evidenceId !== existing.evidenceId) {
 			await validateHandoverEvidence(tx, actor, input.evidenceId);
 		}
+
+		const now = new Date();
+		const nextGiverConfirmedAt = isGiver
+			? (existing.giverConfirmedAt ?? now)
+			: existing.giverConfirmedAt;
+		const nextReceiverConfirmedAt = isReceiver
+			? (existing.receiverConfirmedAt ?? now)
+			: existing.receiverConfirmedAt;
+
+		const bothConfirmed = Boolean(nextGiverConfirmedAt && nextReceiverConfirmedAt);
+		const nextDocumentNo =
+			bothConfirmed && !existing.documentNo ? generateHandoverDocumentNo() : existing.documentNo;
 
 		const handover = await tx.handover.update({
 			where: { id: handoverId },
@@ -268,9 +443,15 @@ export async function confirmHandover(
 			include: HANDOVER_INCLUDE
 		});
 
-		// Pilihan (a): Setelah serah terima dikonfirmasi kedua pihak, pemegang barang (Loan.borrowerId) berpindah ke penerima
-		const previousBorrowerId = existing.loan.borrowerId;
-		const holderTransferred = bothConfirmed && previousBorrowerId !== existing.receiverId;
+		// Pilihan (a): Setelah serah terima dikonfirmasi kedua pihak, pemegang barang berpindah ke penerima
+		// (Tidak berpindah bila kasus petugas menyerahkan ke peminjam yang memang sudah tercatat sebagai borrowerId)
+		const previousBorrowerId = freshLoan.borrowerId;
+		const holderTransferred =
+			bothConfirmed &&
+			!eligibility.isOfficerInitialDelivery &&
+			previousBorrowerId !== existing.receiverId;
+
+		const supersededHandoverIds: string[] = [];
 
 		if (holderTransferred) {
 			await tx.loan.update({
@@ -293,6 +474,39 @@ export async function confirmHandover(
 				},
 				ip: ip ?? null
 			});
+
+			// 3. Batalkan/tandai kedaluwarsa serah terima lain yang masih menunggu untuk peminjaman yang sama
+			const otherPendingHandovers = await tx.handover.findMany({
+				where: {
+					loanId: existing.loanId,
+					id: { not: handoverId },
+					documentNo: null,
+					OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
+				}
+			});
+
+			for (const stale of otherPendingHandovers) {
+				const marker = generateSupersededMarker(stale.id);
+				await tx.handover.update({
+					where: { id: stale.id },
+					data: { documentNo: marker }
+				});
+				supersededHandoverIds.push(stale.id);
+
+				await writeAuditLog(tx, {
+					actorId: actor.id,
+					action: 'HANDOVER_SUPERSEDED',
+					entityType: 'Handover',
+					entityId: stale.id,
+					before: { documentNo: null },
+					after: {
+						documentNo: marker,
+						supersededByHandoverId: handover.id,
+						newHolderId: existing.receiverId
+					},
+					ip: ip ?? null
+				});
+			}
 		}
 
 		await writeAuditLog(tx, {
@@ -311,7 +525,8 @@ export async function confirmHandover(
 				receiverConfirmedAt: handover.receiverConfirmedAt?.toISOString() ?? null,
 				documentNo: handover.documentNo,
 				holderTransferred,
-				newHolderId: bothConfirmed ? existing.receiverId : previousBorrowerId
+				newHolderId: holderTransferred ? existing.receiverId : previousBorrowerId,
+				...(supersededHandoverIds.length > 0 ? { supersededHandoverIds } : {})
 			},
 			ip: ip ?? null
 		});
@@ -360,6 +575,7 @@ export async function listHandovers(
 		...(params.loanId ? { loanId: params.loanId } : {}),
 		...(params.unconfirmedOnly
 			? {
+					documentNo: null,
 					OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
 				}
 			: {})

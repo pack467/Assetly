@@ -1,7 +1,7 @@
 import { ZodError } from 'zod';
-import type { Prisma, SyncStatus } from '@prisma/client';
+import { Prisma, type SyncStatus } from '@prisma/client';
 import { prisma } from '$lib/server/db';
-import { writeAuditLog } from '$lib/server/audit';
+import { writeAuditLog, type DbTx } from '$lib/server/audit';
 import type { PolicyUser } from '$lib/server/policy';
 import { AppError, type ErrorCode } from '$lib/shared/errors';
 import { createLoanSchema, returnLoanItemSchema } from '$lib/shared/schemas/loan';
@@ -48,25 +48,41 @@ async function executeSingleOperation(
 				clientOpId: op.clientOpId
 			});
 			const res = await createLoan(actor, parsed, ip);
-			return { loanId: res.loan.id, status: res.loan.status };
+			return {
+				loanId: res.loan.id,
+				status: res.loan.status,
+				recoveredReplay: res.idempotentReplay
+			};
 		}
 
 		case 'LOAN_RETURN': {
 			let loanItemId =
 				typeof rawPayload.loanItemId === 'string' ? rawPayload.loanItemId.trim() : '';
 
-			// Bila klien offline mengirim assetId (karena meminjam & mengembalikan dalam antrean offline),
-			// temukan LoanItem aktif untuk assetId tersebut
+			// Bila klien offline mengirim assetId, cari LoanItem aktif ATAU LoanItem yang baru saja dikembalikan
+			// oleh operasi dengan evidenceId yang sama (pemulihan crash sebelum SyncOperation tercatat)
 			if (!loanItemId && typeof rawPayload.assetId === 'string') {
+				const assetId = rawPayload.assetId.trim();
 				const activeLoanItem = await prisma.loanItem.findFirst({
 					where: {
-						assetId: rawPayload.assetId.trim(),
+						assetId,
 						returnedAt: null
 					},
 					select: { id: true }
 				});
 				if (activeLoanItem) {
 					loanItemId = activeLoanItem.id;
+				} else if (typeof rawPayload.evidenceId === 'string') {
+					const alreadyReturnedBySameEv = await prisma.loanItem.findFirst({
+						where: {
+							assetId,
+							returnEvidenceId: rawPayload.evidenceId.trim()
+						},
+						select: { id: true }
+					});
+					if (alreadyReturnedBySameEv) {
+						loanItemId = alreadyReturnedBySameEv.id;
+					}
 				}
 			}
 
@@ -146,51 +162,217 @@ async function executeSingleOperation(
 	}
 }
 
-async function recordSyncOutcome(params: {
-	actorId: string;
-	op: SyncOperationItemInput;
-	clientCreatedAt: Date;
-	status: SyncStatus;
-	conflictReason: string | null;
-	ip?: string;
-}) {
-	return prisma.$transaction(async (tx) => {
-		const syncRecord = await tx.syncOperation.create({
-			data: {
-				clientOpId: params.op.clientOpId,
-				userId: params.actorId,
-				type: params.op.type,
-				payload: params.op.payload as Prisma.InputJsonValue,
-				status: params.status,
-				conflictReason: params.conflictReason,
-				clientCreatedAt: params.clientCreatedAt
-			}
-		});
-
-		await writeAuditLog(tx, {
-			actorId: params.actorId,
-			action: `SYNC_OPERATION_${params.status}`,
-			entityType: 'SyncOperation',
-			entityId: syncRecord.id,
-			after: {
-				clientOpId: syncRecord.clientOpId,
-				type: syncRecord.type,
-				status: syncRecord.status,
-				conflictReason: syncRecord.conflictReason,
-				clientCreatedAt: params.clientCreatedAt.toISOString()
-			},
-			ip: params.ip ?? null
-		});
-
-		return syncRecord;
+async function saveSyncOperationInTx(
+	tx: DbTx,
+	params: {
+		actorId: string;
+		op: SyncOperationItemInput;
+		clientCreatedAt: Date;
+		status: SyncStatus;
+		conflictReason: string | null;
+		ip?: string;
+	}
+) {
+	const existing = await tx.syncOperation.findUnique({
+		where: { clientOpId: params.op.clientOpId }
 	});
+	if (existing) {
+		return { record: existing, alreadyExisted: true };
+	}
+
+	const syncRecord = await tx.syncOperation.create({
+		data: {
+			clientOpId: params.op.clientOpId,
+			userId: params.actorId,
+			type: params.op.type,
+			payload: params.op.payload as Prisma.InputJsonValue,
+			status: params.status,
+			conflictReason: params.conflictReason,
+			clientCreatedAt: params.clientCreatedAt
+		}
+	});
+
+	await writeAuditLog(tx, {
+		actorId: params.actorId,
+		action: `SYNC_OPERATION_${params.status}`,
+		entityType: 'SyncOperation',
+		entityId: syncRecord.id,
+		after: {
+			clientOpId: syncRecord.clientOpId,
+			type: syncRecord.type,
+			status: syncRecord.status,
+			conflictReason: syncRecord.conflictReason,
+			clientCreatedAt: params.clientCreatedAt.toISOString()
+		},
+		ip: params.ip ?? null
+	});
+
+	return { record: syncRecord, alreadyExisted: false };
+}
+
+function buildReplayOrHijackResult(
+	existingSyncOp: {
+		id: string;
+		clientOpId: string;
+		userId: string;
+		type: string;
+		status: SyncStatus;
+		conflictReason: string | null;
+	},
+	actorId: string,
+	requestedType: string
+): SyncOperationResultItem {
+	if (existingSyncOp.userId !== actorId) {
+		return {
+			clientOpId: existingSyncOp.clientOpId,
+			type: requestedType,
+			status: 'REJECTED',
+			code: 'DUPLICATE_OPERATION',
+			conflictReason: 'clientOpId sudah digunakan oleh pengguna lain.',
+			idempotentReplay: false,
+			syncOperationId: existingSyncOp.id
+		};
+	}
+
+	return {
+		clientOpId: existingSyncOp.clientOpId,
+		type: existingSyncOp.type,
+		status: existingSyncOp.status,
+		conflictReason: existingSyncOp.conflictReason,
+		idempotentReplay: true,
+		syncOperationId: existingSyncOp.id
+	};
+}
+
+/**
+ * Memproses satu operasi sinkronisasi di bawah kunci eksklusif PostgreSQL pg_advisory_xact_lock(hashtext(clientOpId))
+ * sehingga tahan terhadap pengiriman ulang maupun request paralel dengan clientOpId yang sama.
+ */
+async function processSingleSyncOperationWithLock(
+	actor: PolicyUser,
+	op: SyncOperationItemInput,
+	clientCreatedAt: Date,
+	ip?: string
+): Promise<SyncOperationResultItem> {
+	try {
+		return await prisma.$transaction(
+			async (lockTx) => {
+				// 1. Kunci eksklusif tingkat transaksi PostgreSQL per clientOpId
+				await lockTx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${op.clientOpId}))`;
+
+				// 2. Cek apakah clientOpId sudah pernah tercatat di SyncOperation
+				const existingSyncOp = await lockTx.syncOperation.findUnique({
+					where: { clientOpId: op.clientOpId }
+				});
+
+				if (existingSyncOp) {
+					return buildReplayOrHijackResult(existingSyncOp, actor.id, op.type);
+				}
+
+				// 3. Eksekusi operasi bisnis selama kunci pg_advisory_xact_lock masih dipegang
+				try {
+					const data = await executeSingleOperation(actor, op, ip);
+					const { record, alreadyExisted } = await saveSyncOperationInTx(lockTx, {
+						actorId: actor.id,
+						op,
+						clientCreatedAt,
+						status: 'ACCEPTED',
+						conflictReason: null,
+						ip
+					});
+
+					return {
+						clientOpId: op.clientOpId,
+						type: op.type,
+						status: record.status,
+						conflictReason: record.conflictReason,
+						idempotentReplay: alreadyExisted,
+						syncOperationId: record.id,
+						data
+					};
+				} catch (err) {
+					if (err instanceof AppError) {
+						const isConflict = CONFLICT_ERROR_CODES.has(err.code);
+						const syncStatus: SyncStatus = isConflict ? 'CONFLICT' : 'REJECTED';
+
+						const { record, alreadyExisted } = await saveSyncOperationInTx(lockTx, {
+							actorId: actor.id,
+							op,
+							clientCreatedAt,
+							status: syncStatus,
+							conflictReason: err.message,
+							ip
+						});
+
+						if (alreadyExisted) {
+							return buildReplayOrHijackResult(record, actor.id, op.type);
+						}
+
+						return {
+							clientOpId: op.clientOpId,
+							type: op.type,
+							status: syncStatus,
+							code: err.code,
+							conflictReason: err.message,
+							...(err.details ? { details: err.details } : {}),
+							idempotentReplay: false,
+							syncOperationId: record.id
+						};
+					}
+
+					if (err instanceof ZodError) {
+						const reason = err.issues
+							.map((i) => `${i.path.join('.') || 'payload'}: ${i.message}`)
+							.join('; ');
+
+						const { record, alreadyExisted } = await saveSyncOperationInTx(lockTx, {
+							actorId: actor.id,
+							op,
+							clientCreatedAt,
+							status: 'REJECTED',
+							conflictReason: reason,
+							ip
+						});
+
+						if (alreadyExisted) {
+							return buildReplayOrHijackResult(record, actor.id, op.type);
+						}
+
+						return {
+							clientOpId: op.clientOpId,
+							type: op.type,
+							status: 'REJECTED',
+							code: 'VALIDATION_ERROR',
+							conflictReason: reason,
+							idempotentReplay: false,
+							syncOperationId: record.id
+						};
+					}
+
+					throw err;
+				}
+			},
+			{
+				maxWait: 10000,
+				timeout: 20000
+			}
+		);
+	} catch (err) {
+		// Pengaman tambahan: bila terjadi pelanggaran unique clientOpId (P2002), kembalikan hasil yang sudah tersimpan
+		if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+			const existing = await prisma.syncOperation.findUnique({
+				where: { clientOpId: op.clientOpId }
+			});
+			if (existing) {
+				return buildReplayOrHijackResult(existing, actor.id, op.type);
+			}
+		}
+		throw err;
+	}
 }
 
 /**
  * Memproses batch operasi antrean offline (Bagian 10.2 & 10.3 PROJECT_SPEC.md).
- * - Diurutkan berdasarkan clientCreatedAt.
- * - Idempoten berdasarkan clientOpId (BR-14).
- * - Hasil per operasi: ACCEPTED / CONFLICT / REJECTED.
  */
 export async function processSyncBatch(
 	actor: PolicyUser | null | undefined,
@@ -221,115 +403,13 @@ export async function processSyncBatch(
 	const results: SyncOperationResultItem[] = [];
 
 	for (const entry of indexedOps) {
-		const { op, clientCreatedAt } = entry;
-
-		// 1. Cek idempotensi berdasarkan clientOpId di tabel SyncOperation (BR-14)
-		const existingSyncOp = await prisma.syncOperation.findUnique({
-			where: { clientOpId: op.clientOpId }
-		});
-
-		if (existingSyncOp) {
-			if (existingSyncOp.userId !== actor.id) {
-				results.push({
-					clientOpId: op.clientOpId,
-					type: op.type,
-					status: 'REJECTED',
-					code: 'DUPLICATE_OPERATION',
-					conflictReason: 'clientOpId sudah digunakan oleh pengguna lain.',
-					idempotentReplay: false,
-					syncOperationId: existingSyncOp.id
-				});
-				continue;
-			}
-
-			// Operasi yang sama dikirim ulang: kembalikan hasil sebelumnya tanpa mengeksekusi ulang
-			results.push({
-				clientOpId: existingSyncOp.clientOpId,
-				type: existingSyncOp.type,
-				status: existingSyncOp.status,
-				conflictReason: existingSyncOp.conflictReason,
-				idempotentReplay: true,
-				syncOperationId: existingSyncOp.id
-			});
-			continue;
-		}
-
-		// 2. Jalankan operasi bisnis dengan seluruh aturan validasi, bukti, dan transaksi yang ada
-		try {
-			const data = await executeSingleOperation(actor, op, ip);
-			const saved = await recordSyncOutcome({
-				actorId: actor.id,
-				op,
-				clientCreatedAt,
-				status: 'ACCEPTED',
-				conflictReason: null,
-				ip
-			});
-
-			results.push({
-				clientOpId: op.clientOpId,
-				type: op.type,
-				status: 'ACCEPTED',
-				conflictReason: null,
-				idempotentReplay: false,
-				syncOperationId: saved.id,
-				data
-			});
-		} catch (err) {
-			if (err instanceof AppError) {
-				const isConflict = CONFLICT_ERROR_CODES.has(err.code);
-				const syncStatus: SyncStatus = isConflict ? 'CONFLICT' : 'REJECTED';
-
-				const saved = await recordSyncOutcome({
-					actorId: actor.id,
-					op,
-					clientCreatedAt,
-					status: syncStatus,
-					conflictReason: err.message,
-					ip
-				});
-
-				results.push({
-					clientOpId: op.clientOpId,
-					type: op.type,
-					status: syncStatus,
-					code: err.code,
-					conflictReason: err.message,
-					...(err.details ? { details: err.details } : {}),
-					idempotentReplay: false,
-					syncOperationId: saved.id
-				});
-				continue;
-			}
-
-			if (err instanceof ZodError) {
-				const reason = err.issues
-					.map((i) => `${i.path.join('.') || 'payload'}: ${i.message}`)
-					.join('; ');
-
-				const saved = await recordSyncOutcome({
-					actorId: actor.id,
-					op,
-					clientCreatedAt,
-					status: 'REJECTED',
-					conflictReason: reason,
-					ip
-				});
-
-				results.push({
-					clientOpId: op.clientOpId,
-					type: op.type,
-					status: 'REJECTED',
-					code: 'VALIDATION_ERROR',
-					conflictReason: reason,
-					idempotentReplay: false,
-					syncOperationId: saved.id
-				});
-				continue;
-			}
-
-			throw err;
-		}
+		const itemResult = await processSingleSyncOperationWithLock(
+			actor,
+			entry.op,
+			entry.clientCreatedAt,
+			ip
+		);
+		results.push(itemResult);
 	}
 
 	const summary = {

@@ -162,6 +162,31 @@ export async function createLoan(
 		throw new AppError('EVIDENCE_REQUIRED', 'Data foto bukti (Evidence) tidak ditemukan.');
 	}
 
+	// Pemulihan idempoten bila operasi peminjaman milik pengguna sendiri sudah pernah berhasil
+	// sebelum SyncOperation sempat tercatat (mencegah CONFLICT/REJECTED palsu saat kirim ulang)
+	if (normalizedItems.length === 1) {
+		const recoveredItem = await prisma.loanItem.findFirst({
+			where: {
+				assetId: normalizedItems[0].assetId,
+				checkoutEvidenceId: evidenceIdsList[0],
+				loan: {
+					createdById: actor.id
+				}
+			},
+			include: {
+				loan: {
+					include: LOAN_DETAIL_INCLUDE
+				}
+			}
+		});
+		if (recoveredItem) {
+			return {
+				loan: recoveredItem.loan,
+				idempotentReplay: true
+			};
+		}
+	}
+
 	const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
 	for (const ev of evidences) {
 		// 1. Saat pinjam, foto bukti harus ber-purpose CHECKOUT
@@ -396,6 +421,20 @@ export async function returnLoanItem(
 	assertCan(actor, 'loan:return', { borrowerId: existingItem.loan.borrowerId });
 
 	if (existingItem.returnedAt !== null) {
+		// Pemulihan idempoten bila pengembalian milik pengguna sendiri dengan foto bukti yang sama sudah berhasil
+		// sebelum SyncOperation tercatat (mencegah CONFLICT palsu saat kirim ulang)
+		if (existingItem.returnEvidenceId === input.evidenceId) {
+			const existingLoan = await prisma.loan.findUniqueOrThrow({
+				where: { id: existingItem.loanId },
+				include: LOAN_DETAIL_INCLUDE
+			});
+			return {
+				loanItem: existingItem,
+				asset: existingItem.asset,
+				loan: existingLoan
+			};
+		}
+
 		throw new AppError('INVALID_STATUS_TRANSITION', 'Barang ini sudah dikembalikan sebelumnya.', {
 			returnedAt: existingItem.returnedAt.toISOString()
 		});

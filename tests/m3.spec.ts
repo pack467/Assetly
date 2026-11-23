@@ -329,6 +329,135 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 				}
 			);
 		});
+
+		it('menangani 3 kasus batas serah terima: petugas -> peminjam awal (tanpa perpindahan), dua serah terima dari pemberi yang sama (konflik & superseded), dan konfirmasi setelah barang dikembalikan', async () => {
+			// Buat aset khusus & pinjaman awal untuk borrower1
+			const edgeAsset = await prisma.asset.create({
+				data: {
+					code: `AST-M3-EDGE-${randomUUID().slice(0, 6).toUpperCase()}`,
+					qrToken: randomUUID(),
+					name: 'Laptop Uji Kasus Batas Handover',
+					categoryId,
+					homeLocationId: locationId
+				}
+			});
+			const checkoutEv = await createEvidenceForActor(borrower1, 'CHECKOUT');
+			const createdLoan = await createLoan(borrower1, {
+				assetId: edgeAsset.id,
+				evidenceId: checkoutEv.id,
+				purpose: 'Uji Kasus Batas Handover',
+				expectedReturnAt: new Date(Date.now() + 86400_000).toISOString()
+			});
+			const edgeLoanId = createdLoan.loan.id;
+			const edgeLoanItemId = createdLoan.loan.items[0].id;
+
+			// KASUS A: Petugas (officer1) menyerahkan fisik barang ke peminjam awal (borrower1) yang sudah tercatat sebagai loan.borrowerId
+			const hoOfficerEv = await createEvidenceForActor(officer1, 'HANDOVER');
+			const hoInitial = await createHandover(officer1, {
+				loanId: edgeLoanId,
+				receiverId: borrower1.id,
+				evidenceId: hoOfficerEv.id,
+				note: 'Penyerahan fisik awal dari gudang oleh petugas'
+			});
+			const confirmedInitial = await confirmHandover(borrower1, hoInitial.handover.id);
+			expect(confirmedInitial.handover.loan.borrowerId).toBe(borrower1.id);
+
+			// Pastikan TIDAK ada AuditLog LOAN_HOLDER_TRANSFERRED untuk penyerahan awal ke peminjam yang sudah sama
+			const initialTransferLog = await prisma.auditLog.findFirst({
+				where: {
+					entityType: 'Loan',
+					entityId: edgeLoanId,
+					action: 'LOAN_HOLDER_TRANSFERRED'
+				}
+			});
+			expect(initialTransferLog).toBeNull();
+
+			// KASUS B: Pemegang saat ini (borrower1) membuat DUA serah terima gantung:
+			// Handover #1: borrower1 -> borrower2
+			// Handover #2: borrower1 -> officer1
+			const hoDup1Ev = await createEvidenceForActor(borrower1, 'HANDOVER');
+			const hoDup1 = await createHandover(borrower1, {
+				loanId: edgeLoanId,
+				receiverId: borrower2.id,
+				evidenceId: hoDup1Ev.id,
+				note: 'Handover 1 ke borrower2'
+			});
+
+			const hoDup2Ev = await createEvidenceForActor(borrower1, 'HANDOVER');
+			const hoDup2 = await createHandover(borrower1, {
+				loanId: edgeLoanId,
+				receiverId: officer1.id,
+				evidenceId: hoDup2Ev.id,
+				note: 'Handover 2 ke officer1'
+			});
+
+			// Saat borrower2 mengonfirmasi Handover #1, pemegang berpindah ke borrower2
+			// dan Handover #2 otomatis dibatalkan (superseded)
+			const confirmedDup1 = await confirmHandover(borrower2, hoDup1.handover.id);
+			expect(confirmedDup1.handover.loan.borrowerId).toBe(borrower2.id);
+
+			const supersededRecord = await prisma.handover.findUniqueOrThrow({
+				where: { id: hoDup2.handover.id }
+			});
+			expect(supersededRecord.documentNo).toMatch(/^SUPERSEDED-/);
+
+			const supersededAudit = await prisma.auditLog.findFirst({
+				where: {
+					entityType: 'Handover',
+					entityId: hoDup2.handover.id,
+					action: 'HANDOVER_SUPERSEDED'
+				}
+			});
+			expect(supersededAudit).not.toBeNull();
+
+			// Jika officer1 mencoba mengonfirmasi Handover #2 setelah pemegang sudah berpindah ke borrower2 -> DITOLAK (409 INVALID_STATUS_TRANSITION)
+			await expect(confirmHandover(officer1, hoDup2.handover.id)).rejects.toMatchObject({
+				code: 'INVALID_STATUS_TRANSITION',
+				status: 409
+			});
+
+			// Jika borrower1 (yang sudah bukan pemegang lagi) mencoba membuat handover baru -> DITOLAK (409 INVALID_STATUS_TRANSITION)
+			const hoStaleGiverEv = await createEvidenceForActor(borrower1, 'HANDOVER');
+			await expect(
+				createHandover(borrower1, {
+					loanId: edgeLoanId,
+					receiverId: officer1.id,
+					evidenceId: hoStaleGiverEv.id
+				})
+			).rejects.toMatchObject({
+				code: 'INVALID_STATUS_TRANSITION',
+				status: 409
+			});
+
+			// KASUS C: Konfirmasi setelah barang sudah dikembalikan (Loan COMPLETED)
+			// Pertama, pemegang sah saat ini (borrower2) membuat handover ke borrower1 (masih belum dikonfirmasi)
+			const hoBeforeReturnEv = await createEvidenceForActor(borrower2, 'HANDOVER');
+			const hoBeforeReturn = await createHandover(borrower2, {
+				loanId: edgeLoanId,
+				receiverId: borrower1.id,
+				evidenceId: hoBeforeReturnEv.id,
+				note: 'Handover dibuat sebelum barang dikembalikan'
+			});
+
+			// Lalu barang dikembalikan ke gudang sehingga Loan menjadi COMPLETED
+			const returnEv = await createEvidenceForActor(borrower2, 'RETURN');
+			const returned = await returnLoanItem(borrower2, edgeLoanItemId, {
+				returnCondition: 'NORMAL',
+				evidenceId: returnEv.id
+			});
+			expect(returned.loan.status).toBe('COMPLETED');
+
+			// Setelah Loan selesai (COMPLETED), borrower1 mencoba mengonfirmasi handover gantung tadi -> WAJIB DITOLAK (409 INVALID_STATUS_TRANSITION)
+			await expect(confirmHandover(borrower1, hoBeforeReturn.handover.id)).rejects.toMatchObject({
+				code: 'INVALID_STATUS_TRANSITION',
+				status: 409
+			});
+
+			// Dan pemegang historis pada Loan yang sudah selesai TIDAK boleh berubah (tetap borrower2)
+			const finalLoan = await prisma.loan.findUniqueOrThrow({ where: { id: edgeLoanId } });
+			expect(finalLoan.status).toBe('COMPLETED');
+			expect(finalLoan.borrowerId).toBe(borrower2.id);
+		});
 	});
 
 	describe('2. Buka & Tutup Shift (Tanpa Barang Tertinggal vs Dengan Barang Tertinggal — Bagian 7.4 & BR-12)', () => {
