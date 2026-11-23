@@ -356,8 +356,7 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			const hoInitial = await createHandover(officer1, {
 				loanId: edgeLoanId,
 				receiverId: borrower1.id,
-				evidenceId: hoOfficerEv.id,
-				note: 'Penyerahan fisik awal dari gudang oleh petugas'
+				evidenceId: hoOfficerEv.id
 			});
 			const confirmedInitial = await confirmHandover(borrower1, hoInitial.handover.id);
 			expect(confirmedInitial.handover.loan.borrowerId).toBe(borrower1.id);
@@ -379,16 +378,14 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			const hoDup1 = await createHandover(borrower1, {
 				loanId: edgeLoanId,
 				receiverId: borrower2.id,
-				evidenceId: hoDup1Ev.id,
-				note: 'Handover 1 ke borrower2'
+				evidenceId: hoDup1Ev.id
 			});
 
 			const hoDup2Ev = await createEvidenceForActor(borrower1, 'HANDOVER');
 			const hoDup2 = await createHandover(borrower1, {
 				loanId: edgeLoanId,
 				receiverId: officer1.id,
-				evidenceId: hoDup2Ev.id,
-				note: 'Handover 2 ke officer1'
+				evidenceId: hoDup2Ev.id
 			});
 
 			// Saat borrower2 mengonfirmasi Handover #1, pemegang berpindah ke borrower2
@@ -435,8 +432,7 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			const hoBeforeReturn = await createHandover(borrower2, {
 				loanId: edgeLoanId,
 				receiverId: borrower1.id,
-				evidenceId: hoBeforeReturnEv.id,
-				note: 'Handover dibuat sebelum barang dikembalikan'
+				evidenceId: hoBeforeReturnEv.id
 			});
 
 			// Lalu barang dikembalikan ke gudang sehingga Loan menjadi COMPLETED

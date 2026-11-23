@@ -20,7 +20,7 @@ import {
 	type OfflineQueueStorage,
 	type PendingEvidencePayload
 } from '$lib/client/offlineQueue';
-import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
+import { formatFriendlyErrorMessage, type ApiErrorShape } from '$lib/shared/mobile/watermark';
 
 export interface EnqueueOperationInput {
 	clientOpId?: string;
@@ -242,14 +242,14 @@ async function executeSyncPendingOperations(
 				});
 
 				if (!evRes.ok) {
-					let evErrorBody: unknown = null;
+					let evErrorBody: ApiErrorShape | null = null;
 					try {
-						evErrorBody = await evRes.json();
+						evErrorBody = (await evRes.json()) as ApiErrorShape;
 					} catch {
 						// Abaikan jika bukan JSON
 					}
 
-					const errObj = (evErrorBody as { error?: { code?: string; message?: string } })?.error;
+					const errObj = evErrorBody?.error;
 					const errCode = errObj?.code ?? null;
 
 					// Jika error 4xx permanen (validasi foto gagal, mock location diblokir, forbidden), tandai REJECTED
@@ -323,9 +323,9 @@ async function executeSyncPendingOperations(
 			});
 
 			if (!syncRes.ok) {
-				let syncErrBody: unknown = null;
+				let syncErrBody: ApiErrorShape | null = null;
 				try {
-					syncErrBody = await syncRes.json();
+					syncErrBody = (await syncRes.json()) as ApiErrorShape;
 				} catch {
 					// Abaikan
 				}

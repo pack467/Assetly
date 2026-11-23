@@ -15,7 +15,12 @@ const prisma = new PrismaClient();
 
 async function main() {
 	const adminEmail = process.env.SEED_ADMIN_EMAIL || 'admin@itam.local';
-	const adminPass = process.env.SEED_ADMIN_PASSWORD || randomBytes(12).toString('base64url');
+	const hasExplicitPassword = Boolean(
+		process.env.SEED_ADMIN_PASSWORD && process.env.SEED_ADMIN_PASSWORD.trim().length > 0
+	);
+	const adminPass = hasExplicitPassword
+		? process.env.SEED_ADMIN_PASSWORD.trim()
+		: randomBytes(12).toString('base64url');
 
 	const existingAdmin = await prisma.user.findUnique({ where: { email: adminEmail } });
 	if (!existingAdmin) {
@@ -39,6 +44,9 @@ async function main() {
 		});
 
 		console.log(`Seeded ADMIN: ${created.email}`);
+		if (!hasExplicitPassword) {
+			console.log(`Generated One-Time Admin Password: ${adminPass}`);
+		}
 		console.log(`TOTP Base32 Secret: ${secret.base32}`);
 	} else {
 		console.log(`Admin ${adminEmail} already exists.`);

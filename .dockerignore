@@ -1,0 +1,24 @@
+# Rahasia & konfigurasi lokal (wajib dikecualikan dari image Docker)
+.env
+.env.*
+!.env.example
+
+# Dependensi & data lokal host
+node_modules
+.pgdata
+.storage
+
+# Hasil build lokal & cache
+.svelte-kit
+build
+android
+ios
+
+# Git & log
+.git
+.gitignore
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*

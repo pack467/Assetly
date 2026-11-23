@@ -134,7 +134,7 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 
 		const apiClient = createMobileApiClient({
 			baseUrl: 'http://localhost:5173',
-			tokenStorage,
+			storage: tokenStorage,
 			fetchFn: mockFetch
 		});
 
@@ -263,7 +263,7 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 
 		const apiClient = createMobileApiClient({
 			baseUrl: 'http://localhost:5173',
-			tokenStorage,
+			storage: tokenStorage,
 			fetchFn: mockFetch
 		});
 
@@ -358,7 +358,7 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 
 		const apiClient = createMobileApiClient({
 			baseUrl: 'http://localhost:5173',
-			tokenStorage,
+			storage: tokenStorage,
 			fetchFn: mockFetch
 		});
 

@@ -28,7 +28,9 @@ export const POST: RequestHandler = async (event) => {
 			ip: ip ?? undefined
 		});
 
-		const isSecure = process.env.NODE_ENV === 'production';
+		const forwardedProto = event.request.headers.get('x-forwarded-proto');
+		const isHttps = event.url.protocol === 'https:' || forwardedProto === 'https';
+		const isSecure = process.env.NODE_ENV === 'production' && isHttps;
 
 		event.cookies.set(ACCESSTOKEN_COOKIE, result.accessToken, {
 			path: '/',
