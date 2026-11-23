@@ -31,3 +31,5 @@ Dokumen ini mencatat semua keputusan terbuka pada **Bagian 21 `PROJECT_SPEC.md`*
    - Maksimal **5 percobaan gagal per 15 menit** per kombinasi email/IP; percobaan ke-6 mengembalikan HTTP `429` dengan kode error baku `RATE_LIMITED`.
 3. **Verifikasi dua langkah (TOTP - BR-19):**
    - Akun `ADMIN` yang sudah memiliki `mfaSecret` wajib menyertakan `totpCode` 6 digit saat login. Pendaftaran/aktivasi TOTP admin dikelola pada M1.
+4. **Konfigurasi CORS Ketat untuk Capacitor (Bagian 12):**
+   - Origin aplikasi Android Capacitor (`https://localhost` dan `capacitor://localhost`) dikontrol melalui variabel lingkungan `CORS_ALLOWED_ORIGINS` (daftar eksplisit dipisahkan koma, termasuk penanganan preflight `OPTIONS`). Penggunaan wildcard (`*`) ditolak secara otomatis oleh server.

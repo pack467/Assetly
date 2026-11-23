@@ -12,7 +12,7 @@
    ```bash
    cp .env.example .env
    ```
-2. Isi seluruh variabel rahasia pada `.env` (`POSTGRES_PASSWORD`, `JWT_ACCESS_SECRET` minimal 32 karakter, `EVIDENCE_SIGNING_SECRET` minimal 32 karakter, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `DATABASE_URL`, dll.).
+2. Isi seluruh variabel rahasia pada `.env` (`POSTGRES_PASSWORD`, `JWT_ACCESS_SECRET` minimal 32 karakter, `EVIDENCE_SIGNING_SECRET` minimal 32 karakter, `CORS_ALLOWED_ORIGINS` berisi daftar origin terpisah koma tanpa wildcard `*` seperti `https://localhost,capacitor://localhost`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `DATABASE_URL`, dll.).
 3. Sesuaikan nama domain di `Caddyfile`.
 4. Jalankan layanan dengan Docker Compose:
    ```bash

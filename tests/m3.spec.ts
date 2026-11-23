@@ -19,6 +19,8 @@ import {
 	closeShift,
 	listShifts
 } from '../src/lib/server/services/shiftService';
+import { parseAllowedCorsOrigins, getCorsHeadersForOrigin } from '../src/lib/server/cors';
+import { handle } from '../src/hooks.server';
 
 const VALID_JPEG_BUFFER = Buffer.from([
 	0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48,
@@ -431,6 +433,83 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			// 9. Admin melihat laporan shift lengkap di GET /api/v1/shifts
 			const adminShiftReport = await listShifts(adminActor, { status: 'CLOSED' });
 			expect(adminShiftReport.items.some((s) => s.id === shift1.shift.id)).toBe(true);
+		});
+	});
+
+	describe('3. Penanganan CORS Ketat untuk Origin Capacitor (Bagian 12)', () => {
+		it('mengizinkan origin https://localhost dan capacitor://localhost serta menolak origin asing dan wildcard (*)', () => {
+			const allowed = parseAllowedCorsOrigins('https://localhost, capacitor://localhost');
+			expect(allowed.has('https://localhost')).toBe(true);
+			expect(allowed.has('capacitor://localhost')).toBe(true);
+
+			const headersCapHttps = getCorsHeadersForOrigin('https://localhost', allowed);
+			expect(headersCapHttps?.['access-control-allow-origin']).toBe('https://localhost');
+			expect(headersCapHttps?.vary).toBe('Origin');
+
+			const headersCapScheme = getCorsHeadersForOrigin('capacitor://localhost', allowed);
+			expect(headersCapScheme?.['access-control-allow-origin']).toBe('capacitor://localhost');
+
+			// Origin tidak dikenal wajib ditolak (null)
+			expect(getCorsHeadersForOrigin('https://evil.example.com', allowed)).toBeNull();
+
+			// Wildcard (*) wajib ditolak
+			expect(() => parseAllowedCorsOrigins('*')).toThrowError(/tidak boleh menggunakan wildcard/);
+			expect(() => parseAllowedCorsOrigins('https://localhost, *')).toThrowError(
+				/tidak boleh menggunakan wildcard/
+			);
+			expect(() => parseAllowedCorsOrigins('https://*.example.com')).toThrowError(
+				/tidak boleh menggunakan wildcard/
+			);
+		});
+
+		it('merespons preflight OPTIONS 204 untuk origin Capacitor yang sah dan 403 untuk origin yang tidak sah di hooks.server.ts', async () => {
+			const prevCors = process.env.CORS_ALLOWED_ORIGINS;
+			try {
+				process.env.CORS_ALLOWED_ORIGINS = 'https://localhost,capacitor://localhost';
+
+				// 1. Preflight OPTIONS dari https://localhost -> 204 No Content dengan header CORS lengkap
+				const okPreflight = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/loans', {
+							method: 'OPTIONS',
+							headers: {
+								origin: 'https://localhost',
+								'access-control-request-method': 'POST'
+							}
+						}),
+						url: new URL('http://localhost:5173/api/v1/loans'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Should not reach resolve on OPTIONS')
+				});
+
+				expect(okPreflight.status).toBe(204);
+				expect(okPreflight.headers.get('access-control-allow-origin')).toBe('https://localhost');
+				expect(okPreflight.headers.get('access-control-allow-methods')).toContain('POST');
+				expect(okPreflight.headers.get('access-control-allow-headers')).toContain('Authorization');
+
+				// 2. Preflight OPTIONS dari origin asing -> 403 Forbidden tanpa header Access-Control-Allow-Origin
+				const blockedPreflight = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/loans', {
+							method: 'OPTIONS',
+							headers: {
+								origin: 'https://attacker.invalid'
+							}
+						}),
+						url: new URL('http://localhost:5173/api/v1/loans'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Should not reach resolve on OPTIONS')
+				});
+
+				expect(blockedPreflight.status).toBe(403);
+				expect(blockedPreflight.headers.get('access-control-allow-origin')).toBeNull();
+			} finally {
+				process.env.CORS_ALLOWED_ORIGINS = prevCors;
+			}
 		});
 	});
 });
