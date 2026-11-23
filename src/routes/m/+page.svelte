@@ -1,6 +1,11 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { mobileApi } from '$lib/client/api';
+	import {
+		computeOfflineQueueSummary,
+		subscribeOfflineQueue,
+		type OfflineQueueSummary
+	} from '$lib/client/offlineQueue';
 	import { LoanStatusLabels } from '$lib/shared/enums';
 
 	interface ActiveLoanItem {
@@ -26,6 +31,19 @@
 
 	let activeLoans = $state<LoanEntry[]>([]);
 	let loading = $state(true);
+	let queueSummary = $state<OfflineQueueSummary>({
+		pendingCount: 0,
+		syncingCount: 0,
+		conflictCount: 0,
+		rejectedCount: 0,
+		acceptedCount: 0,
+		totalCount: 0
+	});
+	let unsubscribeQueue: (() => void) | null = null;
+
+	async function refreshQueueSummary() {
+		queueSummary = await computeOfflineQueueSummary();
+	}
 
 	async function loadMyActiveLoans() {
 		loading = true;
@@ -36,13 +54,26 @@
 				const all: LoanEntry[] = data.items ?? [];
 				activeLoans = all.filter((l) => l.status === 'ACTIVE' || l.status === 'PENDING_APPROVAL');
 			}
+		} catch {
+			// Abaikan bila sedang offline
 		} finally {
 			loading = false;
 		}
 	}
 
 	onMount(() => {
+		unsubscribeQueue = subscribeOfflineQueue(() => {
+			refreshQueueSummary();
+		});
+		refreshQueueSummary();
 		loadMyActiveLoans();
+	});
+
+	onDestroy(() => {
+		if (unsubscribeQueue) {
+			unsubscribeQueue();
+			unsubscribeQueue = null;
+		}
 	});
 </script>
 
@@ -82,15 +113,42 @@
 		</a>
 	</div>
 
-	<div class="flex items-center justify-between rounded-2xl border border-slate-200 bg-white p-4">
+	<a
+		href="/m/sync"
+		class="flex items-center justify-between rounded-2xl border bg-white p-4 shadow-2xs active:bg-slate-50 {queueSummary.conflictCount +
+			queueSummary.rejectedCount >
+		0
+			? 'border-red-300'
+			: 'border-slate-200'}"
+	>
 		<div>
-			<div class="text-xs font-semibold text-slate-500">Status Sinkronisasi</div>
-			<div class="mt-0.5 text-sm font-bold text-slate-900">0 operasi menunggu kirim</div>
+			<div class="text-xs font-semibold text-slate-500">
+				Status Sinkronisasi (Ketuk untuk detail)
+			</div>
+			<div class="mt-0.5 text-sm font-bold text-slate-900">
+				{#if queueSummary.conflictCount + queueSummary.rejectedCount > 0}
+					{queueSummary.conflictCount + queueSummary.rejectedCount} konflik/ditolak perlu tindakan
+				{:else if queueSummary.pendingCount + queueSummary.syncingCount > 0}
+					{queueSummary.pendingCount + queueSummary.syncingCount} operasi menunggu kirim
+				{:else}
+					0 operasi menunggu kirim
+				{/if}
+			</div>
 		</div>
-		<span class="rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-800">
-			Tersinkron
-		</span>
-	</div>
+		{#if queueSummary.conflictCount + queueSummary.rejectedCount > 0}
+			<span class="rounded-full bg-red-100 px-3 py-1 text-xs font-bold text-red-800">
+				Periksa Konflik →
+			</span>
+		{:else if queueSummary.pendingCount + queueSummary.syncingCount > 0}
+			<span class="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-900">
+				Menunggu →
+			</span>
+		{:else}
+			<span class="rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-800">
+				Tersinkron
+			</span>
+		{/if}
+	</a>
 
 	<!-- DAFTAR PEMINJAMAN AKTIF SAYA -->
 	<div class="space-y-3">

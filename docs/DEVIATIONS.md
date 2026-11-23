@@ -29,3 +29,12 @@ Dokumen ini mencatat penyesuaian teknis terhadap lingkungan pengembangan atau pe
 - **Solusi & Mitigasi:**
   1. Modul `src/lib/server/storage/index.ts` menyimpan berkas JPEG tervalidasi (cek magic bytes `FF D8 FF` dan ukuran `<= 5 MB`) di direktori privat `.storage/evidence/` (dikecualikan oleh `.gitignore` dan berada di luar folder statis web).
   2. _Signed URL_ dibuat dengan tanda tangan kriptografis HMAC-SHA256 berumur 5 menit (`/api/v1/evidence/{id}/file?expires=...&sig=...`) dan diverifikasi dengan `timingSafeEqual`. Akses tanpa tanda tangan atau setelah kedaluwarsa ditolak dengan `403 FORBIDDEN`.
+
+## 5. Penyimpanan Antrean Operasi Offline dengan IndexedDB (M4 Tahap 4B)
+
+- **Konteks:** Bagian 4.1 dan 10.2 `PROJECT_SPEC.md` menyebutkan penyimpanan antrean lokal di HP menggunakan Capacitor SQLite / Preferences.
+- **Kondisi Lingkungan & Tahap Pengujian:** Pada Tahap 4B, aplikasi lapangan `/m/*` diuji langsung di browser Chrome HP melalui USB port forwarding tanpa membangun APK Capacitor terlebih dahulu. Plugin native `@capacitor-community/sqlite` memerlukan container native Android atau setup WASM khusus.
+- **Solusi & Mitigasi:**
+  1. Dibuat satu lapisan abstraksi `OfflineQueueStorage` di `src/lib/client/offlineQueue.ts` (sejajar dengan `TokenStorageAdapter` di `src/lib/client/tokenStorage.ts`) dengan fungsi `setOfflineQueueStorage(adapter)`.
+  2. Implementasi default di browser menggunakan **IndexedDB** (`itam_offline_queue_db`, object store `offline_operations`) yang mampu menyimpan payload operasi beserta foto bukti terkompresi secara persisten lintas _reload_ halaman dan saat browser HP berada dalam mode _offline_.
+  3. Untuk pengujian otomatis di Node/Vitest disediakan `createMemoryOfflineQueueStorage()`, dan saat pembungkusan APK Android nanti adapter dapat diganti ke Capacitor SQLite tanpa mengubah kode layar `/m/*` maupun `syncManager.ts`.

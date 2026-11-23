@@ -3,6 +3,12 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { mobileApi, onMobileUnauthorized } from '$lib/client/api';
+	import {
+		computeOfflineQueueSummary,
+		subscribeOfflineQueue,
+		type OfflineQueueSummary
+	} from '$lib/client/offlineQueue';
+	import { syncPendingOperations } from '$lib/client/syncManager';
 	import { getTokenStorage } from '$lib/client/tokenStorage';
 	import { RoleLabels } from '$lib/shared/enums';
 	import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
@@ -26,9 +32,23 @@
 	let loginError = $state('');
 	let submitting = $state(false);
 	let isOnline = $state(true);
+	let queueSummary = $state<OfflineQueueSummary>({
+		pendingCount: 0,
+		syncingCount: 0,
+		conflictCount: 0,
+		rejectedCount: 0,
+		acceptedCount: 0,
+		totalCount: 0
+	});
 
 	let unsubscribeUnauthorized: (() => void) | null = null;
+	let unsubscribeQueue: (() => void) | null = null;
 	let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
+	let backgroundSyncInterval: ReturnType<typeof setInterval> | null = null;
+
+	async function refreshQueueSummary() {
+		queueSummary = await computeOfflineQueueSummary();
+	}
 
 	async function checkSession() {
 		loadingAuth = true;
@@ -91,10 +111,20 @@
 
 	onMount(() => {
 		isOnline = navigator.onLine;
-		const onOnline = () => (isOnline = true);
+		const onOnline = () => {
+			isOnline = true;
+			if (currentUser) {
+				syncPendingOperations().catch(() => {});
+			}
+		};
 		const onOffline = () => (isOnline = false);
 		window.addEventListener('online', onOnline);
 		window.addEventListener('offline', onOffline);
+
+		unsubscribeQueue = subscribeOfflineQueue(() => {
+			refreshQueueSummary();
+		});
+		refreshQueueSummary();
 
 		unsubscribeUnauthorized = onMobileUnauthorized(() => {
 			currentUser = null;
@@ -114,6 +144,13 @@
 			12 * 60 * 1000
 		);
 
+		// Jalankan pengecekan retry antrean offline secara berkala tiap 10 detik saat online
+		backgroundSyncInterval = setInterval(() => {
+			if (currentUser && navigator.onLine && queueSummary.pendingCount > 0) {
+				syncPendingOperations().catch(() => {});
+			}
+		}, 10_000);
+
 		checkSession();
 
 		return () => {
@@ -127,9 +164,17 @@
 			unsubscribeUnauthorized();
 			unsubscribeUnauthorized = null;
 		}
+		if (unsubscribeQueue) {
+			unsubscribeQueue();
+			unsubscribeQueue = null;
+		}
 		if (keepAliveInterval) {
 			clearInterval(keepAliveInterval);
 			keepAliveInterval = null;
+		}
+		if (backgroundSyncInterval) {
+			clearInterval(backgroundSyncInterval);
+			backgroundSyncInterval = null;
 		}
 	});
 
@@ -137,8 +182,9 @@
 		{ href: '/m', label: 'Beranda' },
 		{ href: '/m/scan', label: 'Scan' },
 		{ href: '/m/loans', label: 'Pinjaman' },
-		{ href: '/m/handovers', label: 'Serah Terima' },
-		{ href: '/m/shifts', label: 'Shift' }
+		{ href: '/m/handovers', label: 'Serah' },
+		{ href: '/m/shifts', label: 'Shift' },
+		{ href: '/m/sync', label: 'Sinkron' }
 	];
 </script>
 
@@ -243,6 +289,21 @@
 						>
 							{isOnline ? 'Online' : 'Offline'}
 						</span>
+						{#if queueSummary.conflictCount + queueSummary.rejectedCount > 0}
+							<a
+								href="/m/sync"
+								class="rounded-full bg-red-600 px-2 py-0.5 text-[11px] font-bold text-white"
+							>
+								{queueSummary.conflictCount + queueSummary.rejectedCount} Konflik!
+							</a>
+						{:else if queueSummary.pendingCount + queueSummary.syncingCount > 0}
+							<a
+								href="/m/sync"
+								class="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-900"
+							>
+								{queueSummary.pendingCount + queueSummary.syncingCount} Antre
+							</a>
+						{/if}
 					</div>
 					<div class="text-xs text-slate-600">
 						{currentUser.name} · <span class="font-medium">{RoleLabels[currentUser.role]}</span>
@@ -267,17 +328,35 @@
 		<nav
 			class="fixed right-0 bottom-0 left-0 z-30 mx-auto max-w-md border-t border-slate-200 bg-white px-1.5 py-2 shadow-lg"
 		>
-			<div class="grid grid-cols-5 gap-1">
+			<div class="grid grid-cols-6 gap-1">
 				{#each tabs as tab (tab.href)}
 					{@const active =
 						tab.href === '/m' ? page.url.pathname === '/m' : page.url.pathname.startsWith(tab.href)}
+					{@const badgeCount =
+						tab.href === '/m/sync'
+							? queueSummary.pendingCount +
+								queueSummary.syncingCount +
+								queueSummary.conflictCount +
+								queueSummary.rejectedCount
+							: 0}
+					{@const hasConflict =
+						tab.href === '/m/sync' && queueSummary.conflictCount + queueSummary.rejectedCount > 0}
 					<a
 						href={tab.href}
-						class="flex flex-col items-center justify-center rounded-xl py-2.5 text-center text-[11px] font-bold transition-colors {active
+						class="relative flex flex-col items-center justify-center rounded-xl py-2.5 text-center text-[11px] font-bold transition-colors {active
 							? 'bg-slate-900 text-white'
 							: 'text-slate-600 active:bg-slate-100'}"
 					>
 						<span>{tab.label}</span>
+						{#if badgeCount > 0}
+							<span
+								class="absolute -top-1 right-1 rounded-full px-1.5 py-0.2 text-[9px] font-extrabold text-white {hasConflict
+									? 'bg-red-600'
+									: 'bg-amber-600'}"
+							>
+								{badgeCount}
+							</span>
+						{/if}
 					</a>
 				{/each}
 			</div>

@@ -2,6 +2,8 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { mobileApi } from '$lib/client/api';
+	import { getOfflineQueueStorage } from '$lib/client/offlineQueue';
+	import { enqueueOfflineOperation, syncPendingOperations } from '$lib/client/syncManager';
 	import { AssetStatusLabels, type AssetStatusKey } from '$lib/shared/enums';
 	import {
 		computeCompressedDimensions,
@@ -57,6 +59,7 @@
 	let loading = $state(true);
 	let errorMsg = $state('');
 	let successBanner = $state('');
+	let queuedBanner = $state('');
 
 	// Mode aktif: 'info' | 'borrow' | 'return'
 	let activeMode = $state<'info' | 'borrow' | 'return'>('info');
@@ -143,11 +146,54 @@
 		);
 	}
 
+	function applyLoadedAssetState(data: AssetScanPayload) {
+		scanData = data;
+		expectedReturnDate = getDefaultTomorrowIsoLocal();
+
+		if (data.asset.homeLocation?.id) {
+			selectedLocationId = data.asset.homeLocation.id;
+		} else if (locations.length > 0) {
+			selectedLocationId = locations[0].id;
+		}
+
+		borrowChecks = (data.asset.accessories ?? []).map((a: { name: string; quantity: number }) => ({
+			name: a.name,
+			quantity: a.quantity,
+			outOk: true
+		}));
+
+		if (data.activeLoanItem?.accessoryChecks?.length) {
+			returnChecks = data.activeLoanItem.accessoryChecks.map(
+				(c: { id: string; name: string; quantity: number }) => ({
+					id: c.id,
+					name: c.name,
+					quantity: c.quantity,
+					returnOk: true
+				})
+			);
+		} else {
+			returnChecks = (data.asset.accessories ?? []).map(
+				(a: { name: string; quantity: number }) => ({
+					name: a.name,
+					quantity: a.quantity,
+					returnOk: true
+				})
+			);
+		}
+
+		const requestedMode = page.url.searchParams.get('mode');
+		if (requestedMode === 'return' && data.allowedActions.includes('RETURN')) {
+			activeMode = 'return';
+		}
+	}
+
 	async function loadAssetAndMeta() {
 		loading = true;
 		errorMsg = '';
+		const codeParam = (page.params.code ?? '').trim();
+		const cacheKey = `itam_asset_cache_${codeParam.toUpperCase()}`;
+
 		try {
-			const codeParam = page.params.code ?? '';
 			const [assetRes, locRes, meRes] = await Promise.all([
 				mobileApi.get(`/api/v1/assets/by-code/${encodeURIComponent(codeParam)}`),
 				mobileApi.get('/api/v1/locations?onlyActive=true'),
@@ -157,11 +203,21 @@
 			if (meRes.ok) {
 				const meData = await meRes.json();
 				currentUserName = meData.user?.name || 'Pengguna';
+				try {
+					sessionStorage.setItem('itam_user_name_cache', currentUserName);
+				} catch {
+					// Abaikan bila storage penuh
+				}
 			}
 
 			if (locRes.ok) {
 				const locData = await locRes.json();
 				locations = locData.items ?? [];
+				try {
+					sessionStorage.setItem('itam_locations_cache', JSON.stringify(locations));
+				} catch {
+					// Abaikan
+				}
 			}
 
 			const data = await assetRes.json();
@@ -170,47 +226,30 @@
 				return;
 			}
 
-			scanData = data;
-			expectedReturnDate = getDefaultTomorrowIsoLocal();
-
-			if (data.asset.homeLocation?.id) {
-				selectedLocationId = data.asset.homeLocation.id;
-			} else if (locations.length > 0) {
-				selectedLocationId = locations[0].id;
+			try {
+				sessionStorage.setItem(cacheKey, JSON.stringify(data));
+			} catch {
+				// Abaikan
 			}
 
-			borrowChecks = (data.asset.accessories ?? []).map(
-				(a: { name: string; quantity: number }) => ({
-					name: a.name,
-					quantity: a.quantity,
-					outOk: true
-				})
-			);
-
-			if (data.activeLoanItem?.accessoryChecks?.length) {
-				returnChecks = data.activeLoanItem.accessoryChecks.map(
-					(c: { id: string; name: string; quantity: number }) => ({
-						id: c.id,
-						name: c.name,
-						quantity: c.quantity,
-						returnOk: true
-					})
-				);
-			} else {
-				returnChecks = (data.asset.accessories ?? []).map(
-					(a: { name: string; quantity: number }) => ({
-						name: a.name,
-						quantity: a.quantity,
-						returnOk: true
-					})
-				);
-			}
-
-			const requestedMode = page.url.searchParams.get('mode');
-			if (requestedMode === 'return' && data.allowedActions.includes('RETURN')) {
-				activeMode = 'return';
-			}
+			applyLoadedAssetState(data);
 		} catch {
+			// Jika sedang offline, coba muat dari cache sesi terakhir agar form pinjam/kembali tetap bisa diisi
+			try {
+				const cachedUser = sessionStorage.getItem('itam_user_name_cache');
+				if (cachedUser) currentUserName = cachedUser;
+
+				const cachedLocs = sessionStorage.getItem('itam_locations_cache');
+				if (cachedLocs) locations = JSON.parse(cachedLocs);
+
+				const cachedAsset = sessionStorage.getItem(cacheKey);
+				if (cachedAsset) {
+					applyLoadedAssetState(JSON.parse(cachedAsset));
+					return;
+				}
+			} catch {
+				// Abaikan
+			}
 			errorMsg = 'Gagal memuat informasi barang. Periksa koneksi Anda.';
 		} finally {
 			loading = false;
@@ -305,6 +344,8 @@
 		e.preventDefault();
 		if (!scanData) return;
 		errorMsg = '';
+		successBanner = '';
+		queuedBanner = '';
 
 		if (!capturedDataUrl || !capturedTakenAt) {
 			errorMsg = 'Silakan ambil foto bukti kondisi barang dari kamera terlebih dahulu.';
@@ -318,55 +359,66 @@
 
 		submitting = true;
 		try {
-			// 1. Unggah Evidence CHECKOUT melalui mobileApi (otomatis refresh bila token kedaluwarsa di tengah pengisian form)
-			const evRes = await mobileApi.post('/api/v1/evidence', {
-				purpose: 'CHECKOUT',
-				captureSource: 'CAMERA',
-				takenAtDevice: capturedTakenAt,
-				gpsAvailable,
-				latitude: gpsAvailable ? latitude : null,
-				longitude: gpsAvailable ? longitude : null,
-				accuracyM: gpsAvailable ? accuracyM : null,
-				isMockLocation: false,
-				locationId: selectedLocationId || null,
-				imageBase64: capturedDataUrl,
-				mimeType: 'image/jpeg'
+			// 1. Tulis ke antrean operasi lokal HP terlebih dahulu (Offline-First, Bagian 10.1 & 10.2)
+			const queued = await enqueueOfflineOperation({
+				type: 'LOAN_CREATE',
+				label: `Pinjam ${scanData.asset.code} (${scanData.asset.name})`,
+				assetCode: scanData.asset.code,
+				assetName: scanData.asset.name,
+				payload: {
+					purpose: purposeChoice,
+					purposeNote: purposeNote.trim() || null,
+					expectedReturnAt: new Date(expectedReturnDate).toISOString(),
+					locationId: selectedLocationId || null,
+					items: [
+						{
+							assetId: scanData.asset.id,
+							accessoryChecks: borrowChecks
+						}
+					]
+				},
+				pendingEvidence: {
+					purpose: 'CHECKOUT',
+					captureSource: 'CAMERA',
+					takenAtDevice: capturedTakenAt,
+					gpsAvailable,
+					latitude: gpsAvailable ? latitude : null,
+					longitude: gpsAvailable ? longitude : null,
+					accuracyM: gpsAvailable ? accuracyM : null,
+					isMockLocation: false,
+					locationId: selectedLocationId || null,
+					imageBase64: capturedDataUrl,
+					mimeType: 'image/jpeg'
+				}
 			});
-			const evData = await evRes.json();
-			if (!evRes.ok) {
-				errorMsg = formatFriendlyErrorMessage(evData, 'Gagal mengunggah foto bukti.');
-				return;
-			}
 
-			// 2. Buat Peminjaman
-			const loanRes = await mobileApi.post('/api/v1/loans', {
-				purpose: purposeChoice,
-				purposeNote: purposeNote.trim() || null,
-				expectedReturnAt: new Date(expectedReturnDate).toISOString(),
-				clientOpId: crypto.randomUUID(),
-				items: [
-					{
-						assetId: scanData.asset.id,
-						checkoutEvidenceId: evData.evidence.id,
-						accessoryChecks: borrowChecks
-					}
-				]
-			});
-			const loanData = await loanRes.json();
-			if (!loanRes.ok) {
-				errorMsg = formatFriendlyErrorMessage(loanData, 'Gagal menyimpan peminjaman.');
-				return;
-			}
+			// 2. Picu unggah foto & sinkronisasi di latar belakang
+			await syncPendingOperations({ force: true });
+			const latestEntry = await getOfflineQueueStorage().getById(queued.clientOpId);
 
-			successBanner =
-				loanData.loan.status === 'PENDING_APPROVAL'
-					? `Permintaan peminjaman ${scanData.asset.code} berhasil dikirim dan menunggu persetujuan Admin.`
-					: `Peminjaman ${scanData.asset.code} (${scanData.asset.name}) berhasil dicatat!`;
-			activeMode = 'info';
-			capturedDataUrl = null;
-			await loadAssetAndMeta();
+			if (latestEntry?.syncState === 'ACCEPTED') {
+				const loanStatus = (latestEntry.resultData?.loan as { status?: string } | undefined)
+					?.status;
+				successBanner =
+					loanStatus === 'PENDING_APPROVAL'
+						? `Permintaan peminjaman ${scanData.asset.code} berhasil dikirim dan menunggu persetujuan Admin.`
+						: `Peminjaman ${scanData.asset.code} (${scanData.asset.name}) berhasil dicatat dan tersinkron ke server!`;
+				activeMode = 'info';
+				capturedDataUrl = null;
+				await loadAssetAndMeta();
+			} else if (latestEntry?.syncState === 'CONFLICT' || latestEntry?.syncState === 'REJECTED') {
+				errorMsg =
+					latestEntry.conflictReason ||
+					latestEntry.lastError ||
+					'Peminjaman tidak dapat diproses karena terjadi konflik di server.';
+			} else {
+				// Tetap PENDING karena HP sedang offline atau sinyal terputus -> tidak memblokir pekerjaan!
+				queuedBanner = `Tersimpan di Antrean Lokal HP! Data peminjaman ${scanData.asset.code} beserta foto bukti sudah aman di HP dan akan diunggah otomatis di latar belakang begitu sinyal kembali.`;
+				activeMode = 'info';
+				capturedDataUrl = null;
+			}
 		} catch {
-			errorMsg = 'Terjadi gangguan jaringan saat mengirim peminjaman.';
+			errorMsg = 'Gagal menyimpan operasi ke penyimpanan lokal HP.';
 		} finally {
 			submitting = false;
 		}
@@ -376,6 +428,8 @@
 		e.preventDefault();
 		if (!scanData?.activeLoanItem) return;
 		errorMsg = '';
+		successBanner = '';
+		queuedBanner = '';
 
 		if (!capturedDataUrl || !capturedTakenAt) {
 			errorMsg = 'Silakan ambil foto bukti pengembalian barang dari kamera terlebih dahulu.';
@@ -395,53 +449,58 @@
 
 		submitting = true;
 		try {
-			// 1. Unggah Evidence RETURN melalui mobileApi (otomatis refresh bila token kedaluwarsa di tengah pengisian form)
-			const evRes = await mobileApi.post('/api/v1/evidence', {
-				purpose: 'RETURN',
-				captureSource: 'CAMERA',
-				takenAtDevice: capturedTakenAt,
-				gpsAvailable,
-				latitude: gpsAvailable ? latitude : null,
-				longitude: gpsAvailable ? longitude : null,
-				accuracyM: gpsAvailable ? accuracyM : null,
-				isMockLocation: false,
-				locationId: selectedLocationId || null,
-				imageBase64: capturedDataUrl,
-				mimeType: 'image/jpeg'
-			});
-			const evData = await evRes.json();
-			if (!evRes.ok) {
-				errorMsg = formatFriendlyErrorMessage(evData, 'Gagal mengunggah foto bukti pengembalian.');
-				return;
-			}
-
-			// 2. Proses Pengembalian
-			const retRes = await mobileApi.post(
-				`/api/v1/loan-items/${scanData.activeLoanItem.id}/return`,
-				{
+			// 1. Tulis ke antrean operasi lokal HP terlebih dahulu (Offline-First, Bagian 10.1 & 10.2)
+			const queued = await enqueueOfflineOperation({
+				type: 'LOAN_RETURN',
+				label: `Kembalikan ${scanData.asset.code} (${scanData.asset.name})`,
+				assetCode: scanData.asset.code,
+				assetName: scanData.asset.name,
+				payload: {
+					loanItemId: scanData.activeLoanItem.id,
 					returnCondition,
-					evidenceId: evData.evidence.id,
 					damageNote: returnCondition === 'DAMAGED' ? damageNote.trim() : null,
 					accessoryChecks: returnChecks.map((c) => ({
 						id: c.id,
 						name: c.name,
 						returnOk: c.returnOk
-					})),
-					clientOpId: crypto.randomUUID()
+					}))
+				},
+				pendingEvidence: {
+					purpose: 'RETURN',
+					captureSource: 'CAMERA',
+					takenAtDevice: capturedTakenAt,
+					gpsAvailable,
+					latitude: gpsAvailable ? latitude : null,
+					longitude: gpsAvailable ? longitude : null,
+					accuracyM: gpsAvailable ? accuracyM : null,
+					isMockLocation: false,
+					locationId: selectedLocationId || null,
+					imageBase64: capturedDataUrl,
+					mimeType: 'image/jpeg'
 				}
-			);
-			const retData = await retRes.json();
-			if (!retRes.ok) {
-				errorMsg = formatFriendlyErrorMessage(retData, 'Gagal memproses pengembalian barang.');
-				return;
-			}
+			});
 
-			successBanner = `Barang ${scanData.asset.code} berhasil dikembalikan (${returnCondition === 'DAMAGED' ? 'Dilaporkan Rusak' : 'Kondisi Normal'}).`;
-			activeMode = 'info';
-			capturedDataUrl = null;
-			await loadAssetAndMeta();
+			// 2. Picu unggah foto & sinkronisasi di latar belakang
+			await syncPendingOperations({ force: true });
+			const latestEntry = await getOfflineQueueStorage().getById(queued.clientOpId);
+
+			if (latestEntry?.syncState === 'ACCEPTED') {
+				successBanner = `Barang ${scanData.asset.code} berhasil dikembalikan dan tersinkron ke server (${returnCondition === 'DAMAGED' ? 'Dilaporkan Rusak' : 'Kondisi Normal'}).`;
+				activeMode = 'info';
+				capturedDataUrl = null;
+				await loadAssetAndMeta();
+			} else if (latestEntry?.syncState === 'CONFLICT' || latestEntry?.syncState === 'REJECTED') {
+				errorMsg =
+					latestEntry.conflictReason ||
+					latestEntry.lastError ||
+					'Pengembalian tidak dapat diproses karena terjadi konflik di server.';
+			} else {
+				queuedBanner = `Tersimpan di Antrean Lokal HP! Data pengembalian ${scanData.asset.code} beserta foto bukti sudah aman di HP dan akan diunggah otomatis begitu sinyal kembali.`;
+				activeMode = 'info';
+				capturedDataUrl = null;
+			}
 		} catch {
-			errorMsg = 'Terjadi gangguan jaringan saat mengirim pengembalian.';
+			errorMsg = 'Gagal menyimpan operasi pengembalian ke penyimpanan lokal HP.';
 		} finally {
 			submitting = false;
 		}
@@ -490,9 +549,33 @@
 		</div>
 	{/if}
 
+	{#if queuedBanner}
+		<div
+			class="rounded-2xl border-2 border-amber-300 bg-amber-50 p-4 text-sm font-bold text-amber-950"
+		>
+			{queuedBanner}
+			<div class="mt-3 flex gap-2">
+				<a href="/m/sync" class="rounded-xl bg-amber-800 px-4 py-2 text-xs font-bold text-white">
+					Lihat Antrean Sinkronisasi
+				</a>
+				<a
+					href="/m/scan"
+					class="rounded-xl border border-amber-700 bg-white px-4 py-2 text-xs font-bold text-amber-900"
+				>
+					Scan Barang Lain
+				</a>
+			</div>
+		</div>
+	{/if}
+
 	{#if errorMsg}
 		<div class="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-700">
-			{errorMsg}
+			<div>{errorMsg}</div>
+			<div class="mt-2">
+				<a href="/m/sync" class="text-xs font-bold text-red-900 underline">
+					Buka Layar Antrean & Resolusi Konflik (/m/sync) →
+				</a>
+			</div>
 		</div>
 	{/if}
 
