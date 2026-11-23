@@ -6,8 +6,11 @@ import { uploadEvidence } from '../src/lib/server/services/evidenceService';
 import {
 	createLoan,
 	returnLoanItem,
+	listLoans,
 	getDashboardSummary
 } from '../src/lib/server/services/loanService';
+import { getAssetScanInfo } from '../src/lib/server/services/assetService';
+import { updateUser } from '../src/lib/server/services/userService';
 import {
 	createHandover,
 	confirmHandover,
@@ -272,6 +275,59 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 
 			const listed = await listHandovers(borrower1, { loanId: activeLoanId });
 			expect(listed.items.some((h) => h.id === handoverId && h.isConfirmed)).toBe(true);
+		});
+
+		it('memindahkan pemegang barang (Loan.borrowerId) ke penerima setelah serah terima dikonfirmasi kedua pihak (Pilihan a: currentHolder, Pinjaman Saya, tutup shift, USER_HOLDS_ASSETS, & AuditLog)', async () => {
+			// Saat ini activeLoanId dipegang oleh borrower1. Buat serah terima dari borrower1 (giver) ke borrower2 (receiver)
+			const hoToB2 = await createHandover(borrower1, {
+				loanId: activeLoanId,
+				giverId: borrower1.id,
+				receiverId: borrower2.id,
+				autoConfirmGiver: true
+			});
+
+			// Sebelum borrower2 konfirmasi, pemegang masih borrower1
+			const loanBefore = await prisma.loan.findUniqueOrThrow({ where: { id: activeLoanId } });
+			expect(loanBefore.borrowerId).toBe(borrower1.id);
+
+			// Borrower2 mengonfirmasi sebagai penerima -> kedua pihak lengkap -> pemegang berpindah ke borrower2
+			const confirmed = await confirmHandover(borrower2, hoToB2.handover.id, {});
+			expect(confirmed.handover.isConfirmed).toBe(true);
+			expect(confirmed.handover.loan.borrower.id).toBe(borrower2.id);
+
+			// 1. Cek AuditLog LOAN_HOLDER_TRANSFERRED tercatat
+			const transferLog = await prisma.auditLog.findFirst({
+				where: {
+					entityType: 'Loan',
+					entityId: activeLoanId,
+					action: 'LOAN_HOLDER_TRANSFERRED'
+				}
+			});
+			expect(transferLog).not.toBeNull();
+
+			// 2. Cek currentHolder pada info scan barang kini adalah borrower2 dan borrower2 punya aksi RETURN
+			const assetId = confirmed.handover.loan.items[0].asset.id;
+			const assetCode = confirmed.handover.loan.items[0].asset.code;
+			const scanForB2 = await getAssetScanInfo(borrower2, { code: assetCode });
+			expect(scanForB2.currentHolder).toBe('Peminjam 2 M3');
+			expect(scanForB2.allowedActions).toContain('RETURN');
+
+			// 3. Cek daftar "Pinjaman Saya" milik borrower2 kini memuat pinjaman ini, sedangkan borrower1 tidak lagi menjadi pemegang
+			const b2Loans = await listLoans(borrower2, { status: 'ACTIVE' });
+			expect(b2Loans.items.some((l) => l.id === activeLoanId)).toBe(true);
+
+			// 4. Cek penanggung jawab bawaan tutup shift (defaultResponsibleUserId) kini menunjuk ke borrower2
+			const shiftState = await getCurrentShiftState(officer1);
+			const outItem = shiftState.outstandingItems.find((i) => i.asset.id === assetId);
+			expect(outItem?.defaultResponsibleUserId).toBe(borrower2.id);
+
+			// 5. Cek aturan USER_HOLDS_ASSETS (BR-16): borrower2 tidak boleh dinonaktifkan karena kini memegang barang aktif
+			await expect(updateUser(adminActor, borrower2.id, { isActive: false })).rejects.toMatchObject(
+				{
+					code: 'USER_HOLDS_ASSETS',
+					status: 409
+				}
+			);
 		});
 	});
 

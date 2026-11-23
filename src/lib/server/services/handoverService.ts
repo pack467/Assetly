@@ -106,7 +106,7 @@ function formatHandoverRecord(h: Prisma.HandoverGetPayload<{ include: typeof HAN
 
 export async function createHandover(
 	actor: PolicyUser | null | undefined,
-	input: z.infer<typeof createHandoverSchema>,
+	input: z.input<typeof createHandoverSchema>,
 	ip?: string
 ) {
 	if (!actor || actor.isActive === false) {
@@ -161,7 +161,7 @@ export async function createHandover(
 	}
 
 	const now = new Date();
-	const giverConfirmedAt = input.autoConfirmGiver && actor.id === giverId ? now : null;
+	const giverConfirmedAt = (input.autoConfirmGiver ?? true) && actor.id === giverId ? now : null;
 
 	const created = await prisma.$transaction(async (tx) => {
 		if (input.evidenceId) {
@@ -268,6 +268,33 @@ export async function confirmHandover(
 			include: HANDOVER_INCLUDE
 		});
 
+		// Pilihan (a): Setelah serah terima dikonfirmasi kedua pihak, pemegang barang (Loan.borrowerId) berpindah ke penerima
+		const previousBorrowerId = existing.loan.borrowerId;
+		const holderTransferred = bothConfirmed && previousBorrowerId !== existing.receiverId;
+
+		if (holderTransferred) {
+			await tx.loan.update({
+				where: { id: existing.loanId },
+				data: {
+					borrowerId: existing.receiverId
+				}
+			});
+
+			await writeAuditLog(tx, {
+				actorId: actor.id,
+				action: 'LOAN_HOLDER_TRANSFERRED',
+				entityType: 'Loan',
+				entityId: existing.loanId,
+				before: { borrowerId: previousBorrowerId },
+				after: {
+					borrowerId: existing.receiverId,
+					handoverId: handover.id,
+					documentNo: handover.documentNo
+				},
+				ip: ip ?? null
+			});
+		}
+
 		await writeAuditLog(tx, {
 			actorId: actor.id,
 			action: 'HANDOVER_CONFIRMED',
@@ -282,10 +309,19 @@ export async function confirmHandover(
 				confirmedByRole: isGiver ? 'GIVER' : 'RECEIVER',
 				giverConfirmedAt: handover.giverConfirmedAt?.toISOString() ?? null,
 				receiverConfirmedAt: handover.receiverConfirmedAt?.toISOString() ?? null,
-				documentNo: handover.documentNo
+				documentNo: handover.documentNo,
+				holderTransferred,
+				newHolderId: bothConfirmed ? existing.receiverId : previousBorrowerId
 			},
 			ip: ip ?? null
 		});
+
+		if (holderTransferred) {
+			return tx.handover.findUniqueOrThrow({
+				where: { id: handoverId },
+				include: HANDOVER_INCLUDE
+			});
+		}
 
 		return handover;
 	});

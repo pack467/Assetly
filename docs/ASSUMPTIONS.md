@@ -33,3 +33,6 @@ Dokumen ini mencatat semua keputusan terbuka pada **Bagian 21 `PROJECT_SPEC.md`*
    - Akun `ADMIN` yang sudah memiliki `mfaSecret` wajib menyertakan `totpCode` 6 digit saat login. Pendaftaran/aktivasi TOTP admin dikelola pada M1.
 4. **Konfigurasi CORS Ketat untuk Capacitor (Bagian 12):**
    - Origin aplikasi Android Capacitor (`https://localhost` dan `capacitor://localhost`) dikontrol melalui variabel lingkungan `CORS_ALLOWED_ORIGINS` (daftar eksplisit dipisahkan koma, termasuk penanganan preflight `OPTIONS`). Penggunaan wildcard (`*`) ditolak secara otomatis oleh server.
+5. **Perpindahan Pemegang Barang Setelah Serah Terima Dikonfirmasi Dua Pihak (Pilihan a — Bagian 7.2):**
+   - Setelah kedua pihak (`giver` dan `receiver`) mengonfirmasi `Handover`, pemegang barang aktif (`Loan.borrowerId`) berpindah ke pihak penerima (`receiverId`) dalam transaksi yang sama beserta pencatatan `AuditLog` (`LOAN_HOLDER_TRANSFERRED`).
+   - Konsekuensinya: `currentHolder` pada info barang, daftar "Pinjaman Saya", hak pengembalian barang, `responsibleUserId` bawaan saat tutup shift (BR-12), dan proteksi penonaktifan user pemegang barang (`USER_HOLDS_ASSETS`, BR-16) otomatis mengikuti pemegang baru.
