@@ -3,7 +3,7 @@ services:
     build: ..
     env_file: ../.env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-itam}?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER wajib diisi di .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD wajib diisi di .env}@db:5432/${POSTGRES_DB:?POSTGRES_DB wajib diisi di .env}?schema=public
       PROTOCOL_HEADER: x-forwarded-proto
       HOST_HEADER: x-forwarded-host
     volumes:
@@ -17,14 +17,14 @@ services:
     image: postgres:18-alpine
     env_file: ../.env
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-itam}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER wajib diisi di .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD wajib diisi di .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB wajib diisi di .env}
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-itam}']
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
       interval: 5s
       timeout: 5s
       retries: 10
