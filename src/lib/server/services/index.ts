@@ -5,3 +5,5 @@ export * from './assetService';
 export * from './auditService';
 export * from './evidenceService';
 export * from './loanService';
+export * from './handoverService';
+export * from './shiftService';

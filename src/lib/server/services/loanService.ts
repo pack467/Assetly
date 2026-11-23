@@ -38,8 +38,8 @@ const LOAN_DETAIL_INCLUDE = {
 	handovers: true
 } satisfies Prisma.LoanInclude;
 
-async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Promise<void> {
-	const [usedInLoanItem, usedInHandover] = await Promise.all([
+export async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Promise<void> {
+	const [usedInLoanItem, usedInHandover, usedInShiftClose] = await Promise.all([
 		tx.loanItem.findFirst({
 			where: {
 				OR: [{ checkoutEvidenceId: { in: evidenceIds } }, { returnEvidenceId: { in: evidenceIds } }]
@@ -49,14 +49,27 @@ async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Promise<v
 		tx.handover.findFirst({
 			where: { evidenceId: { in: evidenceIds } },
 			select: { id: true, evidenceId: true }
+		}),
+		tx.auditLog.findFirst({
+			where: {
+				action: 'SHIFT_CLOSED',
+				OR: evidenceIds.map((id) => ({
+					after: {
+						path: ['evidenceId'],
+						equals: id
+					}
+				}))
+			},
+			select: { id: true }
 		})
 	]);
 
-	if (usedInLoanItem || usedInHandover) {
+	if (usedInLoanItem || usedInHandover || usedInShiftClose) {
 		const duplicateId =
 			usedInLoanItem?.checkoutEvidenceId ??
 			usedInLoanItem?.returnEvidenceId ??
-			usedInHandover?.evidenceId;
+			usedInHandover?.evidenceId ??
+			evidenceIds[0];
 		throw new AppError(
 			'DUPLICATE_OPERATION',
 			'Foto bukti (Evidence) ini sudah pernah digunakan dan tidak boleh dipakai ulang.',
