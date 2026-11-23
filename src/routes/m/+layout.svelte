@@ -135,8 +135,10 @@
 
 	const tabs = [
 		{ href: '/m', label: 'Beranda' },
-		{ href: '/m/scan', label: 'Scan / Cari' },
-		{ href: '/m/loans', label: 'Pinjaman Saya' }
+		{ href: '/m/scan', label: 'Scan' },
+		{ href: '/m/loans', label: 'Pinjaman' },
+		{ href: '/m/handovers', label: 'Serah Terima' },
+		{ href: '/m/shifts', label: 'Shift' }
 	];
 </script>
 
@@ -263,15 +265,15 @@
 
 		<!-- NAVIGASI BAWAH SATU TANGAN (IBU JARI) -->
 		<nav
-			class="fixed right-0 bottom-0 left-0 z-30 mx-auto max-w-md border-t border-slate-200 bg-white px-2 py-2 shadow-lg"
+			class="fixed right-0 bottom-0 left-0 z-30 mx-auto max-w-md border-t border-slate-200 bg-white px-1.5 py-2 shadow-lg"
 		>
-			<div class="grid grid-cols-3 gap-2">
+			<div class="grid grid-cols-5 gap-1">
 				{#each tabs as tab (tab.href)}
 					{@const active =
 						tab.href === '/m' ? page.url.pathname === '/m' : page.url.pathname.startsWith(tab.href)}
 					<a
 						href={tab.href}
-						class="flex flex-col items-center justify-center rounded-xl py-3 text-xs font-bold transition-colors {active
+						class="flex flex-col items-center justify-center rounded-xl py-2.5 text-center text-[11px] font-bold transition-colors {active
 							? 'bg-slate-900 text-white'
 							: 'text-slate-600 active:bg-slate-100'}"
 					>

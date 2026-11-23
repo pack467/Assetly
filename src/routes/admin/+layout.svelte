@@ -84,6 +84,7 @@
 	const navItems = [
 		{ href: '/admin', label: 'Dashboard' },
 		{ href: '/admin/loans', label: 'Peminjaman' },
+		{ href: '/admin/shifts', label: 'Laporan Shift' },
 		{ href: '/admin/assets', label: 'Barang & QR' },
 		{ href: '/admin/categories', label: 'Kategori' },
 		{ href: '/admin/locations', label: 'Lokasi' },

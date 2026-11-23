@@ -64,7 +64,24 @@
 		</a>
 	</div>
 
-	<!-- STATUS SINKRONISASI (Bagian 8.1) -->
+	<!-- STATUS SINKRONISASI & PINTASAN SERAH TERIMA / SHIFT (Bagian 8.1) -->
+	<div class="grid grid-cols-2 gap-3">
+		<a
+			href="/m/handovers"
+			class="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs active:bg-slate-50"
+		>
+			<div class="text-xs font-semibold text-slate-500">Dua Pihak</div>
+			<div class="mt-0.5 text-sm font-bold text-slate-900">Serah Terima →</div>
+		</a>
+		<a
+			href="/m/shifts"
+			class="rounded-2xl border border-slate-200 bg-white p-4 shadow-2xs active:bg-slate-50"
+		>
+			<div class="text-xs font-semibold text-slate-500">Petugas</div>
+			<div class="mt-0.5 text-sm font-bold text-slate-900">Buka / Tutup Shift →</div>
+		</a>
+	</div>
+
 	<div class="flex items-center justify-between rounded-2xl border border-slate-200 bg-white p-4">
 		<div>
 			<div class="text-xs font-semibold text-slate-500">Status Sinkronisasi</div>
