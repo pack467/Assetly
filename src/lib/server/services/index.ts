@@ -7,3 +7,4 @@ export * from './evidenceService';
 export * from './loanService';
 export * from './handoverService';
 export * from './shiftService';
+export * from './syncService';
