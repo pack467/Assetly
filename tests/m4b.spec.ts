@@ -14,7 +14,9 @@ import {
 	computeBackoffDelayMs,
 	enqueueOfflineOperation,
 	extractMissingShiftCloseAssets,
+	isOperationStuck,
 	retryRejectedShiftCloseWithReasons,
+	STUCK_OPERATION_RETRY_THRESHOLD,
 	syncPendingOperations
 } from '../src/lib/client/syncManager';
 
@@ -676,5 +678,137 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 			assetId: '99999999-9999-4999-8999-999999999999',
 			reason: 'Masih dipakai acara wisuda di Aula Utama'
 		});
+	});
+
+	it('8. menjaga urutan FIFO ketat (berhenti di operasi pertama yang gagal sementara/backoff) serta mendeteksi operasi macet (#2 + #10)', async () => {
+		const tokenStorage = createMemoryTokenStorage({
+			accessToken: 'valid-access-token',
+			refreshToken: 'valid-refresh-token'
+		});
+
+		let failFirstOperation = true;
+		const sentOpIds: string[] = [];
+
+		const mockFetch: typeof fetch = async (input, init) => {
+			const url = String(input);
+			if (url.endsWith('/api/v1/sync')) {
+				const parsedBody = JSON.parse(String(init?.body)) as {
+					operations: Array<{ clientOpId: string; type: string }>;
+				};
+				const op = parsedBody.operations[0];
+				sentOpIds.push(op.clientOpId);
+
+				if (op.type === 'LOAN_CREATE' && failFirstOperation) {
+					return new Response(
+						JSON.stringify({ error: { code: 'INTERNAL_ERROR', message: 'Gateway timeout 503' } }),
+						{ status: 503, headers: { 'Content-Type': 'application/json' } }
+					);
+				}
+
+				return new Response(
+					JSON.stringify({
+						results: [
+							{
+								clientOpId: op.clientOpId,
+								status: 'ACCEPTED',
+								idempotentReplay: false,
+								conflictReason: null
+							}
+						]
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response('{}', { status: 404 });
+		};
+
+		const apiClient = createMobileApiClient({
+			baseUrl: 'http://localhost:5173',
+			storage: tokenStorage,
+			fetchFn: mockFetch
+		});
+
+		const opBorrow = await enqueueOfflineOperation(
+			{
+				type: 'LOAN_CREATE',
+				label: 'Pinjam AST-0010 (Laptop Lenovo)',
+				clientCreatedAt: '2026-11-26T01:00:00.000Z',
+				payload: {
+					purpose: 'Rapat',
+					expectedReturnAt: '2026-11-27T01:00:00.000Z',
+					items: [
+						{
+							assetId: '10101010-1010-4010-8010-101010101010',
+							checkoutEvidenceId: '20202020-2020-4020-8020-202020202020'
+						}
+					]
+				}
+			},
+			queueStorage
+		);
+
+		const opReturn = await enqueueOfflineOperation(
+			{
+				type: 'LOAN_RETURN',
+				label: 'Kembalikan AST-0010 (Laptop Lenovo)',
+				clientCreatedAt: '2026-11-26T01:05:00.000Z',
+				payload: {
+					assetId: '10101010-1010-4010-8010-101010101010',
+					returnCondition: 'NORMAL',
+					evidenceId: '30303030-3030-4030-8030-303030303030'
+				}
+			},
+			queueStorage
+		);
+
+		const baseNow = 1_700_000_000_000;
+
+		// 1. Saat operasi pertama (LOAN_CREATE) gagal sementara (HTTP 503), operasi kedua (LOAN_RETURN) TIDAK boleh dikirim
+		const run1 = await syncPendingOperations({
+			apiClient,
+			storage: queueStorage,
+			nowMs: baseNow
+		});
+		expect(run1.processed).toBe(1);
+		expect(run1.accepted).toBe(0);
+		expect(run1.stillPending).toBe(2);
+		expect(sentOpIds).toEqual([opBorrow.clientOpId]);
+
+		// 2. Saat tick berikutnya berjalan sebelum jadwal backoff operasi pertama habis (tanpa force), operasi kedua tetap TIDAK boleh menyalip
+		const runDuringBackoff = await syncPendingOperations({
+			apiClient,
+			storage: queueStorage,
+			nowMs: baseNow + 500
+		});
+		expect(runDuringBackoff.processed).toBe(0);
+		expect(sentOpIds).toEqual([opBorrow.clientOpId]);
+
+		// 3. Simulasikan kegagalan berulang hingga mencapai STUCK_OPERATION_RETRY_THRESHOLD (5x)
+		for (let i = 2; i <= STUCK_OPERATION_RETRY_THRESHOLD; i++) {
+			await syncPendingOperations({
+				apiClient,
+				storage: queueStorage,
+				force: true,
+				nowMs: baseNow + i * 60_000
+			});
+		}
+
+		const stuckBorrow = await queueStorage.getById(opBorrow.clientOpId);
+		expect(stuckBorrow?.retryCount).toBe(STUCK_OPERATION_RETRY_THRESHOLD);
+		expect(isOperationStuck(stuckBorrow!)).toBe(true);
+
+		const waitingReturn = await queueStorage.getById(opReturn.clientOpId);
+		expect(waitingReturn?.retryCount).toBe(0);
+		expect(isOperationStuck(waitingReturn!)).toBe(false);
+
+		// 4. Begitu masalah jaringan/server teratasi (atau operasi macet berhasil/dibatalkan), antrean berlanjut berurutan
+		failFirstOperation = false;
+		const runRecovered = await syncPendingOperations({
+			apiClient,
+			storage: queueStorage,
+			force: true
+		});
+		expect(runRecovered.accepted).toBe(2);
+		expect(runRecovered.stillPending).toBe(0);
 	});
 });

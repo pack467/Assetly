@@ -12,7 +12,9 @@
 	} from '$lib/client/offlineQueue';
 	import {
 		extractMissingShiftCloseAssets,
+		isOperationStuck,
 		retryRejectedShiftCloseWithReasons,
+		STUCK_OPERATION_RETRY_THRESHOLD,
 		syncPendingOperations
 	} from '$lib/client/syncManager';
 
@@ -30,6 +32,9 @@
 	let statusFeedback = $state('');
 	let isOnline = $state(true);
 	let shiftCloseSupplementReasons = $state<Record<string, Record<string, string>>>({});
+	let confirmingCancelId = $state<string | null>(null);
+
+	const stuckItems = $derived(items.filter((i) => isOperationStuck(i)));
 
 	let unsubscribeQueue: (() => void) | null = null;
 
@@ -98,6 +103,9 @@
 
 	async function handleDismissItem(clientOpId: string) {
 		await getOfflineQueueStorage().remove(clientOpId);
+		if (confirmingCancelId === clientOpId) {
+			confirmingCancelId = null;
+		}
 		statusFeedback = 'Catatan operasi telah dihapus dari antrean HP.';
 		await refreshQueueList();
 	}
@@ -281,6 +289,24 @@
 			</div>
 		{/if}
 	</div>
+
+	<!-- BANNER PERINGATAN BILA ADA OPERASI MACET (FIFO HEAD-OF-LINE) -->
+	{#if stuckItems.length > 0}
+		<div class="rounded-2xl border-2 border-amber-400 bg-amber-50 p-4 shadow-2xs space-y-2">
+			<div class="text-xs font-extrabold uppercase tracking-wider text-amber-900">
+				⚠ Peringatan — Operasi Macet di Antrean ({stuckItems.length})
+			</div>
+			<div class="text-sm font-bold text-amber-950">
+				Terdapat operasi yang sudah gagal dikirim ≥ {STUCK_OPERATION_RETRY_THRESHOLD} kali berturut-turut.
+			</div>
+			<p class="text-xs text-amber-900 leading-relaxed">
+				Karena antrean dikirim berurutan (FIFO) untuk menjaga urutan transaksi, operasi yang macet di
+				urutan terdepan akan menahan operasi berikutnya. Anda dapat menekan
+				<strong>"Coba Kirim Sekarang"</strong> atau menekan
+				<strong>"Batalkan Operasi Macet"</strong> dengan konfirmasi bila operasi tersebut tidak lagi diperlukan.
+			</p>
+		</div>
+	{/if}
 
 	<!-- BANNER PERINGATAN BILA ADA KONFLIK -->
 	{#if summary.conflictCount > 0 || summary.rejectedCount > 0}
@@ -483,7 +509,20 @@
 							</div>
 						</div>
 					{:else if item.syncState === 'PENDING'}
-						{#if item.retryCount > 0 && item.lastError}
+						{@const stuck = isOperationStuck(item)}
+						{#if stuck}
+							<div
+								class="space-y-1.5 rounded-xl border-2 border-amber-400 bg-amber-50 p-3 text-xs text-amber-950"
+							>
+								<div class="font-extrabold text-amber-900">
+									⚠ Operasi Macet (Gagal {item.retryCount}x berturut-turut)
+								</div>
+								<div class="text-amber-900">
+									Operasi ini menahan pengiriman antrean setelahnya. Pesan terakhir:
+									<strong>{item.lastError || 'Gagal menghubungi server.'}</strong>
+								</div>
+							</div>
+						{:else if item.retryCount > 0 && item.lastError}
 							<div
 								class="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900"
 							>
@@ -494,24 +533,58 @@
 							</div>
 						{/if}
 
-						<div class="flex gap-2">
-							<button
-								type="button"
-								onclick={handleSyncNow}
-								disabled={syncing}
-								class="flex-1 rounded-xl bg-slate-900 px-3 py-2.5 text-xs font-bold text-white active:bg-slate-800 disabled:opacity-50"
+						{#if confirmingCancelId === item.clientOpId}
+							<div
+								class="space-y-2.5 rounded-xl border border-red-300 bg-red-50 p-3 text-xs text-red-950"
 							>
-								Coba Kirim Sekarang
-							</button>
-							<button
-								type="button"
-								onclick={() => handleDismissItem(item.clientOpId)}
-								disabled={syncing}
-								class="rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-xs font-bold text-slate-700 active:bg-slate-100"
-							>
-								Batalkan
-							</button>
-						</div>
+								<div class="font-bold">
+									Konfirmasi Batalkan & Hapus Operasi dari Antrean?
+								</div>
+								<p class="text-red-800">
+									Operasi <strong>{item.label}</strong> belum tersimpan di server. Jika dibatalkan,
+									catatan lokal ini akan dihapus dan antrean berikutnya akan dilanjutkan.
+								</p>
+								<div class="flex gap-2">
+									<button
+										type="button"
+										onclick={() => handleDismissItem(item.clientOpId)}
+										disabled={syncing}
+										class="flex-1 rounded-xl bg-red-700 px-3 py-2.5 text-xs font-bold text-white active:bg-red-800"
+									>
+										Ya, Batalkan Operasi Ini
+									</button>
+									<button
+										type="button"
+										onclick={() => (confirmingCancelId = null)}
+										disabled={syncing}
+										class="rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-xs font-bold text-slate-700 active:bg-slate-100"
+									>
+										Tidak
+									</button>
+								</div>
+							</div>
+						{:else}
+							<div class="flex gap-2">
+								<button
+									type="button"
+									onclick={handleSyncNow}
+									disabled={syncing}
+									class="flex-1 rounded-xl bg-slate-900 px-3 py-2.5 text-xs font-bold text-white active:bg-slate-800 disabled:opacity-50"
+								>
+									Coba Kirim Sekarang
+								</button>
+								<button
+									type="button"
+									onclick={() => (confirmingCancelId = item.clientOpId)}
+									disabled={syncing}
+									class="rounded-xl border {stuck
+										? 'border-red-400 bg-red-50 text-red-800'
+										: 'border-slate-300 bg-white text-slate-700'} px-3 py-2.5 text-xs font-bold active:bg-slate-100"
+								>
+									{stuck ? 'Batalkan Operasi Macet' : 'Batalkan'}
+								</button>
+							</div>
+						{/if}
 					{/if}
 				</div>
 			{/each}

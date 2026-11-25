@@ -55,10 +55,22 @@ export interface SyncPendingOptions {
 
 const BASE_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 60_000;
+export const STUCK_OPERATION_RETRY_THRESHOLD = 5;
 
 export function computeBackoffDelayMs(retryCount: number): number {
 	const exponent = Math.max(0, Math.min(retryCount - 1, 6));
 	return Math.min(BASE_BACKOFF_MS * Math.pow(2, exponent), MAX_BACKOFF_MS);
+}
+
+/**
+ * Menentukan apakah sebuah operasi PENDING di antrean sudah mengalami kegagalan berulang
+ * melampaui ambang batas wajar sehingga perlu peringatan "Operasi Macet" di /m/sync.
+ */
+export function isOperationStuck(
+	item: OfflineQueueItem,
+	threshold = STUCK_OPERATION_RETRY_THRESHOLD
+): boolean {
+	return item.syncState === 'PENDING' && item.retryCount >= threshold;
 }
 
 /**
@@ -215,8 +227,10 @@ async function executeSyncPendingOperations(
 			continue;
 		}
 
+		// Aturan FIFO ketat (#2): Jika operasi paling depan yang masih PENDING belum melewati jadwal backoff-nya,
+		// hentikan perulangan (break) agar operasi berikutnya tidak menyalip operasi ini.
 		if (!force && rawItem.nextRetryAt !== null && rawItem.nextRetryAt > nowMs) {
-			continue;
+			break;
 		}
 
 		processed++;
@@ -431,6 +445,10 @@ async function executeSyncPendingOperations(
 				lastError: errMsg
 			};
 			await storage.put(item);
+
+			// Aturan FIFO ketat (#2): Berhenti di operasi pertama yang gagal sementara (network / 5xx)
+			// agar operasi dependen setelahnya (mis. LOAN_RETURN atau SHIFT_CLOSE) tidak menyalip operasi ini.
+			break;
 		}
 	}
 
