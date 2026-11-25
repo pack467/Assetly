@@ -12,6 +12,12 @@ export const uploadEvidenceMetaSchema = z.object({
 	purpose: evidencePurposeSchema,
 	captureSource: z.string().trim().toUpperCase().default('CAMERA'),
 	takenAtDevice: z.string().datetime({ offset: true }).or(z.string().min(10)),
+	uploadedAtDevice: z
+		.string()
+		.datetime({ offset: true })
+		.or(z.string().min(10))
+		.nullable()
+		.optional(),
 	gpsAvailable: z.boolean().default(false),
 	latitude: z.number().min(-90).max(90).nullable().optional(),
 	longitude: z.number().min(-180).max(180).nullable().optional(),

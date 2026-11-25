@@ -214,8 +214,11 @@ model Evidence {
 
   // Waktu: simpan dua-duanya, selisihnya jadi sinyal risiko
   takenAtDevice    DateTime
+  uploadedAtDevice DateTime?
   receivedAtServer DateTime        @default(now())
   clockSkewSec     Int?
+  rawClockSkewSec  Int?
+  offlineDelaySec  Int?
 
   // Lokasi
   gpsAvailable        Boolean      @default(false)

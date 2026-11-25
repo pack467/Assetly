@@ -16,6 +16,8 @@ export interface RiskConfig {
 	blockOnMock: boolean;
 	clockSkewWarnSec: number;
 	clockSkewSuspiciousSec: number;
+	futureToleranceSec: number;
+	offlineToleranceSec: number;
 	maxAccuracyM: number;
 	farLocationMultiplier: number;
 	maxSpeedKmh: number;
@@ -26,6 +28,8 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
 	blockOnMock: (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false',
 	clockSkewWarnSec: 300,
 	clockSkewSuspiciousSec: 3600,
+	futureToleranceSec: 60,
+	offlineToleranceSec: 15 * 60, // toleransi 15 menit sejak aktivitas online terakhir
 	maxAccuracyM: 5000,
 	farLocationMultiplier: 5,
 	maxSpeedKmh: 150,
@@ -34,6 +38,7 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
 
 export interface EvidenceRiskInput {
 	takenAtDevice: Date;
+	uploadedAtDevice?: Date | null;
 	receivedAtServer?: Date;
 	gpsAvailable: boolean;
 	latitude?: number | null;
@@ -54,17 +59,35 @@ export interface PreviousEvidencePoint {
 	locationId: string | null;
 	receivedAtServer: Date;
 	takenAtDevice: Date;
+	offlineDelaySec?: number | null;
 }
 
 export interface EvidenceRiskContext {
 	recentUserEvidences?: PreviousEvidencePoint[];
+	/**
+	 * Waktu aktivitas online terakhir pengguna yang tercatat di server
+	 * (diambil dari waktu efektif Evidence terakhir pengguna atau Session.createdAt aktif terakhir).
+	 */
+	lastOnlineActivityAt?: Date | null;
+	/**
+	 * Waktu takenAtDevice dari bukti terakhir pengguna yang sama (termasuk bukti non-GPS)
+	 * untuk menegakkan urutan waktu monotonik (takenAtDevice baru tidak boleh lebih tua dari bukti terakhir).
+	 */
+	latestPreviousTakenAt?: Date | null;
 }
 
 export interface EvidenceRiskEvaluation {
 	riskLevel: RiskLevel;
 	riskReasons: RiskReasonCode[];
 	shouldBlock: boolean;
+	/** Selisih jam efektif setelah memperhitungkan jeda antrean offline yang sah */
 	clockSkewSec: number;
+	/** Selisih mentah |receivedAtServer - takenAtDevice| dalam detik */
+	rawClockSkewSec: number;
+	/** Lama antrean offline yang terverifikasi dan diterima oleh server (detik) */
+	offlineDelaySec: number;
+	/** Waktu pengambilan efektif yang sudah dibatasi oleh server (dipakai untuk IMPOSSIBLE_JUMP) */
+	effectiveCapturedAt: Date;
 	distanceToLocationM: number | null;
 }
 
@@ -118,9 +141,71 @@ export function evaluateEvidenceRisk(
 	};
 
 	const receivedAt = input.receivedAtServer ?? new Date();
-	const clockSkewSec = Math.round(
+	const rawClockSkewSec = Math.round(
 		Math.abs(receivedAt.getTime() - input.takenAtDevice.getTime()) / 1000
 	);
+
+	// Bila uploadedAtDevice disertakan klien, gunakan untuk mengukur selisih jam HP saat unggah (a)
+	// dan klaim durasi offline uploadedAtDevice - takenAtDevice (b).
+	const uploadedAt = input.uploadedAtDevice ?? input.takenAtDevice;
+	const uploadClockSkewSec = Math.round(
+		Math.abs(receivedAt.getTime() - uploadedAt.getTime()) / 1000
+	);
+	const rawClaimedOfflineSec = Math.round(
+		(uploadedAt.getTime() - input.takenAtDevice.getTime()) / 1000
+	);
+
+	const recent = context.recentUserEvidences ?? [];
+	const latestPrev = recent[0] ?? null;
+	const latestPrevEffectiveAt = latestPrev
+		? new Date(latestPrev.receivedAtServer.getTime() - (latestPrev.offlineDelaySec ?? 0) * 1000)
+		: null;
+	const latestPrevTakenAt = context.latestPreviousTakenAt ?? latestPrev?.takenAtDevice ?? null;
+
+	// Syarat keabsahan klaim waktu ambil (takenAtDevice):
+	// 1) Tidak boleh di masa depan terhadap receivedAtServer maupun uploadedAtDevice (toleransi 60 detik)
+	const isTakenInFutureOfServer =
+		(input.takenAtDevice.getTime() - receivedAt.getTime()) / 1000 > cfg.futureToleranceSec;
+	const isTakenInFutureOfUpload = rawClaimedOfflineSec < -cfg.futureToleranceSec;
+
+	// 2) Tidak boleh lebih tua dari bukti terakhir milik pengguna yang sama
+	const isOlderThanPreviousEvidence = Boolean(
+		latestPrevTakenAt && input.takenAtDevice.getTime() < latestPrevTakenAt.getTime()
+	);
+
+	// Tentukan titik aktivitas online terakhir pengguna di server (lastOnlineAnchor)
+	let lastOnlineAnchor: Date | null = context.lastOnlineActivityAt ?? null;
+	if (latestPrevEffectiveAt) {
+		if (!lastOnlineAnchor || latestPrevEffectiveAt.getTime() > lastOnlineAnchor.getTime()) {
+			lastOnlineAnchor = latestPrevEffectiveAt;
+		}
+	}
+
+	let offlineDelaySec = 0;
+	let clockSkewSec = rawClockSkewSec;
+
+	if (isTakenInFutureOfServer || isTakenInFutureOfUpload || isOlderThanPreviousEvidence) {
+		// Klaim waktu ambil melanggar batas masa depan atau urutan monotonik bukti -> tidak ada potongan offline
+		offlineDelaySec = 0;
+		clockSkewSec = Math.max(uploadClockSkewSec, rawClockSkewSec);
+	} else {
+		const positiveClaimedOfflineSec = Math.max(0, rawClaimedOfflineSec);
+		let maxAllowedOfflineSec = positiveClaimedOfflineSec;
+		if (lastOnlineAnchor) {
+			const elapsedSinceLastOnlineSec = Math.max(
+				0,
+				Math.round((receivedAt.getTime() - lastOnlineAnchor.getTime()) / 1000)
+			);
+			maxAllowedOfflineSec = elapsedSinceLastOnlineSec + cfg.offlineToleranceSec;
+		}
+
+		offlineDelaySec = Math.min(positiveClaimedOfflineSec, maxAllowedOfflineSec);
+		const unexplainedOfflineSec = Math.max(0, positiveClaimedOfflineSec - maxAllowedOfflineSec);
+		// Total CLOCK_SKEW sesungguhnya = (a) selisih jam HP saat unggah + (b) klaim offline yang melampaui batas aktivitas online terakhir
+		clockSkewSec = uploadClockSkewSec + unexplainedOfflineSec;
+	}
+
+	const effectiveCapturedAt = new Date(receivedAt.getTime() - offlineDelaySec * 1000);
 
 	let riskLevel: RiskLevel = 'NORMAL';
 	const reasons: RiskReasonCode[] = [];
@@ -195,18 +280,17 @@ export function evaluateEvidenceRisk(
 		}
 
 		// 6. IMPOSSIBLE_JUMP & 7. REPEATED_COORDS terhadap bukti sebelumnya milik user yang sama
-		const recent = context.recentUserEvidences ?? [];
-		if (recent.length > 0) {
-			const latestPrev = recent[0];
+		if (recent.length > 0 && latestPrev && latestPrevEffectiveAt) {
 			const jumpDistanceM = calculateHaversineDistanceM(
 				lat,
 				lng,
 				latestPrev.latitude,
 				latestPrev.longitude
 			);
+			// Gunakan waktu pengambilan efektif yang sudah dibatasi (bukan receivedAtServer mentah)
 			const deltaSec = Math.max(
 				1,
-				Math.abs(receivedAt.getTime() - latestPrev.receivedAtServer.getTime()) / 1000
+				Math.abs(effectiveCapturedAt.getTime() - latestPrevEffectiveAt.getTime()) / 1000
 			);
 			const speedKmh = (jumpDistanceM / deltaSec) * 3.6;
 
@@ -244,6 +328,9 @@ export function evaluateEvidenceRisk(
 		riskReasons: reasons,
 		shouldBlock,
 		clockSkewSec,
+		rawClockSkewSec,
+		offlineDelaySec,
+		effectiveCapturedAt,
 		distanceToLocationM
 	};
 }
@@ -266,7 +353,8 @@ export async function loadRecentUserEvidencesForRisk(
 			longitude: true,
 			locationId: true,
 			receivedAtServer: true,
-			takenAtDevice: true
+			takenAtDevice: true,
+			offlineDelaySec: true
 		}
 	});
 
@@ -280,6 +368,67 @@ export async function loadRecentUserEvidencesForRisk(
 			longitude: r.longitude,
 			locationId: r.locationId,
 			receivedAtServer: r.receivedAtServer,
-			takenAtDevice: r.takenAtDevice
+			takenAtDevice: r.takenAtDevice,
+			offlineDelaySec: r.offlineDelaySec ?? 0
 		}));
+}
+
+/**
+ * Memuat konteks risiko lengkap pengguna dari database:
+ * - recentUserEvidences: 5 bukti ber-GPS terakhir untuk IMPOSSIBLE_JUMP & REPEATED_COORDS
+ * - latestPreviousTakenAt: takenAtDevice dari bukti terakhir pengguna (termasuk non-GPS) untuk cek monotonik
+ * - lastOnlineActivityAt: diambil dari sumber paling sederhana dan andal di server, yaitu
+ *   maksimum antara waktu efektif Evidence terakhir pengguna (receivedAtServer - offlineDelaySec)
+ *   dan waktu login sesi aktif terakhir (Session.createdAt).
+ */
+export async function loadUserEvidenceRiskContext(
+	tx: DbTx,
+	userId: string
+): Promise<EvidenceRiskContext> {
+	const [recentUserEvidences, latestAnyEvidence, latestActiveSession] = await Promise.all([
+		loadRecentUserEvidencesForRisk(tx, userId),
+		tx.evidence.findFirst({
+			where: { userId },
+			orderBy: { receivedAtServer: 'desc' },
+			select: {
+				takenAtDevice: true,
+				receivedAtServer: true,
+				offlineDelaySec: true
+			}
+		}),
+		tx.session.findFirst({
+			where: {
+				userId,
+				revokedAt: null
+			},
+			orderBy: { createdAt: 'desc' },
+			select: {
+				createdAt: true
+			}
+		})
+	]);
+
+	const latestEvidenceEffectiveAt = latestAnyEvidence
+		? new Date(
+				latestAnyEvidence.receivedAtServer.getTime() -
+					(latestAnyEvidence.offlineDelaySec ?? 0) * 1000
+			)
+		: null;
+
+	const sessionCreatedAt = latestActiveSession?.createdAt ?? null;
+	let lastOnlineActivityAt: Date | null = null;
+	if (latestEvidenceEffectiveAt && sessionCreatedAt) {
+		lastOnlineActivityAt =
+			latestEvidenceEffectiveAt.getTime() >= sessionCreatedAt.getTime()
+				? latestEvidenceEffectiveAt
+				: sessionCreatedAt;
+	} else {
+		lastOnlineActivityAt = latestEvidenceEffectiveAt ?? sessionCreatedAt;
+	}
+
+	return {
+		recentUserEvidences,
+		latestPreviousTakenAt: latestAnyEvidence?.takenAtDevice ?? null,
+		lastOnlineActivityAt
+	};
 }

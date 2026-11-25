@@ -311,12 +311,113 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			expect(flaggedOnly.shouldBlock).toBe(false);
 		});
 
-		it('membuktikan perilaku CLOCK_SKEW saat ini: foto yang diambil saat offline 2 jam lalu dan baru diunggah sekarang dinilai jam melenceng (CLOCK_SKEW_LARGE / SUSPICIOUS) (#6)', () => {
-			// Skenario nyata offline: foto diambil pukul 01:00 UTC di gudang tanpa sinyal (jam HP akurat),
-			// lalu baru terunggah ke server pukul 03:00 UTC (2 jam kemudian = 7200 detik) saat sinyal kembali.
-			const takenOfflineTwoHoursAgo = new Date(now.getTime() - 2 * 3600 * 1000);
-			const offlinePhotoRisk = evaluateEvidenceRisk({
-				takenAtDevice: takenOfflineTwoHoursAgo,
+		it('menilai adil foto offline jujur (2 jam), mencegah IMPOSSIBLE_JUMP palsu pada batch offline 30 menit, serta tetap menangkap pemalsuan jam HP saat online maupun jam HP salah saat unggah (#6)', () => {
+			// 1. Foto offline jujur 2 jam: diambil pukul 01:00 UTC saat offline (aktivitas online terakhir pukul 00:45 UTC),
+			//    diunggah pukul 03:00 UTC saat sinyal kembali (uploadedAtDevice = 03:00 UTC).
+			const takenTwoHoursAgo = new Date(now.getTime() - 2 * 3600 * 1000);
+			const lastOnlineBeforeWarehouse = new Date(now.getTime() - 2.25 * 3600 * 1000);
+
+			const honestOfflineRes = evaluateEvidenceRisk(
+				{
+					takenAtDevice: takenTwoHoursAgo,
+					uploadedAtDevice: now,
+					receivedAtServer: now,
+					gpsAvailable: true,
+					latitude: -6.2001,
+					longitude: 106.8167,
+					accuracyM: 12,
+					isMockLocation: false,
+					location: baseLoc
+				},
+				{
+					lastOnlineActivityAt: lastOnlineBeforeWarehouse
+				}
+			);
+
+			expect(honestOfflineRes.riskLevel).toBe('NORMAL');
+			expect(honestOfflineRes.riskReasons).toEqual([]);
+			expect(honestOfflineRes.clockSkewSec).toBe(0);
+			expect(honestOfflineRes.rawClockSkewSec).toBe(7200);
+			expect(honestOfflineRes.offlineDelaySec).toBe(7200);
+
+			// 2. Dua foto offline berjarak 30 menit di dua gedung berbeda (~1.7 km) yang diunggah bersamaan (selisih terima server 1 detik):
+			//    Foto 1 diambil pukul 01:00 di Gedung A (-6.2, 106.8166), diterima pukul 03:00:00 (offlineDelaySec = 7200).
+			//    Foto 2 diambil pukul 01:30 di Gedung B (-6.215, 106.8166), diterima pukul 03:00:01 (uploadedAtDevice = 03:00:01).
+			//    Kecepatan efektif = ~1.67 km / 30 menit = ~3.3 km/jam -> TIDAK kena IMPOSSIBLE_JUMP!
+			const taken90MinAgo = new Date(now.getTime() - 90 * 60 * 1000);
+			const receivedOneSecLater = new Date(now.getTime() + 1000);
+			const buildingBLoc = {
+				id: 'loc-gedung-b',
+				latitude: -6.215,
+				longitude: 106.8166,
+				radiusM: 100
+			};
+
+			const secondOfflineBatchPhoto = evaluateEvidenceRisk(
+				{
+					takenAtDevice: taken90MinAgo,
+					uploadedAtDevice: receivedOneSecLater,
+					receivedAtServer: receivedOneSecLater,
+					gpsAvailable: true,
+					latitude: -6.215,
+					longitude: 106.8166,
+					accuracyM: 10,
+					isMockLocation: false,
+					location: buildingBLoc
+				},
+				{
+					lastOnlineActivityAt: takenTwoHoursAgo,
+					latestPreviousTakenAt: takenTwoHoursAgo,
+					recentUserEvidences: [
+						{
+							latitude: -6.2001,
+							longitude: 106.8167,
+							locationId: baseLoc.id,
+							takenAtDevice: takenTwoHoursAgo,
+							receivedAtServer: now,
+							offlineDelaySec: 7200
+						}
+					]
+				}
+			);
+
+			expect(secondOfflineBatchPhoto.riskReasons).not.toContain('IMPOSSIBLE_JUMP');
+			expect(secondOfflineBatchPhoto.riskLevel).toBe('NORMAL');
+			expect(secondOfflineBatchPhoto.clockSkewSec).toBe(0);
+			expect(secondOfflineBatchPhoto.offlineDelaySec).toBe(5401);
+
+			// 3. Pengguna memundurkan jam HP saat online (baru saja aktif online 5 menit lalu, memundurkan jam 2 jam saat memotret,
+			//    lalu mengembalikan jam HP ke waktu sekarang saat mengunggah agar berpura-pura offline 2 jam):
+			//    Batas klaim offline maksimum = 5 menit + 15 menit toleransi = 20 menit (1200 detik).
+			//    Sisa 6000 detik tidak terjelaskan -> TETAP TERTANGKAP sebagai CLOCK_SKEW_LARGE (SUSPICIOUS)!
+			const onlineFiveMinAgo = new Date(now.getTime() - 5 * 60 * 1000);
+			const spoofedOfflineClaim = evaluateEvidenceRisk(
+				{
+					takenAtDevice: takenTwoHoursAgo,
+					uploadedAtDevice: now,
+					receivedAtServer: now,
+					gpsAvailable: true,
+					latitude: -6.2001,
+					longitude: 106.8167,
+					accuracyM: 12,
+					isMockLocation: false,
+					location: baseLoc
+				},
+				{
+					lastOnlineActivityAt: onlineFiveMinAgo
+				}
+			);
+
+			expect(spoofedOfflineClaim.offlineDelaySec).toBe(1200);
+			expect(spoofedOfflineClaim.clockSkewSec).toBe(6000);
+			expect(spoofedOfflineClaim.riskReasons).toContain('CLOCK_SKEW_LARGE');
+			expect(spoofedOfflineClaim.riskLevel).toBe('SUSPICIOUS');
+
+			// 4. Jam HP salah saat unggah (uploadedAtDevice melenceng 2 jam dari receivedAtServer):
+			//    Tertangkap langsung oleh pemeriksaan (a) |receivedAtServer - uploadedAtDevice|!
+			const wrongClockAtUpload = evaluateEvidenceRisk({
+				takenAtDevice: takenTwoHoursAgo,
+				uploadedAtDevice: takenTwoHoursAgo,
 				receivedAtServer: now,
 				gpsAvailable: true,
 				latitude: -6.2001,
@@ -326,10 +427,33 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				location: baseLoc
 			});
 
-			// Bukti bahwa implementasi saat ini membandingkan takenAtDevice langsung dengan receivedAtServer (selisih 7200 detik > 3600 detik)
-			expect(offlinePhotoRisk.clockSkewSec).toBe(7200);
-			expect(offlinePhotoRisk.riskReasons).toContain('CLOCK_SKEW_LARGE');
-			expect(offlinePhotoRisk.riskLevel).toBe('SUSPICIOUS');
+			expect(wrongClockAtUpload.clockSkewSec).toBe(7200);
+			expect(wrongClockAtUpload.riskReasons).toContain('CLOCK_SKEW_LARGE');
+			expect(wrongClockAtUpload.riskLevel).toBe('SUSPICIOUS');
+
+			// 5. takenAtDevice di masa depan (> 60 detik) atau lebih tua dari bukti terakhir pengguna -> ditolak potongan offline-nya
+			const futureTaken = evaluateEvidenceRisk({
+				takenAtDevice: new Date(now.getTime() + 10 * 60 * 1000),
+				uploadedAtDevice: now,
+				receivedAtServer: now,
+				gpsAvailable: false
+			});
+			expect(futureTaken.offlineDelaySec).toBe(0);
+			expect(futureTaken.riskReasons).toContain('CLOCK_SKEW');
+
+			const olderThanPrevious = evaluateEvidenceRisk(
+				{
+					takenAtDevice: new Date(now.getTime() - 40 * 60 * 1000),
+					uploadedAtDevice: now,
+					receivedAtServer: now,
+					gpsAvailable: false
+				},
+				{
+					latestPreviousTakenAt: new Date(now.getTime() - 20 * 60 * 1000)
+				}
+			);
+			expect(olderThanPrevious.offlineDelaySec).toBe(0);
+			expect(olderThanPrevious.riskReasons).toContain('CLOCK_SKEW');
 		});
 	});
 
@@ -920,6 +1044,103 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				}
 			});
 			expect(returnAuditCount).toBe(1);
+		});
+
+		it('menyimpan rawClockSkewSec dan offlineDelaySec di tabel Evidence serta menetapkan LoanItem.returnedAt memakai waktu server (bukan takenAtDevice mentah) (#6)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			// Buat pengguna baru tanpa aktivitas online sebelumnya dalam 2 jam terakhir
+			const offlineUserRow = await prisma.user.create({
+				data: {
+					name: 'Petugas Gudang Offline',
+					email: `m2a-offline-${suffix}@example.com`,
+					passwordHash: 'hash',
+					role: 'BORROWER',
+					isActive: true
+				}
+			});
+			const offlineActor: PolicyUser = {
+				id: offlineUserRow.id,
+				role: 'BORROWER',
+				isActive: true
+			};
+
+			const offlineAsset = await prisma.asset.create({
+				data: {
+					code: `AST-OFFTIME-${suffix}`,
+					qrToken: `qr-offtime-${randomUUID()}`,
+					name: 'Laptop Uji Waktu Offline DB',
+					categoryId: standardCategoryId,
+					status: 'AVAILABLE'
+				}
+			});
+
+			const checkoutTakenAt = new Date(Date.now() - 2 * 3600 * 1000); // 2 jam lalu
+			const checkoutUploadedAt = new Date();
+			const uploadedCheckout = await uploadEvidence(offlineActor, {
+				meta: {
+					purpose: 'CHECKOUT',
+					captureSource: 'CAMERA',
+					takenAtDevice: checkoutTakenAt.toISOString(),
+					uploadedAtDevice: checkoutUploadedAt.toISOString(),
+					gpsAvailable: true,
+					latitude: -6.2,
+					longitude: 106.8166,
+					accuracyM: 10,
+					isMockLocation: false,
+					locationId: location1Id
+				},
+				fileBuffer: VALID_JPEG_BUFFER
+			});
+
+			expect(uploadedCheckout.evidence.riskLevel).toBe('NORMAL');
+			expect(uploadedCheckout.evidence.clockSkewSec).toBeLessThanOrEqual(5);
+			expect(uploadedCheckout.evidence.rawClockSkewSec).toBeGreaterThanOrEqual(7195);
+			expect(uploadedCheckout.evidence.offlineDelaySec).toBeGreaterThanOrEqual(7195);
+
+			const createdLoan = await createLoan(offlineActor, {
+				assetId: offlineAsset.id,
+				evidenceId: uploadedCheckout.evidence.id,
+				purpose: 'Pinjam Offline Gudang',
+				expectedReturnAt: new Date(Date.now() + 86400_000).toISOString()
+			});
+			const loanItemId = createdLoan.loan.items[0].id;
+
+			// Foto pengembalian diambil offline 1 jam lalu (lebih baru dari foto pinjam 2 jam lalu), diunggah sekarang
+			const returnTakenAt = new Date(Date.now() - 3600 * 1000);
+			const beforeReturnServerMs = Date.now();
+			const uploadedReturn = await uploadEvidence(offlineActor, {
+				meta: {
+					purpose: 'RETURN',
+					captureSource: 'CAMERA',
+					takenAtDevice: returnTakenAt.toISOString(),
+					uploadedAtDevice: new Date().toISOString(),
+					gpsAvailable: true,
+					latitude: -6.2,
+					longitude: 106.8166,
+					accuracyM: 10,
+					isMockLocation: false,
+					locationId: location1Id
+				},
+				fileBuffer: VALID_JPEG_BUFFER
+			});
+
+			expect(uploadedReturn.evidence.riskLevel).toBe('NORMAL');
+			expect(uploadedReturn.evidence.rawClockSkewSec).toBeGreaterThanOrEqual(3595);
+			expect(uploadedReturn.evidence.offlineDelaySec).toBeGreaterThanOrEqual(3595);
+
+			const returned = await returnLoanItem(offlineActor, loanItemId, {
+				returnCondition: 'NORMAL',
+				evidenceId: uploadedReturn.evidence.id
+			});
+
+			// Waktu resmi pengembalian (returnedAt) wajib memakai jam server saat diproses, TIDAK pernah memakai takenAtDevice mentah (1 jam lalu)
+			expect(returned.loanItem.returnedAt).not.toBeNull();
+			expect(returned.loanItem.returnedAt!.getTime()).toBeGreaterThanOrEqual(
+				beforeReturnServerMs - 1000
+			);
+			expect(returned.loanItem.returnedAt!.getTime()).toBeGreaterThan(
+				returnTakenAt.getTime() + 3500 * 1000
+			);
 		});
 	});
 });

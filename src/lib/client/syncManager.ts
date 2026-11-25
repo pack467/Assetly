@@ -248,6 +248,7 @@ async function executeSyncPendingOperations(
 					purpose: ev.purpose,
 					captureSource: ev.captureSource,
 					takenAtDevice: ev.takenAtDevice,
+					uploadedAtDevice: new Date().toISOString(),
 					gpsAvailable: ev.gpsAvailable,
 					latitude: ev.latitude,
 					longitude: ev.longitude,

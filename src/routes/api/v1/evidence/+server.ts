@@ -29,6 +29,7 @@ export const POST: RequestHandler = async (event) => {
 				purpose: formData.get('purpose'),
 				captureSource: (formData.get('captureSource') as string) || 'CAMERA',
 				takenAtDevice: formData.get('takenAtDevice'),
+				uploadedAtDevice: (formData.get('uploadedAtDevice') as string) || null,
 				gpsAvailable: rawGps === 'true' || rawGps === '1',
 				latitude: rawLat !== null && rawLat !== '' ? Number(rawLat) : null,
 				longitude: rawLng !== null && rawLng !== '' ? Number(rawLng) : null,

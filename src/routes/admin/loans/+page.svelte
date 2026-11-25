@@ -5,8 +5,11 @@
 	interface LoanEvidence {
 		id: string;
 		takenAtDevice: string;
+		uploadedAtDevice?: string | null;
 		receivedAtServer: string;
 		clockSkewSec: number | null;
+		rawClockSkewSec?: number | null;
+		offlineDelaySec?: number | null;
 		gpsAvailable: boolean;
 		latitude: number | null;
 		longitude: number | null;
@@ -258,7 +261,12 @@
 												{/if}
 											</div>
 											<div>
-												Selisih Jam HP vs Server: {ev.clockSkewSec ?? 0} detik
+												Selisih Jam Efektif (Clock Skew): {ev.clockSkewSec ?? 0} detik
+											</div>
+											<div>
+												Selisih Mentah (Ambil vs Terima): {ev.rawClockSkewSec ??
+													ev.clockSkewSec ??
+													0} detik · Lama Offline: {ev.offlineDelaySec ?? 0} detik
 											</div>
 											<div>
 												Lokasi:
@@ -292,7 +300,11 @@
 											<div>
 												Risiko: <strong>{RiskLevelLabels[rev.riskLevel]}</strong>
 											</div>
-											<div>Selisih Jam: {rev.clockSkewSec ?? 0} detik</div>
+											<div>
+												Selisih Jam Efektif: {rev.clockSkewSec ?? 0} detik · Mentah:
+												{rev.rawClockSkewSec ?? rev.clockSkewSec ?? 0} detik · Offline:
+												{rev.offlineDelaySec ?? 0} detik
+											</div>
 											{#if item.returnSignedUrl}
 												<a
 													href={item.returnSignedUrl}

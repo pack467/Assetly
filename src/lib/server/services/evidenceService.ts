@@ -2,7 +2,7 @@ import type { EvidencePurpose } from '@prisma/client';
 import { prisma } from '$lib/server/db';
 import { writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, type PolicyUser } from '$lib/server/policy';
-import { evaluateEvidenceRisk, loadRecentUserEvidencesForRisk } from '$lib/server/risk';
+import { evaluateEvidenceRisk, loadUserEvidenceRiskContext } from '$lib/server/risk';
 import {
 	createEvidenceSignedUrl,
 	deletePrivateEvidenceFile,
@@ -46,6 +46,18 @@ export async function uploadEvidence(
 		);
 	}
 
+	let uploadedAtDevice: Date | null = null;
+	if (meta.uploadedAtDevice) {
+		const parsedUpload = new Date(meta.uploadedAtDevice);
+		if (Number.isNaN(parsedUpload.getTime())) {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				'Waktu pengunggahan foto di perangkat (uploadedAtDevice) tidak valid.'
+			);
+		}
+		uploadedAtDevice = parsedUpload;
+	}
+
 	const hasCoords =
 		meta.gpsAvailable &&
 		typeof meta.latitude === 'number' &&
@@ -81,11 +93,12 @@ export async function uploadEvidence(
 	}
 
 	const receivedAtServer = new Date();
-	const recentUserEvidences = await loadRecentUserEvidencesForRisk(prisma, currentUser.id);
+	const riskContext = await loadUserEvidenceRiskContext(prisma, currentUser.id);
 
 	const riskEvaluation = evaluateEvidenceRisk(
 		{
 			takenAtDevice,
+			uploadedAtDevice,
 			receivedAtServer,
 			gpsAvailable: hasCoords,
 			latitude: hasCoords ? meta.latitude : null,
@@ -94,7 +107,7 @@ export async function uploadEvidence(
 			isMockLocation: meta.isMockLocation,
 			location: selectedLocation
 		},
-		{ recentUserEvidences }
+		riskContext
 	);
 
 	// BR-07: Bila isMockLocation = true dan RISK_BLOCK_ON_MOCK aktif, blokir dan catat di AuditLog
@@ -137,8 +150,11 @@ export async function uploadEvidence(
 					imageKey,
 					userId: currentUser.id,
 					takenAtDevice,
+					uploadedAtDevice,
 					receivedAtServer,
 					clockSkewSec: riskEvaluation.clockSkewSec,
+					rawClockSkewSec: riskEvaluation.rawClockSkewSec,
+					offlineDelaySec: riskEvaluation.offlineDelaySec,
 					gpsAvailable: hasCoords,
 					latitude: hasCoords ? meta.latitude : null,
 					longitude: hasCoords ? meta.longitude : null,
@@ -162,6 +178,8 @@ export async function uploadEvidence(
 					gpsAvailable: evidence.gpsAvailable,
 					locationId: evidence.locationId,
 					clockSkewSec: evidence.clockSkewSec,
+					rawClockSkewSec: evidence.rawClockSkewSec,
+					offlineDelaySec: evidence.offlineDelaySec,
 					riskLevel: evidence.riskLevel,
 					riskReasons: riskEvaluation.riskReasons
 				},
