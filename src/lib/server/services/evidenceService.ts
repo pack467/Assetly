@@ -233,7 +233,7 @@ export async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Pr
 		}),
 		tx.auditLog.findFirst({
 			where: {
-				action: 'SHIFT_CLOSED',
+				action: { in: ['SHIFT_CLOSED', 'SHIFT_FORCE_CLOSED_BY_ADMIN'] },
 				OR: evidenceIds.map((id) => ({
 					after: {
 						path: ['evidenceId'],

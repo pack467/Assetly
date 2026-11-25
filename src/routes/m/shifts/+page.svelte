@@ -46,6 +46,13 @@
 		note: string | null;
 		user: { id: string; name: string; email: string; role: string };
 		items: ShiftItemRecord[];
+		forceClosedByAdmin?: {
+			adminId: string;
+			adminName: string;
+			adminEmail: string;
+			emergencyCloseReason: string;
+			closedAt: string;
+		} | null;
 	}
 
 	let currentShift = $state<ShiftRecord | null>(null);
@@ -326,6 +333,20 @@
 					Petugas: <strong>{previousClosedShift.user.name}</strong>
 					{previousClosedShift.note ? ` · Catatan: "${previousClosedShift.note}"` : ''}
 				</div>
+				{#if previousClosedShift.forceClosedByAdmin}
+					<div
+						class="rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs text-amber-950 space-y-1"
+					>
+						<div class="font-extrabold text-amber-900">
+							⚠ Shift Sebelumnya Ditutup Darurat oleh Admin ({previousClosedShift.forceClosedByAdmin
+								.adminName})
+						</div>
+						<div>
+							Alasan Darurat:
+							<strong>"{previousClosedShift.forceClosedByAdmin.emergencyCloseReason}"</strong>
+						</div>
+					</div>
+				{/if}
 				{#if previousClosedShift.items.length === 0}
 					<div class="text-xs font-medium text-emerald-800">
 						✓ Shift sebelumnya ditutup bersih tanpa barang tertinggal.

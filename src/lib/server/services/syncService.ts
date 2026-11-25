@@ -142,6 +142,15 @@ async function executeSingleOperation(
 				});
 				if (openForUser) {
 					shiftId = openForUser.id;
+				} else {
+					const latestClosedForUser = await tx.shift.findFirst({
+						where: { userId: actor.id, status: 'CLOSED' },
+						orderBy: { closedAt: 'desc' },
+						select: { id: true }
+					});
+					if (latestClosedForUser) {
+						shiftId = latestClosedForUser.id;
+					}
 				}
 			}
 			if (!shiftId) {

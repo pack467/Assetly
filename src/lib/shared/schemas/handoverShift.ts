@@ -28,6 +28,7 @@ export const shiftItemClosureInputSchema = z.object({
 
 export const closeShiftSchema = z.object({
 	note: z.string().trim().max(1000).nullable().optional(),
+	emergencyCloseReason: z.string().trim().max(1000).nullable().optional(),
 	evidenceId: z.string().uuid('ID bukti foto tidak valid.').nullable().optional(),
 	items: z.array(shiftItemClosureInputSchema).default([])
 });

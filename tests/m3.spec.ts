@@ -22,6 +22,7 @@ import {
 	closeShift,
 	listShifts
 } from '../src/lib/server/services/shiftService';
+import { processSyncBatch } from '../src/lib/server/services/syncService';
 import { parseAllowedCorsOrigins, getCorsHeadersForOrigin } from '../src/lib/server/cors';
 import { handle } from '../src/hooks.server';
 
@@ -633,6 +634,161 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			// 9. Admin melihat laporan shift lengkap di GET /api/v1/shifts
 			const adminShiftReport = await listShifts(adminActor, { status: 'CLOSED' });
 			expect(adminShiftReport.items.some((s) => s.id === shift1.shift.id)).toBe(true);
+		});
+
+		it('mendukung Tutup Shift Darurat oleh ADMIN (Lapis 2): wajib emergencyCloseReason, menulis AuditLog SHIFT_FORCE_CLOSED_BY_ADMIN, tampil di Catatan Shift Sebelumnya, menolak OFFICER/BORROWER, dan mengubah SHIFT_CLOSE susulan menjadi CONFLICT', async () => {
+			// Bersihkan dulu pinjaman aktif dari test sebelumnya
+			await prisma.loanItem.updateMany({
+				where: { returnedAt: null },
+				data: { returnedAt: new Date(), returnCondition: 'NORMAL' }
+			});
+
+			const suffix = randomUUID().slice(0, 8);
+			const fcAsset = await prisma.asset.create({
+				data: {
+					code: `AST-FC-${suffix}`,
+					qrToken: `qr-fc-${randomUUID()}`,
+					name: 'Laptop Uji Force Close Shift',
+					categoryId,
+					status: 'AVAILABLE'
+				}
+			});
+
+			// 1. Petugas 1 (officer1) membuka shift dan ada 1 barang sedang dipinjam
+			const opened = await openShift(officer1, { note: 'Shift Petugas 1 di Gudang Tanpa Sinyal' });
+			const evCheckout = await createEvidenceForActor(borrower1, 'CHECKOUT');
+			const loan = await createLoan(borrower1, {
+				assetId: fcAsset.id,
+				evidenceId: evCheckout.id,
+				purpose: 'Liputan Lapangan',
+				expectedReturnAt: new Date(Date.now() + 86400_000).toISOString()
+			});
+			const activeLoanItemId = loan.loan.items[0].id;
+
+			// 2. BORROWER dan OFFICER lain (officer2) wajib DITOLAK melakukan force-close (403 FORBIDDEN)
+			await expect(
+				closeShift(borrower1, opened.shift.id, {
+					emergencyCloseReason: 'Coba tutup dari akun peminjam',
+					items: [{ loanItemId: activeLoanItemId, reason: 'Masih dipakai' }]
+				})
+			).rejects.toMatchObject({
+				code: 'FORBIDDEN',
+				status: 403
+			});
+
+			await expect(
+				closeShift(officer2, opened.shift.id, {
+					emergencyCloseReason: 'Coba tutup darurat dari akun petugas 2',
+					items: [{ loanItemId: activeLoanItemId, reason: 'Masih dipakai' }]
+				})
+			).rejects.toMatchObject({
+				code: 'FORBIDDEN',
+				status: 403
+			});
+
+			// 3. ADMIN wajib mengisi emergencyCloseReason dengan panjang minimal yang wajar (>= 10 karakter); kosong/pendek ditolak (400 VALIDATION_ERROR)
+			await expect(
+				closeShift(adminActor, opened.shift.id, {
+					emergencyCloseReason: '',
+					items: [{ loanItemId: activeLoanItemId, reason: 'Masih dipakai liputan' }]
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			await expect(
+				closeShift(adminActor, opened.shift.id, {
+					emergencyCloseReason: 'Pendek',
+					items: [{ loanItemId: activeLoanItemId, reason: 'Masih dipakai liputan' }]
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			// 4. ADMIN berhasil menutup shift secara darurat dengan alasan lengkap dan alasan per barang keluar
+			const emergencyReasonText =
+				'HP petugas 1 kehabisan baterai di gudang basement tanpa sinyal; konfirmasi via telepon';
+			const forceClosed = await closeShift(adminActor, opened.shift.id, {
+				emergencyCloseReason: emergencyReasonText,
+				note: 'Ditutup darurat oleh Admin saat pergantian shift',
+				items: [
+					{
+						loanItemId: activeLoanItemId,
+						reason: 'Masih dipakai liputan hingga besok pagi'
+					}
+				]
+			});
+
+			expect(forceClosed.shift.status).toBe('CLOSED');
+			expect(forceClosed.shift.forceClosedByAdmin).toMatchObject({
+				adminId: adminActor.id,
+				emergencyCloseReason: emergencyReasonText
+			});
+
+			// 5. Pastikan AuditLog SHIFT_FORCE_CLOSED_BY_ADMIN mencatat admin, petugas pemilik shift, alasan, dan daftar barang beserta alasannya
+			const auditLog = await prisma.auditLog.findFirst({
+				where: {
+					entityType: 'Shift',
+					entityId: opened.shift.id,
+					action: 'SHIFT_FORCE_CLOSED_BY_ADMIN'
+				}
+			});
+			expect(auditLog).not.toBeNull();
+			expect(auditLog?.actorId).toBe(adminActor.id);
+			const afterObj = auditLog?.after as Record<string, unknown>;
+			expect((afterObj.closedByAdmin as { id: string }).id).toBe(adminActor.id);
+			expect((afterObj.targetOfficer as { id: string }).id).toBe(officer1.id);
+			expect(afterObj.emergencyCloseReason).toBe(emergencyReasonText);
+			const loggedItems = afterObj.items as Array<{
+				loanItemId: string;
+				assetCode: string;
+				reason: string;
+			}>;
+			expect(loggedItems).toHaveLength(1);
+			expect(loggedItems[0]).toMatchObject({
+				loanItemId: activeLoanItemId,
+				assetCode: fcAsset.code,
+				reason: 'Masih dipakai liputan hingga besok pagi'
+			});
+
+			// 6. Petugas berikutnya (officer2) melihat di "Catatan Shift Sebelumnya" bahwa shift ditutup admin lengkap dengan nama admin dan alasan
+			const nextOfficerView = await getCurrentShiftState(officer2);
+			expect(nextOfficerView.previousClosedShift?.id).toBe(opened.shift.id);
+			expect(nextOfficerView.previousClosedShift?.forceClosedByAdmin).not.toBeNull();
+			expect(nextOfficerView.previousClosedShift?.forceClosedByAdmin?.adminName).toBe('Admin M3');
+			expect(nextOfficerView.previousClosedShift?.forceClosedByAdmin?.emergencyCloseReason).toBe(
+				emergencyReasonText
+			);
+
+			// 7. Saat HP petugas 1 (officer1) menyala kembali dan mengirim SHIFT_CLOSE lama lewat /api/v1/sync -> menghasilkan CONFLICT dengan pesan jelas
+			const lateSyncRes = await processSyncBatch(officer1, {
+				operations: [
+					{
+						clientOpId: `late-shift-close-${randomUUID()}`,
+						type: 'SHIFT_CLOSE',
+						clientCreatedAt: new Date().toISOString(),
+						payload: {
+							shiftId: opened.shift.id,
+							note: 'Tutup shift dari HP petugas 1 yang baru menyala',
+							items: [
+								{
+									loanItemId: activeLoanItemId,
+									reason: 'Masih dipakai liputan'
+								}
+							]
+						}
+					}
+				]
+			});
+
+			expect(lateSyncRes.results[0].status).toBe('CONFLICT');
+			expect(lateSyncRes.results[0].code).toBe('INVALID_STATUS_TRANSITION');
+			expect(lateSyncRes.results[0].conflictReason).toContain(
+				'ditutup secara darurat oleh Admin (Admin M3)'
+			);
+			expect(lateSyncRes.results[0].conflictReason).toContain(emergencyReasonText);
 		});
 	});
 

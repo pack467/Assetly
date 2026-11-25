@@ -7,6 +7,14 @@ import { validateAndAssertEvidenceUnused } from './evidenceService';
 import type { z } from 'zod';
 import type { closeShiftSchema, openShiftSchema } from '$lib/shared/schemas/handoverShift';
 
+export interface ForceClosedByAdminInfo {
+	adminId: string;
+	adminName: string;
+	adminEmail: string;
+	emergencyCloseReason: string;
+	closedAt: string;
+}
+
 const SHIFT_DETAIL_INCLUDE = {
 	user: {
 		select: { id: true, name: true, email: true, role: true }
@@ -33,6 +41,66 @@ const SHIFT_DETAIL_INCLUDE = {
 		}
 	}
 } satisfies Prisma.ShiftInclude;
+
+type ShiftWithDetail = Prisma.ShiftGetPayload<{ include: typeof SHIFT_DETAIL_INCLUDE }>;
+
+export type ShiftWithForceCloseInfo = ShiftWithDetail & {
+	forceClosedByAdmin: ForceClosedByAdminInfo | null;
+};
+
+function parseForceCloseAuditAfter(
+	afterJson: Prisma.JsonValue | null
+): ForceClosedByAdminInfo | null {
+	if (!afterJson || typeof afterJson !== 'object' || Array.isArray(afterJson)) {
+		return null;
+	}
+	const obj = afterJson as Record<string, unknown>;
+	const adminObj =
+		obj.closedByAdmin && typeof obj.closedByAdmin === 'object'
+			? (obj.closedByAdmin as Record<string, unknown>)
+			: null;
+	const reason = typeof obj.emergencyCloseReason === 'string' ? obj.emergencyCloseReason : '';
+	if (!adminObj || !reason) return null;
+
+	return {
+		adminId: typeof adminObj.id === 'string' ? adminObj.id : '',
+		adminName: typeof adminObj.name === 'string' ? adminObj.name : 'Administrator',
+		adminEmail: typeof adminObj.email === 'string' ? adminObj.email : '',
+		emergencyCloseReason: reason,
+		closedAt: typeof obj.closedAt === 'string' ? obj.closedAt : new Date().toISOString()
+	};
+}
+
+async function attachForceCloseInfoToShifts(
+	db: DbTx,
+	shifts: ShiftWithDetail[]
+): Promise<ShiftWithForceCloseInfo[]> {
+	if (shifts.length === 0) return [];
+	const shiftIds = shifts.map((s) => s.id);
+	const forceLogs = await db.auditLog.findMany({
+		where: {
+			entityType: 'Shift',
+			action: 'SHIFT_FORCE_CLOSED_BY_ADMIN',
+			entityId: { in: shiftIds }
+		},
+		orderBy: { createdAt: 'desc' }
+	});
+
+	const forceMap = new Map<string, ForceClosedByAdminInfo>();
+	for (const log of forceLogs) {
+		if (!forceMap.has(log.entityId)) {
+			const parsed = parseForceCloseAuditAfter(log.after);
+			if (parsed) {
+				forceMap.set(log.entityId, parsed);
+			}
+		}
+	}
+
+	return shifts.map((s) => ({
+		...s,
+		forceClosedByAdmin: forceMap.get(s.id) ?? null
+	}));
+}
 
 /**
  * Mengambil seluruh LoanItem aktif (returnedAt IS NULL) dari database untuk pengecekan tutup shift (Bagian 7.4 & BR-12).
@@ -69,6 +137,7 @@ export async function getActiveOutstandingLoanItems(db: DbTx = prisma) {
 	return items.map((li) => ({
 		loanItemId: li.id,
 		loanId: li.loanId,
+		assetId: li.assetId,
 		asset: li.asset,
 		purpose: li.loan.purpose,
 		expectedReturnAt: li.loan.expectedReturnAt,
@@ -131,14 +200,19 @@ export async function openShift(
 		return shift;
 	});
 
-	return { shift: created };
+	return {
+		shift: {
+			...created,
+			forceClosedByAdmin: null
+		}
+	};
 }
 
 export async function getCurrentShiftState(actor: PolicyUser | null | undefined) {
 	assertCan(actor, 'shift:manage');
 	const officerActor = actor;
 
-	const [currentShift, outstandingItems, previousClosedShift] = await Promise.all([
+	const [currentShift, outstandingItems, rawPreviousClosedShift] = await Promise.all([
 		prisma.shift.findFirst({
 			where: {
 				userId: officerActor.id,
@@ -158,10 +232,14 @@ export async function getCurrentShiftState(actor: PolicyUser | null | undefined)
 		})
 	]);
 
+	const [enrichedPrevious] = rawPreviousClosedShift
+		? await attachForceCloseInfoToShifts(prisma, [rawPreviousClosedShift])
+		: [null];
+
 	return {
-		currentShift,
+		currentShift: currentShift ? { ...currentShift, forceClosedByAdmin: null } : null,
 		outstandingItems,
-		previousClosedShift
+		previousClosedShift: enrichedPrevious
 	};
 }
 
@@ -177,19 +255,68 @@ export async function closeShift(
 	const db = outerTx ?? prisma;
 
 	const existingShift = await db.shift.findUnique({
-		where: { id: shiftId }
+		where: { id: shiftId },
+		include: {
+			user: {
+				select: { id: true, name: true, email: true, role: true }
+			}
+		}
 	});
 
 	if (!existingShift) {
 		throw new AppError('NOT_FOUND', 'Data shift tidak ditemukan.');
 	}
 
-	if (officerActor.role !== 'ADMIN' && existingShift.userId !== officerActor.id) {
-		throw new AppError('FORBIDDEN', 'Anda hanya dapat menutup shift milik Anda sendiri.');
+	const hasEmergencyReasonInput = Boolean(
+		input.emergencyCloseReason && input.emergencyCloseReason.trim().length > 0
+	);
+	const isForceCloseByAdmin = existingShift.userId !== officerActor.id || hasEmergencyReasonInput;
+
+	// Hanya ADMIN yang boleh menutup shift milik petugas lain atau menjalankan tutup shift darurat
+	if (isForceCloseByAdmin && officerActor.role !== 'ADMIN') {
+		throw new AppError(
+			'FORBIDDEN',
+			'Hanya ADMIN yang berhak melakukan penutupan shift darurat atas nama petugas.'
+		);
 	}
 
 	if (existingShift.status !== 'OPEN') {
-		throw new AppError('INVALID_STATUS_TRANSITION', 'Shift ini sudah ditutup sebelumnya.');
+		const forceLog = await db.auditLog.findFirst({
+			where: {
+				entityType: 'Shift',
+				entityId: existingShift.id,
+				action: 'SHIFT_FORCE_CLOSED_BY_ADMIN'
+			},
+			orderBy: { createdAt: 'desc' }
+		});
+		const forceInfo = forceLog ? parseForceCloseAuditAfter(forceLog.after) : null;
+		if (forceInfo) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				`Shift ini telah ditutup secara darurat oleh Admin (${forceInfo.adminName}) dengan alasan: "${forceInfo.emergencyCloseReason}". Anda dapat menghapus operasi tutup shift ini dari antrean HP.`,
+				{
+					shiftId: existingShift.id,
+					forceClosedByAdmin: forceInfo
+				},
+				409
+			);
+		}
+
+		throw new AppError(
+			'INVALID_STATUS_TRANSITION',
+			'Shift ini sudah ditutup sebelumnya. Anda dapat menghapus catatan ini dari antrean.',
+			{ shiftId: existingShift.id },
+			409
+		);
+	}
+
+	const emergencyCloseReason = (input.emergencyCloseReason ?? '').trim();
+	if (isForceCloseByAdmin && emergencyCloseReason.length < 10) {
+		throw new AppError(
+			'VALIDATION_ERROR',
+			'Alasan penutupan shift darurat oleh Admin (emergencyCloseReason) wajib diisi minimal 10 karakter.',
+			{ field: 'emergencyCloseReason' }
+		);
 	}
 
 	// Bagian 7.4 langkah 1 & BR-12: Server menghitung LoanItem aktif yang masih keluar dari database
@@ -261,29 +388,84 @@ export async function closeShift(
 			include: SHIFT_DETAIL_INCLUDE
 		});
 
-		await writeAuditLog(tx, {
-			actorId: officerActor.id,
-			action: 'SHIFT_CLOSED',
-			entityType: 'Shift',
-			entityId: updatedShift.id,
-			before: { status: 'OPEN', closedAt: null },
-			after: {
-				status: 'CLOSED',
-				closedAt: now.toISOString(),
-				outstandingItemCount: outstandingItems.length,
-				...(input.evidenceId ? { evidenceId: input.evidenceId } : {}),
-				items: outstandingItems.map((a) => ({
-					loanItemId: a.loanItemId,
-					assetCode: a.asset.code,
-					reason: reasonMap.get(a.loanItemId)?.reason,
-					responsibleUserId:
-						reasonMap.get(a.loanItemId)?.responsibleUserId ?? a.defaultResponsibleUserId
-				}))
-			},
-			ip: ip ?? null
-		});
+		const itemDetailsForAudit = outstandingItems.map((a) => ({
+			loanItemId: a.loanItemId,
+			assetId: a.asset.id,
+			assetCode: a.asset.code,
+			assetName: a.asset.name,
+			reason: reasonMap.get(a.loanItemId)?.reason,
+			responsibleUserId:
+				reasonMap.get(a.loanItemId)?.responsibleUserId ?? a.defaultResponsibleUserId
+		}));
 
-		return updatedShift;
+		let forceClosedByAdmin: ForceClosedByAdminInfo | null = null;
+
+		if (isForceCloseByAdmin) {
+			const adminUser = await tx.user.findUniqueOrThrow({
+				where: { id: officerActor.id },
+				select: { id: true, name: true, email: true }
+			});
+
+			forceClosedByAdmin = {
+				adminId: adminUser.id,
+				adminName: adminUser.name,
+				adminEmail: adminUser.email,
+				emergencyCloseReason,
+				closedAt: now.toISOString()
+			};
+
+			await writeAuditLog(tx, {
+				actorId: officerActor.id,
+				action: 'SHIFT_FORCE_CLOSED_BY_ADMIN',
+				entityType: 'Shift',
+				entityId: updatedShift.id,
+				before: {
+					status: 'OPEN',
+					closedAt: null,
+					targetOfficerId: existingShift.userId
+				},
+				after: {
+					status: 'CLOSED',
+					closedAt: now.toISOString(),
+					closedByAdmin: {
+						id: adminUser.id,
+						name: adminUser.name,
+						email: adminUser.email
+					},
+					targetOfficer: {
+						id: existingShift.user.id,
+						name: existingShift.user.name,
+						email: existingShift.user.email
+					},
+					emergencyCloseReason,
+					outstandingItemCount: outstandingItems.length,
+					...(input.evidenceId ? { evidenceId: input.evidenceId } : {}),
+					items: itemDetailsForAudit
+				},
+				ip: ip ?? null
+			});
+		} else {
+			await writeAuditLog(tx, {
+				actorId: officerActor.id,
+				action: 'SHIFT_CLOSED',
+				entityType: 'Shift',
+				entityId: updatedShift.id,
+				before: { status: 'OPEN', closedAt: null },
+				after: {
+					status: 'CLOSED',
+					closedAt: now.toISOString(),
+					outstandingItemCount: outstandingItems.length,
+					...(input.evidenceId ? { evidenceId: input.evidenceId } : {}),
+					items: itemDetailsForAudit
+				},
+				ip: ip ?? null
+			});
+		}
+
+		return {
+			...updatedShift,
+			forceClosedByAdmin
+		};
 	});
 
 	return { shift: closed };
@@ -309,7 +491,7 @@ export async function listShifts(
 		...(params.userId ? { userId: params.userId } : {})
 	};
 
-	const [total, items] = await Promise.all([
+	const [total, rawItems] = await Promise.all([
 		prisma.shift.count({ where }),
 		prisma.shift.findMany({
 			where,
@@ -319,6 +501,8 @@ export async function listShifts(
 			include: SHIFT_DETAIL_INCLUDE
 		})
 	]);
+
+	const items = await attachForceCloseInfoToShifts(prisma, rawItems);
 
 	return {
 		items,

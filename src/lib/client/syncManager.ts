@@ -83,6 +83,9 @@ export function formatLaymanConflictGuidance(
 		if (type === 'HANDOVER_CREATE' || type === 'HANDOVER_CONFIRM') {
 			return `${baseMsg || 'Status serah terima sudah berubah.'} Barang mungkin sudah diserahterimakan ke pihak lain atau sudah dikembalikan ke gudang.`;
 		}
+		if (type === 'SHIFT_CLOSE') {
+			return `${baseMsg || 'Shift ini sudah ditutup sebelumnya.'} Silakan tekan tombol "Saya Mengerti, Hapus dari Antrean" di bawah untuk membersihkan antrean HP Anda.`;
+		}
 		return `${baseMsg || 'Status barang atau transaksi sudah berubah di server.'} Silakan periksa kembali kondisi terbaru barang dengan melakukan Scan ulang.`;
 	}
 
