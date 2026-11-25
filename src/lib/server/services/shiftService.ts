@@ -1,7 +1,7 @@
 import type { Prisma, ShiftStatus } from '@prisma/client';
 import { prisma } from '$lib/server/db';
 import { runInTx, writeAuditLog, type DbTx } from '$lib/server/audit';
-import { assertCan, type PolicyUser } from '$lib/server/policy';
+import { assertCan, can, type PolicyUser } from '$lib/server/policy';
 import { AppError } from '$lib/shared/errors';
 import { validateAndAssertEvidenceUnused } from './evidenceService';
 import type { z } from 'zod';
@@ -272,8 +272,11 @@ export async function closeShift(
 	);
 	const isForceCloseByAdmin = existingShift.userId !== officerActor.id || hasEmergencyReasonInput;
 
-	// Hanya ADMIN yang boleh menutup shift milik petugas lain atau menjalankan tutup shift darurat
-	if (isForceCloseByAdmin && officerActor.role !== 'ADMIN') {
+	// Hanya peran yang diizinkan oleh kebijakan terpusat can('shift:force-close') yang boleh menutup shift milik petugas lain atau tutup shift darurat (BR-03)
+	if (
+		isForceCloseByAdmin &&
+		!can(officerActor, 'shift:force-close', { userId: existingShift.userId })
+	) {
 		throw new AppError(
 			'FORBIDDEN',
 			'Hanya ADMIN yang berhak melakukan penutupan shift darurat atas nama petugas.'

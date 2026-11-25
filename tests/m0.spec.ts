@@ -50,10 +50,12 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 			expect(can(borrowerUser, 'asset:read')).toBe(true);
 		});
 
-		it('membatasi pengelolaan master data, persetujuan, status LOST/RETIRED, audit log, dan cabut sesi hanya untuk ADMIN', () => {
+		it('membatasi pengelolaan master data, persetujuan, tutup darurat shift, status LOST/RETIRED, audit log, dan cabut sesi hanya untuk ADMIN', () => {
 			const adminOnlyActions = [
 				'master:manage',
 				'loan:approve',
+				'shift:force-close',
+				'shift:read_all',
 				'ticket:manage',
 				'asset:set_terminal_status',
 				'risk:read',
@@ -83,10 +85,18 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 			expect(can(adminUser, 'loan:return', { borrowerId: 'other-user' })).toBe(true);
 		});
 
-		it('mengatur hak shift dan pembuatan tiket perbaikan untuk ADMIN dan OFFICER', () => {
+		it('mengatur hak shift (buka/tutup sendiri vs tutup darurat) dan pembuatan tiket perbaikan', () => {
 			expect(can(adminUser, 'shift:manage')).toBe(true);
 			expect(can(officerUser, 'shift:manage')).toBe(true);
 			expect(can(borrowerUser, 'shift:manage')).toBe(false);
+
+			// Matriks can() untuk shift:force-close (tutup shift milik petugas lain / tutup darurat)
+			expect(can(adminUser, 'shift:force-close', { userId: officerUser.id })).toBe(true);
+			expect(can(officerUser, 'shift:force-close', { userId: officerUser.id })).toBe(false);
+			expect(can(officerUser, 'shift:force-close', { userId: 'other-officer' })).toBe(false);
+			expect(can(borrowerUser, 'shift:force-close', { userId: officerUser.id })).toBe(false);
+			expect(can(inactiveAdmin, 'shift:force-close', { userId: officerUser.id })).toBe(false);
+			expect(can(null, 'shift:force-close', { userId: officerUser.id })).toBe(false);
 
 			expect(can(adminUser, 'ticket:create')).toBe(true);
 			expect(can(officerUser, 'ticket:create')).toBe(true);

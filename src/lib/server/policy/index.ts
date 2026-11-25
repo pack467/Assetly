@@ -19,6 +19,7 @@ export type PolicyAction =
 	| 'handover:create'
 	| 'handover:confirm'
 	| 'shift:manage'
+	| 'shift:force-close'
 	| 'shift:read_all'
 	| 'ticket:create'
 	| 'ticket:manage'
@@ -117,10 +118,12 @@ export function can(
 			}
 			return false;
 
-		// Buka / tutup shift: ADMIN dan OFFICER
+		// Buka / tutup shift milik sendiri: ADMIN dan OFFICER
 		case 'shift:manage':
 			return role === 'ADMIN' || role === 'OFFICER';
 
+		// Tutup shift milik petugas lain / tutup shift darurat: Hanya ADMIN
+		case 'shift:force-close':
 		case 'shift:read_all':
 			return role === 'ADMIN';
 
