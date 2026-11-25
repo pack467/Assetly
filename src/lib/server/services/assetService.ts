@@ -29,6 +29,9 @@ export async function generateQrSvg(qrToken: string): Promise<string> {
 }
 
 export async function generateNextAssetCode(tx: DbTx): Promise<string> {
+	// Kunci advisory tingkat transaksi agar pembangkitan kode otomatis AST-XXXX bebas tabrakan pada pembuatan/impor paralel
+	await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('asset_code_seq'))`;
+
 	const latest = await tx.asset.findMany({
 		where: { code: { startsWith: 'AST-' } },
 		select: { code: true },

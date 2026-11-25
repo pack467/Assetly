@@ -415,5 +415,25 @@ describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-1
 			expect(commit2.createdCount).toBe(0);
 			expect(commit2.skippedDuplicateCount).toBe(2);
 		});
+
+		it('Membangkitkan kode otomatis AST-XXXX tanpa tabrakan saat 6 createAsset dipanggil secara paralel (pg_advisory_xact_lock)', async () => {
+			const createdParallel = await Promise.all(
+				Array.from({ length: 6 }, (_, idx) =>
+					createAsset(adminActor, {
+						name: `Barang Kode Otomatis Paralel #${idx + 1}`,
+						categoryId,
+						homeLocationId: locationId
+					})
+				)
+			);
+
+			expect(createdParallel).toHaveLength(6);
+			const generatedCodes = createdParallel.map((c) => c.asset.code);
+			const uniqueCodes = new Set(generatedCodes);
+			expect(uniqueCodes.size).toBe(6);
+			for (const code of generatedCodes) {
+				expect(code).toMatch(/^AST-\d{4,}$/);
+			}
+		});
 	});
 });
