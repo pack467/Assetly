@@ -1,17 +1,23 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { mobileApi } from '$lib/client/api';
-	import { getOfflineQueueStorage, subscribeOfflineQueue } from '$lib/client/offlineQueue';
+	import {
+		getOfflineQueueStorage,
+		subscribeOfflineQueue,
+		type OfflineQueueItem
+	} from '$lib/client/offlineQueue';
 	import { enqueueOfflineOperation, syncPendingOperations } from '$lib/client/syncManager';
 	import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
 
 	interface OutstandingLoanItem {
-		loanItemId: string;
-		loanId: string;
+		loanItemId?: string;
+		loanId?: string;
+		assetId: string;
 		purpose: string;
-		expectedReturnAt: string;
+		expectedReturnAt?: string;
 		isOverdue: boolean;
-		defaultResponsibleUserId: string;
+		defaultResponsibleUserId?: string;
+		isQueuedOfflineBorrow?: boolean;
 		asset: {
 			id: string;
 			code: string;
@@ -56,29 +62,98 @@
 	}
 
 	let currentShift = $state<ShiftRecord | null>(null);
-	let outstandingItems = $state<OutstandingLoanItem[]>([]);
+	let serverOutstandingItems = $state<OutstandingLoanItem[]>([]);
+	let pendingQueueOps = $state<OfflineQueueItem[]>([]);
 	let previousClosedShift = $state<ShiftRecord | null>(null);
 	let loading = $state(true);
 	let errorMsg = $state('');
 	let successMsg = $state('');
 	let queuedMsg = $state('');
-	let unsyncedAssetOpsCount = $state(0);
 
 	let openNote = $state('');
 	let closeNote = $state('');
-	let reasonsByLoanItemId = $state<Record<string, string>>({});
+	// Map alasan berdasarkan key unik (loanItemId atau assetId)
+	let reasonsByKey = $state<Record<string, string>>({});
 	let submitting = $state(false);
 	let unsubscribeQueue: (() => void) | null = null;
 
-	async function checkUnsyncedAssetOps(): Promise<number> {
+	function getItemKey(item: OutstandingLoanItem): string {
+		return item.loanItemId || item.assetId || item.asset.id;
+	}
+
+	/**
+	 * Lapis 1: Menggabungkan daftar barang keluar dari server dengan transaksi pinjam/kembali
+	 * yang masih mengantre secara offline di HP ini (diidentifikasi lewat assetId).
+	 */
+	const effectiveOutstandingItems = $derived.by(() => {
+		const returnedLoanItemIds = new Set<string>();
+		const returnedAssetIds = new Set<string>();
+
+		for (const op of pendingQueueOps) {
+			if (op.type === 'LOAN_RETURN') {
+				if (typeof op.payload.loanItemId === 'string') {
+					returnedLoanItemIds.add(op.payload.loanItemId);
+				}
+				if (typeof op.payload.assetId === 'string') {
+					returnedAssetIds.add(op.payload.assetId);
+				}
+			}
+		}
+
+		const list: OutstandingLoanItem[] = serverOutstandingItems
+			.filter(
+				(item) =>
+					!(item.loanItemId && returnedLoanItemIds.has(item.loanItemId)) &&
+					!returnedAssetIds.has(item.asset.id)
+			)
+			.map((item) => ({
+				...item,
+				assetId: item.assetId || item.asset.id
+			}));
+
+		const existingAssetIds = new Set(list.map((i) => i.asset.id));
+
+		for (const op of pendingQueueOps) {
+			if (op.type === 'LOAN_CREATE') {
+				const rawItems = Array.isArray(op.payload.items)
+					? (op.payload.items as Array<Record<string, unknown>>)
+					: typeof op.payload.assetId === 'string'
+						? [{ assetId: op.payload.assetId }]
+						: [];
+
+				for (const raw of rawItems) {
+					const assetId = typeof raw.assetId === 'string' ? raw.assetId : '';
+					if (!assetId || existingAssetIds.has(assetId) || returnedAssetIds.has(assetId)) {
+						continue;
+					}
+					existingAssetIds.add(assetId);
+					list.push({
+						assetId,
+						purpose: String(op.payload.purpose ?? 'Pinjaman Offline'),
+						isOverdue: false,
+						isQueuedOfflineBorrow: true,
+						asset: {
+							id: assetId,
+							code: op.assetCode ?? 'BARANG-OFFLINE',
+							name: op.assetName ?? op.label,
+							status: 'BORROWED'
+						},
+						borrower: {
+							id: '',
+							name: 'Antrean Pinjam Offline di HP Ini',
+							email: ''
+						}
+					});
+				}
+			}
+		}
+
+		return list;
+	});
+
+	async function syncQueueSnapshot() {
 		const all = await getOfflineQueueStorage().listAll();
-		const count = all.filter(
-			(op) =>
-				(op.syncState === 'PENDING' || op.syncState === 'SYNCING') &&
-				(op.type === 'LOAN_CREATE' || op.type === 'LOAN_RETURN' || op.type === 'HANDOVER_CREATE')
-		).length;
-		unsyncedAssetOpsCount = count;
-		return count;
+		pendingQueueOps = all.filter((op) => op.syncState === 'PENDING' || op.syncState === 'SYNCING');
 	}
 
 	async function loadShiftState() {
@@ -95,21 +170,18 @@
 				return;
 			}
 			currentShift = data.currentShift;
-			outstandingItems = data.outstandingItems ?? [];
+			serverOutstandingItems = (data.outstandingItems ?? []).map((it: OutstandingLoanItem) => ({
+				...it,
+				assetId: it.assetId || it.asset.id
+			}));
 			previousClosedShift = data.previousClosedShift;
-
-			const initialReasons: Record<string, string> = {};
-			for (const item of outstandingItems) {
-				initialReasons[item.loanItemId] = reasonsByLoanItemId[item.loanItemId] || '';
-			}
-			reasonsByLoanItemId = initialReasons;
 
 			try {
 				sessionStorage.setItem(
 					'itam_shift_state_cache',
 					JSON.stringify({
 						currentShift,
-						outstandingItems,
+						outstandingItems: serverOutstandingItems,
 						previousClosedShift
 					})
 				);
@@ -122,13 +194,8 @@
 				if (cached) {
 					const parsed = JSON.parse(cached);
 					currentShift = parsed.currentShift ?? null;
-					outstandingItems = parsed.outstandingItems ?? [];
+					serverOutstandingItems = parsed.outstandingItems ?? [];
 					previousClosedShift = parsed.previousClosedShift ?? null;
-					const initialReasons: Record<string, string> = {};
-					for (const item of outstandingItems) {
-						initialReasons[item.loanItemId] = reasonsByLoanItemId[item.loanItemId] || '';
-					}
-					reasonsByLoanItemId = initialReasons;
 					return;
 				}
 			} catch {
@@ -184,16 +251,10 @@
 		successMsg = '';
 		queuedMsg = '';
 
-		// Pastikan tidak ada transaksi pinjam/kembali offline di HP ini yang belum punya loanItemId server
-		const pendingAssetOps = await checkUnsyncedAssetOps();
-		if (pendingAssetOps > 0) {
-			errorMsg = `Masih terdapat ${pendingAssetOps} transaksi barang offline di HP ini yang belum tersinkron ke server (belum memiliki ID server). Silakan buka menu Sinkron (/m/sync) dan sinkronkan terlebih dahulu sebelum menutup shift.`;
-			return;
-		}
-
-		// Validasi lokal awal agar pengguna tahu barang mana yang belum diisi alasannya
-		for (const item of outstandingItems) {
-			const r = (reasonsByLoanItemId[item.loanItemId] || '').trim();
+		// Validasi lokal awal agar pengguna tahu barang mana yang belum diisi alasannya (baik loanItemId maupun assetId offline)
+		for (const item of effectiveOutstandingItems) {
+			const key = getItemKey(item);
+			const r = (reasonsByKey[key] || '').trim();
 			if (r.length < 3) {
 				errorMsg = `Mohon isi alasan untuk barang ${item.asset.code} (${item.asset.name}) yang masih keluar (minimal 3 karakter, BR-12).`;
 				return;
@@ -204,15 +265,22 @@
 		try {
 			const queued = await enqueueOfflineOperation({
 				type: 'SHIFT_CLOSE',
-				label: `Tutup Shift Kerja (${outstandingItems.length} barang keluar)`,
+				label: `Tutup Shift Kerja (${effectiveOutstandingItems.length} barang keluar)`,
 				payload: {
 					shiftId: currentShift.id,
 					note: closeNote.trim() || null,
-					items: outstandingItems.map((item) => ({
-						loanItemId: item.loanItemId,
-						reason: (reasonsByLoanItemId[item.loanItemId] || '').trim(),
-						responsibleUserId: item.defaultResponsibleUserId
-					}))
+					items: effectiveOutstandingItems.map((item) => {
+						const key = getItemKey(item);
+						return {
+							...(item.loanItemId ? { loanItemId: item.loanItemId } : {}),
+							assetId: item.asset.id,
+							assetCode: item.asset.code,
+							reason: (reasonsByKey[key] || '').trim(),
+							...(item.defaultResponsibleUserId
+								? { responsibleUserId: item.defaultResponsibleUserId }
+								: {})
+						};
+					})
 				}
 			});
 
@@ -221,8 +289,8 @@
 
 			if (latest?.syncState === 'ACCEPTED') {
 				successMsg =
-					outstandingItems.length > 0
-						? `Shift berhasil ditutup dengan mencatat ${outstandingItems.length} barang yang masih keluar.`
+					effectiveOutstandingItems.length > 0
+						? `Shift berhasil ditutup dengan mencatat ${effectiveOutstandingItems.length} barang yang masih keluar.`
 						: 'Shift berhasil ditutup dengan bersih (semua barang telah kembali).';
 				closeNote = '';
 				await loadShiftState();
@@ -230,10 +298,10 @@
 				errorMsg =
 					latest.conflictReason ||
 					latest.lastError ||
-					'Penutupan shift ditolak server (kemungkinan ada barang keluar baru yang belum diberi alasan). Muat ulang halaman ini.';
+					'Penutupan shift ditolak server. Silakan periksa dan lengkapi alasan di menu Sinkron (/m/sync).';
 			} else {
 				queuedMsg =
-					'Tersimpan di Antrean Lokal HP! Data penutupan shift dan alasan per barang sudah aman di HP serta akan dikirim otomatis saat sinyal kembali.';
+					'Tersimpan di Antrean Lokal HP! Data penutupan shift akan diproses berurutan setelah operasi peminjaman offline sebelumnya terkirim ke server.';
 				closeNote = '';
 			}
 		} catch {
@@ -245,9 +313,9 @@
 
 	onMount(() => {
 		unsubscribeQueue = subscribeOfflineQueue(() => {
-			checkUnsyncedAssetOps();
+			syncQueueSnapshot();
 		});
-		checkUnsyncedAssetOps();
+		syncQueueSnapshot();
 		loadShiftState();
 	});
 
@@ -268,21 +336,6 @@
 		</p>
 	</div>
 
-	{#if unsyncedAssetOpsCount > 0}
-		<div
-			class="rounded-2xl border-2 border-amber-300 bg-amber-50 p-4 text-xs font-medium text-amber-950"
-		>
-			<div class="font-extrabold">
-				Perhatian Sebelum Tutup Shift ({unsyncedAssetOpsCount} Transaksi Offline Belum Terkirim)
-			</div>
-			<p class="mt-1">
-				HP ini masih menyimpan transaksi pinjam/kembali/serah terima offline yang belum memiliki ID
-				server. Sinkronkan terlebih dahulu di
-				<a href="/m/sync" class="font-bold underline">Menu Sinkron (/m/sync)</a> sebelum menutup shift.
-			</p>
-		</div>
-	{/if}
-
 	{#if queuedMsg}
 		<div
 			class="rounded-2xl border-2 border-amber-300 bg-amber-50 p-4 text-sm font-bold text-amber-950"
@@ -298,7 +351,12 @@
 
 	{#if errorMsg}
 		<div class="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-700">
-			{errorMsg}
+			<div>{errorMsg}</div>
+			<div class="mt-2">
+				<a href="/m/sync" class="text-xs font-bold text-red-900 underline">
+					Buka Layar Antrean & Lengkapi Alasan (/m/sync) →
+				</a>
+			</div>
 		</div>
 	{/if}
 	{#if successMsg}
@@ -420,7 +478,7 @@
 					</div>
 				</div>
 
-				{#if outstandingItems.length === 0}
+				{#if effectiveOutstandingItems.length === 0}
 					<div
 						class="rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-xs text-emerald-900"
 					>
@@ -431,11 +489,13 @@
 					<div class="space-y-3">
 						<div class="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950">
 							<strong>Perhatian (BR-12):</strong> Terdapat
-							<strong>{outstandingItems.length} barang</strong> yang masih keluar di database. Anda wajib
-							mengisi alasan untuk setiap barang di bawah sebelum menutup shift.
+							<strong>{effectiveOutstandingItems.length} barang</strong> yang masih keluar (termasuk pinjaman
+							offline di HP ini). Anda wajib mengisi alasan untuk setiap barang di bawah sebelum menutup
+							shift.
 						</div>
 
-						{#each outstandingItems as item (item.loanItemId)}
+						{#each effectiveOutstandingItems as item (getItemKey(item))}
+							{@const key = getItemKey(item)}
 							<div class="space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-3.5">
 								<div class="flex items-start justify-between gap-2">
 									<div>
@@ -444,7 +504,13 @@
 										</div>
 										<div class="text-sm font-bold text-slate-900">{item.asset.name}</div>
 									</div>
-									{#if item.isOverdue}
+									{#if item.isQueuedOfflineBorrow}
+										<span
+											class="rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-bold text-amber-900"
+										>
+											Antrean Offline (via assetId)
+										</span>
+									{:else if item.isOverdue}
 										<span
 											class="rounded-full bg-red-100 px-2.5 py-0.5 text-[11px] font-bold text-red-800"
 										>
@@ -457,18 +523,15 @@
 									{item.purpose}
 								</div>
 								<div>
-									<label
-										for={`reason-${item.loanItemId}`}
-										class="block text-xs font-bold text-slate-800"
-									>
+									<label for={`reason-${key}`} class="block text-xs font-bold text-slate-800">
 										Alasan Barang Belum Kembali (Wajib - BR-12)
 									</label>
 									<input
-										id={`reason-${item.loanItemId}`}
+										id={`reason-${key}`}
 										type="text"
 										required
 										minlength="3"
-										bind:value={reasonsByLoanItemId[item.loanItemId]}
+										bind:value={reasonsByKey[key]}
 										placeholder="Mis. Acara seminar masih berlanjut hingga malam"
 										class="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm"
 									/>
@@ -493,7 +556,7 @@
 
 				<button
 					type="submit"
-					disabled={submitting || unsyncedAssetOpsCount > 0}
+					disabled={submitting}
 					class="w-full rounded-xl bg-slate-900 py-4 text-base font-extrabold text-white active:bg-slate-800 disabled:opacity-50"
 				>
 					{submitting ? 'Menutup Shift...' : 'TUTUP SHIFT SEKARANG'}

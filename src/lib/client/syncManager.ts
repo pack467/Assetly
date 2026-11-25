@@ -345,7 +345,9 @@ async function executeSyncPendingOperations(
 					clientOpId: string;
 					status: 'ACCEPTED' | 'CONFLICT' | 'REJECTED';
 					conflictReason?: string | null;
+					code?: string | null;
 					errorCode?: string | null;
+					details?: Record<string, unknown> | null;
 					data?: Record<string, unknown> | null;
 				}>;
 			};
@@ -354,6 +356,8 @@ async function executeSyncPendingOperations(
 			if (!opResult) {
 				throw new Error('Respons sinkronisasi server tidak memuat hasil operasi.');
 			}
+
+			const resolvedCode = opResult.code ?? opResult.errorCode ?? null;
 
 			if (opResult.status === 'ACCEPTED') {
 				accepted++;
@@ -379,32 +383,34 @@ async function executeSyncPendingOperations(
 				conflicts++;
 				const guidance = formatLaymanConflictGuidance(
 					item.type,
-					opResult.errorCode,
+					resolvedCode,
 					opResult.conflictReason
 				);
 				item = {
 					...item,
 					syncState: 'CONFLICT',
-					errorCode: opResult.errorCode ?? 'ALREADY_BORROWED_CONFLICT',
+					errorCode: resolvedCode ?? 'ALREADY_BORROWED_CONFLICT',
 					conflictReason: guidance,
 					lastError: opResult.conflictReason ?? guidance,
-					nextRetryAt: null
+					nextRetryAt: null,
+					resultData: opResult.details ?? opResult.data ?? null
 				};
 				await storage.put(item);
 			} else {
 				rejected++;
 				const guidance = formatLaymanConflictGuidance(
 					item.type,
-					opResult.errorCode,
+					resolvedCode,
 					opResult.conflictReason
 				);
 				item = {
 					...item,
 					syncState: 'REJECTED',
-					errorCode: opResult.errorCode ?? 'VALIDATION_ERROR',
+					errorCode: resolvedCode ?? 'VALIDATION_ERROR',
 					conflictReason: guidance,
 					lastError: opResult.conflictReason ?? guidance,
-					nextRetryAt: null
+					nextRetryAt: null,
+					resultData: opResult.details ?? opResult.data ?? null
 				};
 				await storage.put(item);
 			}
@@ -440,5 +446,129 @@ async function executeSyncPendingOperations(
 		rejected,
 		stillPending,
 		items: updatedItems
+	};
+}
+
+export interface MissingShiftAssetInfo {
+	assetCode: string;
+	assetId?: string;
+	loanItemId?: string;
+	assetName?: string;
+}
+
+/**
+ * Mengekstrak daftar barang yang belum memiliki alasan dari operasi SHIFT_CLOSE yang REJECTED.
+ */
+export function extractMissingShiftCloseAssets(item: OfflineQueueItem): MissingShiftAssetInfo[] {
+	if (item.type !== 'SHIFT_CLOSE') return [];
+
+	const details = item.resultData;
+	if (details && Array.isArray(details.missingAssets) && details.missingAssets.length > 0) {
+		return (details.missingAssets as Array<Record<string, unknown>>).map((m) => ({
+			assetCode: String(m.assetCode ?? ''),
+			...(typeof m.assetId === 'string' ? { assetId: m.assetId } : {}),
+			...(typeof m.loanItemId === 'string' ? { loanItemId: m.loanItemId } : {}),
+			...(typeof m.assetName === 'string' ? { assetName: m.assetName } : {})
+		}));
+	}
+
+	if (details && Array.isArray(details.missingAssetCodes) && details.missingAssetCodes.length > 0) {
+		return (details.missingAssetCodes as unknown[]).map((code) => ({
+			assetCode: String(code)
+		}));
+	}
+
+	const msg = `${item.conflictReason ?? ''} ${item.lastError ?? ''}`;
+	const parenMatch = /\(([A-Z0-9,\s-]+)\)\s*\(BR-12\)/i.exec(msg);
+	if (parenMatch) {
+		return parenMatch[1]
+			.split(',')
+			.map((s) => s.trim())
+			.filter(Boolean)
+			.map((assetCode) => ({ assetCode }));
+	}
+
+	return [];
+}
+
+/**
+ * Melengkapi alasan barang keluar yang kurang pada operasi SHIFT_CLOSE yang REJECTED,
+ * menggantinya dengan clientOpId baru, lalu mengirim ulang ke server.
+ */
+export async function retryRejectedShiftCloseWithReasons(
+	oldClientOpId: string,
+	reasonsByAssetCodeOrId: Record<string, string>,
+	options: SyncPendingOptions = {}
+): Promise<{ newItem: OfflineQueueItem; outcome: SyncRunOutcome }> {
+	const storage = options.storage ?? getOfflineQueueStorage();
+	const existing = await storage.getById(oldClientOpId);
+	if (!existing || existing.type !== 'SHIFT_CLOSE') {
+		throw new Error('Operasi tutup shift yang akan dilengkapi tidak ditemukan.');
+	}
+
+	const missingList = extractMissingShiftCloseAssets(existing);
+	const prevItems = Array.isArray(existing.payload.items)
+		? [...(existing.payload.items as Array<Record<string, unknown>>)]
+		: [];
+
+	for (const missing of missingList) {
+		const reasonText = (
+			reasonsByAssetCodeOrId[missing.assetCode] ??
+			(missing.assetId ? reasonsByAssetCodeOrId[missing.assetId] : undefined) ??
+			(missing.loanItemId ? reasonsByAssetCodeOrId[missing.loanItemId] : undefined) ??
+			''
+		).trim();
+
+		if (reasonText.length >= 3) {
+			prevItems.push({
+				...(missing.loanItemId ? { loanItemId: missing.loanItemId } : {}),
+				...(missing.assetId ? { assetId: missing.assetId } : {}),
+				assetCode: missing.assetCode,
+				reason: reasonText
+			});
+		}
+	}
+
+	// Tambahkan juga alasan tambahan dari map jika belum ada di missingList
+	for (const [key, val] of Object.entries(reasonsByAssetCodeOrId)) {
+		const trimmed = val.trim();
+		if (trimmed.length < 3) continue;
+		const alreadyAdded = prevItems.some(
+			(it) => it.assetCode === key || it.assetId === key || it.loanItemId === key
+		);
+		if (!alreadyAdded) {
+			const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key);
+			prevItems.push({
+				...(isUuid ? { assetId: key } : { assetCode: key }),
+				reason: trimmed
+			});
+		}
+	}
+
+	await storage.remove(oldClientOpId);
+
+	const newItem = await enqueueOfflineOperation(
+		{
+			type: 'SHIFT_CLOSE',
+			label: existing.label,
+			payload: {
+				...existing.payload,
+				items: prevItems
+			},
+			pendingEvidence: existing.pendingEvidence
+		},
+		storage
+	);
+
+	const outcome = await syncPendingOperations({
+		...options,
+		storage,
+		force: true
+	});
+
+	const updatedNewItem = (await storage.getById(newItem.clientOpId)) ?? newItem;
+	return {
+		newItem: updatedNewItem,
+		outcome
 	};
 }

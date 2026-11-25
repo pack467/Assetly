@@ -16,15 +16,21 @@ export const openShiftSchema = z.object({
 	note: z.string().trim().max(1000).nullable().optional()
 });
 
-export const shiftItemClosureInputSchema = z.object({
-	loanItemId: z.string().uuid('ID item peminjaman tidak valid.'),
-	reason: z
-		.string()
-		.trim()
-		.min(3, 'Alasan barang belum kembali wajib diisi minimal 3 karakter (BR-12).')
-		.max(1000),
-	responsibleUserId: z.string().uuid('ID penanggung jawab tidak valid.').nullable().optional()
-});
+export const shiftItemClosureInputSchema = z
+	.object({
+		loanItemId: z.string().uuid('ID item peminjaman tidak valid.').optional(),
+		assetId: z.string().uuid('ID barang (assetId) tidak valid.').optional(),
+		assetCode: z.string().trim().max(100).optional(),
+		reason: z
+			.string()
+			.trim()
+			.min(3, 'Alasan barang belum kembali wajib diisi minimal 3 karakter (BR-12).')
+			.max(1000),
+		responsibleUserId: z.string().uuid('ID penanggung jawab tidak valid.').nullable().optional()
+	})
+	.refine((val) => Boolean(val.loanItemId || val.assetId || val.assetCode), {
+		message: 'Setiap item penutupan shift wajib mencantumkan loanItemId, assetId, atau assetCode.'
+	});
 
 export const closeShiftSchema = z.object({
 	note: z.string().trim().max(1000).nullable().optional(),

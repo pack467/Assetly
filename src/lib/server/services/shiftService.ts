@@ -322,23 +322,61 @@ export async function closeShift(
 	// Bagian 7.4 langkah 1 & BR-12: Server menghitung LoanItem aktif yang masih keluar dari database
 	const outstandingItems = await getActiveOutstandingLoanItems(db);
 
-	const reasonMap = new Map<
+	const reasonByLoanItemId = new Map<
 		string,
 		{ reason: string; responsibleUserId: string | null | undefined }
 	>();
+	const reasonByAssetId = new Map<
+		string,
+		{ reason: string; responsibleUserId: string | null | undefined }
+	>();
+	const reasonByAssetCode = new Map<
+		string,
+		{ reason: string; responsibleUserId: string | null | undefined }
+	>();
+
 	for (const item of input.items ?? []) {
-		reasonMap.set(item.loanItemId, {
+		const entry = {
 			reason: item.reason.trim(),
 			responsibleUserId: item.responsibleUserId
-		});
+		};
+		if (item.loanItemId) {
+			reasonByLoanItemId.set(item.loanItemId, entry);
+		}
+		if (item.assetId) {
+			reasonByAssetId.set(item.assetId, entry);
+		}
+		if (item.assetCode) {
+			reasonByAssetCode.set(item.assetCode.trim().toUpperCase(), entry);
+		}
 	}
 
-	// BR-12: Tiap barang yang belum kembali wajib diberi alasan
+	function resolveProvidedReason(activeItem: (typeof outstandingItems)[number]) {
+		return (
+			reasonByLoanItemId.get(activeItem.loanItemId) ??
+			reasonByAssetId.get(activeItem.asset.id) ??
+			reasonByAssetCode.get(activeItem.asset.code.toUpperCase())
+		);
+	}
+
+	// BR-12: Tiap barang yang belum kembali wajib diberi alasan (alasan untuk barang yang sudah kembali otomatis diabaikan)
 	const missingLoanItemCodes: string[] = [];
+	const missingAssets: Array<{
+		loanItemId: string;
+		assetId: string;
+		assetCode: string;
+		assetName: string;
+	}> = [];
 	for (const activeItem of outstandingItems) {
-		const provided = reasonMap.get(activeItem.loanItemId);
+		const provided = resolveProvidedReason(activeItem);
 		if (!provided || provided.reason.length < 3) {
 			missingLoanItemCodes.push(activeItem.asset.code);
+			missingAssets.push({
+				loanItemId: activeItem.loanItemId,
+				assetId: activeItem.asset.id,
+				assetCode: activeItem.asset.code,
+				assetName: activeItem.asset.name
+			});
 		}
 	}
 
@@ -346,7 +384,7 @@ export async function closeShift(
 		throw new AppError(
 			'VALIDATION_ERROR',
 			`Terdapat ${missingLoanItemCodes.length} barang yang masih keluar dan wajib diberi alasan sebelum menutup shift (${missingLoanItemCodes.join(', ')}) (BR-12).`,
-			{ missingAssetCodes: missingLoanItemCodes }
+			{ missingAssetCodes: missingLoanItemCodes, missingAssets }
 		);
 	}
 
@@ -366,7 +404,7 @@ export async function closeShift(
 		if (outstandingItems.length > 0) {
 			await tx.shiftItem.createMany({
 				data: outstandingItems.map((activeItem) => {
-					const provided = reasonMap.get(activeItem.loanItemId)!;
+					const provided = resolveProvidedReason(activeItem)!;
 					return {
 						shiftId,
 						loanItemId: activeItem.loanItemId,
@@ -388,15 +426,17 @@ export async function closeShift(
 			include: SHIFT_DETAIL_INCLUDE
 		});
 
-		const itemDetailsForAudit = outstandingItems.map((a) => ({
-			loanItemId: a.loanItemId,
-			assetId: a.asset.id,
-			assetCode: a.asset.code,
-			assetName: a.asset.name,
-			reason: reasonMap.get(a.loanItemId)?.reason,
-			responsibleUserId:
-				reasonMap.get(a.loanItemId)?.responsibleUserId ?? a.defaultResponsibleUserId
-		}));
+		const itemDetailsForAudit = outstandingItems.map((a) => {
+			const provided = resolveProvidedReason(a);
+			return {
+				loanItemId: a.loanItemId,
+				assetId: a.asset.id,
+				assetCode: a.asset.code,
+				assetName: a.asset.name,
+				reason: provided?.reason,
+				responsibleUserId: provided?.responsibleUserId ?? a.defaultResponsibleUserId
+			};
+		});
 
 		let forceClosedByAdmin: ForceClosedByAdminInfo | null = null;
 

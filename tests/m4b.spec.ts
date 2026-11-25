@@ -13,6 +13,8 @@ import {
 import {
 	computeBackoffDelayMs,
 	enqueueOfflineOperation,
+	extractMissingShiftCloseAssets,
+	retryRejectedShiftCloseWithReasons,
 	syncPendingOperations
 } from '../src/lib/client/syncManager';
 
@@ -548,5 +550,131 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 
 		const syncedClose = await queueStorage.getById(shiftCloseOp.clientOpId);
 		expect(syncedClose?.syncState).toBe('ACCEPTED');
+	});
+
+	it('7. menampilkan kode barang yang belum punya alasan saat SHIFT_CLOSE ditolak (REJECTED) dan berhasil mengirim ulang setelah alasan dilengkapi di /m/sync (Lapis 1)', async () => {
+		const tokenStorage = createMemoryTokenStorage({
+			accessToken: 'valid-access-token',
+			refreshToken: 'valid-refresh-token'
+		});
+
+		let attempt = 0;
+		const sentPayloads: Array<Record<string, unknown>> = [];
+
+		const mockFetch: typeof fetch = async (input, init) => {
+			const url = String(input);
+			if (url.endsWith('/api/v1/sync')) {
+				attempt++;
+				const parsedBody = JSON.parse(String(init?.body)) as {
+					operations: Array<{ clientOpId: string; payload: Record<string, unknown> }>;
+				};
+				const op = parsedBody.operations[0];
+				sentPayloads.push(op.payload);
+
+				if (attempt === 1) {
+					return new Response(
+						JSON.stringify({
+							results: [
+								{
+									clientOpId: op.clientOpId,
+									status: 'REJECTED',
+									code: 'VALIDATION_ERROR',
+									conflictReason:
+										'Terdapat 1 barang yang masih keluar dan wajib diberi alasan sebelum menutup shift (AST-0099) (BR-12).',
+									details: {
+										missingAssetCodes: ['AST-0099'],
+										missingAssets: [
+											{
+												assetCode: 'AST-0099',
+												assetId: '99999999-9999-4999-8999-999999999999',
+												assetName: 'Proyektor Aula Utama'
+											}
+										]
+									}
+								}
+							]
+						}),
+						{ status: 200, headers: { 'Content-Type': 'application/json' } }
+					);
+				}
+
+				return new Response(
+					JSON.stringify({
+						results: [
+							{
+								clientOpId: op.clientOpId,
+								status: 'ACCEPTED',
+								idempotentReplay: false,
+								conflictReason: null
+							}
+						]
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response('{}', { status: 404 });
+		};
+
+		const apiClient = createMobileApiClient({
+			baseUrl: 'http://localhost:5173',
+			storage: tokenStorage,
+			fetchFn: mockFetch
+		});
+
+		const initialClose = await enqueueOfflineOperation(
+			{
+				type: 'SHIFT_CLOSE',
+				label: 'Tutup Shift Sore',
+				payload: {
+					shiftId: '44444444-4444-4444-8444-444444444444',
+					items: []
+				}
+			},
+			queueStorage
+		);
+
+		// 1. Percobaan pertama ditolak karena AST-0099 belum punya alasan
+		const run1 = await syncPendingOperations({
+			apiClient,
+			storage: queueStorage,
+			force: true
+		});
+		expect(run1.rejected).toBe(1);
+
+		const rejectedItem = await queueStorage.getById(initialClose.clientOpId);
+		expect(rejectedItem?.syncState).toBe('REJECTED');
+		expect(rejectedItem?.conflictReason).toContain('AST-0099');
+
+		const missingAssets = extractMissingShiftCloseAssets(rejectedItem!);
+		expect(missingAssets).toHaveLength(1);
+		expect(missingAssets[0].assetCode).toBe('AST-0099');
+
+		// 2. Petugas melengkapi alasan untuk AST-0099 di layar /m/sync lalu mengirim ulang
+		const { newItem, outcome } = await retryRejectedShiftCloseWithReasons(
+			initialClose.clientOpId,
+			{
+				'AST-0099': 'Masih dipakai acara wisuda di Aula Utama'
+			},
+			{
+				apiClient,
+				storage: queueStorage
+			}
+		);
+
+		expect(outcome.accepted).toBe(1);
+		expect(newItem.syncState).toBe('ACCEPTED');
+		expect(newItem.clientOpId).not.toBe(initialClose.clientOpId);
+
+		const secondItems = sentPayloads[1].items as Array<{
+			assetCode: string;
+			assetId: string;
+			reason: string;
+		}>;
+		expect(secondItems).toHaveLength(1);
+		expect(secondItems[0]).toMatchObject({
+			assetCode: 'AST-0099',
+			assetId: '99999999-9999-4999-8999-999999999999',
+			reason: 'Masih dipakai acara wisuda di Aula Utama'
+		});
 	});
 });

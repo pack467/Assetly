@@ -632,4 +632,146 @@ describe('M4 Tahap 4A: Backend Sinkronisasi Offline (POST /api/v1/sync) — Idem
 			await smallPoolPrisma.$disconnect();
 		}
 	});
+
+	it('8. mendukung Lapis 1 SHIFT_CLOSE via /sync: LOAN_CREATE offline + SHIFT_CLOSE (via assetId) dalam satu batch (ACCEPTED), menolak barang keluar tanpa alasan (REJECTED dengan kode barang), dan mengabaikan alasan untuk barang yang sudah kembali', async () => {
+		// Bersihkan semua LoanItem aktif sebelumnya agar daftar barang keluar terkontrol
+		await prisma.loanItem.updateMany({
+			where: { returnedAt: null },
+			data: { returnedAt: new Date(), returnCondition: 'NORMAL' }
+		});
+
+		const suffix = randomUUID().slice(0, 8);
+		const officerUser = await prisma.user.create({
+			data: {
+				name: 'Officer Lapis 1 Sync',
+				email: `m4a-off-l1-${suffix}@example.com`,
+				passwordHash: 'hash',
+				role: 'OFFICER',
+				isActive: true
+			}
+		});
+		const officerActor: PolicyUser = { id: officerUser.id, role: 'OFFICER', isActive: true };
+
+		const [assetOfflineBorrow, assetAlreadyReturned] = await Promise.all([
+			prisma.asset.create({
+				data: {
+					code: `AST-L1-OUT-${suffix}`,
+					qrToken: `qr-l1-out-${randomUUID()}`,
+					name: 'Laptop Pinjam Offline Lapis 1',
+					categoryId,
+					status: 'AVAILABLE'
+				}
+			}),
+			prisma.asset.create({
+				data: {
+					code: `AST-L1-RET-${suffix}`,
+					qrToken: `qr-l1-ret-${randomUUID()}`,
+					name: 'Kamera Sudah Kembali Sebelum Tutup Shift',
+					categoryId,
+					status: 'AVAILABLE'
+				}
+			})
+		]);
+
+		// Pinjam dan kembalikan assetAlreadyReturned sebelum shift ditutup
+		const [evOutRet, evInRet, evOutOffline] = await Promise.all([
+			createEvidenceForActor(officerActor, 'CHECKOUT'),
+			createEvidenceForActor(officerActor, 'RETURN'),
+			createEvidenceForActor(officerActor, 'CHECKOUT')
+		]);
+
+		const expectedReturnAt = new Date(Date.now() + 86400_000).toISOString();
+		const loanReturnedBeforeClose = await createLoan(officerActor, {
+			borrowerId: borrower1.id,
+			assetId: assetAlreadyReturned.id,
+			evidenceId: evOutRet.id,
+			purpose: 'Sudah selesai sebelum tutup shift',
+			expectedReturnAt
+		});
+		await returnLoanItem(officerActor, loanReturnedBeforeClose.loan.items[0].id, {
+			returnCondition: 'NORMAL',
+			evidenceId: evInRet.id
+		});
+
+		// A. Uji penolakan SHIFT_CLOSE bila ada barang keluar yang belum diberi alasan -> REJECTED dengan menyebut kode barang
+		const openOpId1 = `l1-open-1-${randomUUID()}`;
+		const loanOpId1 = `l1-loan-1-${randomUUID()}`;
+		const closeMissingReasonOpId = `l1-close-miss-${randomUUID()}`;
+
+		const batchMissingReason = await processSyncBatch(officerActor, {
+			operations: [
+				{
+					clientOpId: openOpId1,
+					type: 'SHIFT_OPEN',
+					clientCreatedAt: '2026-11-25T08:00:00.000Z',
+					payload: { note: 'Shift Uji Lapis 1' }
+				},
+				{
+					clientOpId: loanOpId1,
+					type: 'LOAN_CREATE',
+					clientCreatedAt: '2026-11-25T08:05:00.000Z',
+					payload: {
+						borrowerId: borrower1.id,
+						assetId: assetOfflineBorrow.id,
+						evidenceId: evOutOffline.id,
+						purpose: 'Pinjam Offline Tanpa ID Server',
+						expectedReturnAt
+					}
+				},
+				{
+					clientOpId: closeMissingReasonOpId,
+					type: 'SHIFT_CLOSE',
+					clientCreatedAt: '2026-11-25T08:10:00.000Z',
+					payload: {
+						note: 'Coba tutup tanpa alasan untuk barang yang baru dipinjam offline',
+						items: []
+					}
+				}
+			]
+		});
+
+		expect(batchMissingReason.results[0].status).toBe('ACCEPTED');
+		expect(batchMissingReason.results[1].status).toBe('ACCEPTED');
+		expect(batchMissingReason.results[2].status).toBe('REJECTED');
+		expect(batchMissingReason.results[2].code).toBe('VALIDATION_ERROR');
+		expect(batchMissingReason.results[2].conflictReason).toContain(assetOfflineBorrow.code);
+
+		// B. Uji pengiriman SHIFT_CLOSE dengan identifikasi via assetId + alasan untuk barang yang sudah kembali (diabaikan, bukan error) -> ACCEPTED
+		const closeValidOpId = `l1-close-ok-${randomUUID()}`;
+		const batchValidClose = await processSyncBatch(officerActor, {
+			operations: [
+				{
+					clientOpId: closeValidOpId,
+					type: 'SHIFT_CLOSE',
+					clientCreatedAt: '2026-11-25T08:15:00.000Z',
+					payload: {
+						note: 'Tutup shift setelah melengkapi alasan via assetId',
+						items: [
+							{
+								assetId: assetOfflineBorrow.id,
+								reason: 'Masih dipakai seminar oleh peminjam 1'
+							},
+							{
+								// Barang ini sudah dikembalikan sebelum tutup shift -> harus diabaikan tanpa error
+								assetId: assetAlreadyReturned.id,
+								reason: 'Alasan untuk barang yang ternyata sudah kembali'
+							}
+						]
+					}
+				}
+			]
+		});
+
+		expect(batchValidClose.results[0].status).toBe('ACCEPTED');
+
+		// Pastikan ShiftItem hanya mencatat 1 barang yang benar-benar masih keluar (assetOfflineBorrow)
+		const closedShiftId = (batchValidClose.results[0].data as { shiftId: string }).shiftId;
+		const recordedShiftItems = await prisma.shiftItem.findMany({
+			where: { shiftId: closedShiftId },
+			include: { loanItem: true }
+		});
+		expect(recordedShiftItems).toHaveLength(1);
+		expect(recordedShiftItems[0].loanItem.assetId).toBe(assetOfflineBorrow.id);
+		expect(recordedShiftItems[0].reason).toBe('Masih dipakai seminar oleh peminjam 1');
+	});
 });

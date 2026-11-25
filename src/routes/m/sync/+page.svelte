@@ -10,7 +10,11 @@
 		type OfflineQueueSummary,
 		type OfflineSyncState
 	} from '$lib/client/offlineQueue';
-	import { syncPendingOperations } from '$lib/client/syncManager';
+	import {
+		extractMissingShiftCloseAssets,
+		retryRejectedShiftCloseWithReasons,
+		syncPendingOperations
+	} from '$lib/client/syncManager';
 
 	let items = $state<OfflineQueueItem[]>([]);
 	let summary = $state<OfflineQueueSummary>({
@@ -25,6 +29,7 @@
 	let syncing = $state(false);
 	let statusFeedback = $state('');
 	let isOnline = $state(true);
+	let shiftCloseSupplementReasons = $state<Record<string, Record<string, string>>>({});
 
 	let unsubscribeQueue: (() => void) | null = null;
 
@@ -100,6 +105,51 @@
 	async function handleResolveConflictAndPickAnother(clientOpId: string) {
 		await getOfflineQueueStorage().remove(clientOpId);
 		await goto('/m/scan');
+	}
+
+	function getShiftSupplementReason(clientOpId: string, assetCode: string): string {
+		return shiftCloseSupplementReasons[clientOpId]?.[assetCode] ?? '';
+	}
+
+	function setShiftSupplementReason(clientOpId: string, assetCode: string, value: string) {
+		shiftCloseSupplementReasons = {
+			...shiftCloseSupplementReasons,
+			[clientOpId]: {
+				...(shiftCloseSupplementReasons[clientOpId] ?? {}),
+				[assetCode]: value
+			}
+		};
+	}
+
+	async function handleRetryShiftCloseWithReasons(item: OfflineQueueItem) {
+		statusFeedback = '';
+		const missingList = extractMissingShiftCloseAssets(item);
+		const mapForOp = shiftCloseSupplementReasons[item.clientOpId] ?? {};
+
+		for (const m of missingList) {
+			const val = (mapForOp[m.assetCode] ?? '').trim();
+			if (val.length < 3) {
+				statusFeedback = `Mohon isi alasan untuk barang ${m.assetCode} minimal 3 karakter sebelum mengirim ulang.`;
+				return;
+			}
+		}
+
+		syncing = true;
+		try {
+			const { newItem } = await retryRejectedShiftCloseWithReasons(item.clientOpId, mapForOp);
+			await refreshQueueList();
+			if (newItem.syncState === 'ACCEPTED') {
+				statusFeedback =
+					'Penutupan shift berhasil dilengkapi dan telah diterima server (ACCEPTED)!';
+			} else {
+				statusFeedback =
+					newItem.conflictReason ||
+					newItem.lastError ||
+					'Pengiriman ulang tutup shift masih memerlukan perhatian.';
+			}
+		} finally {
+			syncing = false;
+		}
 	}
 
 	async function handleClearAccepted() {
@@ -353,6 +403,10 @@
 					</div>
 
 					{#if item.syncState === 'CONFLICT' || item.syncState === 'REJECTED'}
+						{@const missingShiftAssets =
+							item.type === 'SHIFT_CLOSE' && item.syncState === 'REJECTED'
+								? extractMissingShiftCloseAssets(item)
+								: []}
 						<div class="space-y-3 rounded-xl border border-red-200 bg-red-50 p-3.5">
 							<div>
 								<div class="text-xs font-extrabold text-red-900">
@@ -365,14 +419,60 @@
 								</p>
 							</div>
 
+							{#if missingShiftAssets.length > 0}
+								<div class="space-y-2.5 rounded-xl border border-rose-300 bg-white p-3">
+									<div class="text-xs font-extrabold text-rose-900">
+										Lengkapi Alasan Barang Keluar Lalu Kirim Ulang:
+									</div>
+									{#each missingShiftAssets as missingAsset (missingAsset.assetCode)}
+										<div>
+											<label
+												for={`supp-${item.clientOpId}-${missingAsset.assetCode}`}
+												class="block text-[11px] font-bold text-slate-800"
+											>
+												{missingAsset.assetCode}
+												{#if missingAsset.assetName}
+													— {missingAsset.assetName}
+												{/if}
+											</label>
+											<input
+												id={`supp-${item.clientOpId}-${missingAsset.assetCode}`}
+												type="text"
+												value={getShiftSupplementReason(item.clientOpId, missingAsset.assetCode)}
+												oninput={(e) =>
+													setShiftSupplementReason(
+														item.clientOpId,
+														missingAsset.assetCode,
+														e.currentTarget.value
+													)}
+												placeholder="Tulis alasan barang ini masih dibawa keluar..."
+												class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-900"
+											/>
+										</div>
+									{/each}
+									<button
+										type="button"
+										onclick={() => handleRetryShiftCloseWithReasons(item)}
+										disabled={syncing}
+										class="w-full rounded-xl bg-emerald-700 px-4 py-2.5 text-xs font-bold text-white shadow-2xs active:bg-emerald-800 disabled:opacity-50"
+									>
+										{syncing
+											? 'Sedang Mengirim Ulang...'
+											: 'Simpan Alasan & Kirim Ulang Tutup Shift'}
+									</button>
+								</div>
+							{/if}
+
 							<div class="flex flex-col gap-2">
-								<button
-									type="button"
-									onclick={() => handleResolveConflictAndPickAnother(item.clientOpId)}
-									class="w-full rounded-xl bg-red-700 px-4 py-3 text-xs font-bold text-white shadow-2xs active:bg-red-800"
-								>
-									Scan / Pilih Barang Lain & Hapus Catatan Ini
-								</button>
+								{#if item.type !== 'SHIFT_CLOSE' && item.type !== 'SHIFT_OPEN'}
+									<button
+										type="button"
+										onclick={() => handleResolveConflictAndPickAnother(item.clientOpId)}
+										class="w-full rounded-xl bg-red-700 px-4 py-3 text-xs font-bold text-white shadow-2xs active:bg-red-800"
+									>
+										Scan / Pilih Barang Lain & Hapus Catatan Ini
+									</button>
+								{/if}
 								<button
 									type="button"
 									onclick={() => handleDismissItem(item.clientOpId)}
