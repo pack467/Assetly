@@ -474,6 +474,78 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			expect(finalLoan.status).toBe('COMPLETED');
 			expect(finalLoan.borrowerId).toBe(borrower2.id);
 		});
+
+		it('menangani konfirmasi serah terima paralel (pemberi & penerima bersamaan serta klik ganda penerima) tanpa kehilangan timestamp atau membuat documentNo/transfer ganda (#5)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const raceHoAsset = await prisma.asset.create({
+				data: {
+					code: `AST-M3-RACEHO-${suffix}`,
+					qrToken: `qr-raceho-${randomUUID()}`,
+					name: 'Laptop Uji Balapan Handover',
+					categoryId,
+					status: 'AVAILABLE'
+				}
+			});
+
+			const checkoutEv = await createEvidenceForActor(borrower1, 'CHECKOUT');
+			const loanRes = await createLoan(borrower1, {
+				assetId: raceHoAsset.id,
+				evidenceId: checkoutEv.id,
+				purpose: 'Uji Konkurensi Handover',
+				expectedReturnAt: new Date(Date.now() + 86400_000).toISOString()
+			});
+			const raceLoanId = loanRes.loan.id;
+			const raceLoanItemId = loanRes.loan.items[0].id;
+
+			// Buat handover dengan autoConfirmGiver: false sehingga kedua pihak belum konfirmasi
+			const createdHo = await createHandover(borrower1, {
+				loanId: raceLoanId,
+				giverId: borrower1.id,
+				receiverId: borrower2.id,
+				autoConfirmGiver: false
+			});
+			expect(createdHo.handover.giverConfirmedAt).toBeNull();
+			expect(createdHo.handover.receiverConfirmedAt).toBeNull();
+
+			// A. Jalankan konfirmasi Pemberi (borrower1) dan Penerima (borrower2) secara paralel
+			//    Pastikan tidak ada timestamp konfirmasi yang tertimpa/hilang
+			await Promise.all([
+				confirmHandover(borrower1, createdHo.handover.id),
+				confirmHandover(borrower2, createdHo.handover.id)
+			]);
+
+			const finalHo = await prisma.handover.findUniqueOrThrow({
+				where: { id: createdHo.handover.id }
+			});
+			expect(finalHo.giverConfirmedAt).not.toBeNull();
+			expect(finalHo.receiverConfirmedAt).not.toBeNull();
+			expect(finalHo.documentNo).toMatch(/^BA-\d{8}-[A-F0-9]{6}$/);
+
+			// B. Klik ganda / pengiriman paralel oleh Penerima setelah terkonfirmasi wajib idempoten (mengembalikan documentNo yang sama, tanpa transfer kedua)
+			const [resDup1, resDup2] = await Promise.all([
+				confirmHandover(borrower2, createdHo.handover.id),
+				confirmHandover(borrower2, createdHo.handover.id)
+			]);
+			expect(resDup1.handover.documentNo).toBe(finalHo.documentNo);
+			expect(resDup2.handover.documentNo).toBe(finalHo.documentNo);
+
+			// LOAN_HOLDER_TRANSFERRED hanya boleh tercatat tepat 1 kali untuk peminjaman ini
+			const transferLogsCount = await prisma.auditLog.count({
+				where: {
+					entityType: 'Loan',
+					entityId: raceLoanId,
+					action: 'LOAN_HOLDER_TRANSFERRED'
+				}
+			});
+			expect(transferLogsCount).toBe(1);
+
+			// Bersihkan pinjaman agar suite shift di bawah tetap bersih
+			const retEv = await createEvidenceForActor(borrower2, 'RETURN');
+			await returnLoanItem(borrower2, raceLoanItemId, {
+				returnCondition: 'NORMAL',
+				evidenceId: retEv.id
+			});
+		});
 	});
 
 	describe('2. Buka & Tutup Shift (Tanpa Barang Tertinggal vs Dengan Barang Tertinggal — Bagian 7.4 & BR-12)', () => {

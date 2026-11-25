@@ -298,6 +298,11 @@ export async function confirmHandover(
 		);
 	}
 
+	const alreadyConfirmedOutsideTx =
+		((isGiver && existing.giverConfirmedAt !== null) ||
+			(isReceiver && existing.receiverConfirmedAt !== null)) &&
+		(!input.evidenceId || input.evidenceId === existing.evidenceId);
+
 	const preCheckEligibility = verifyGiverEligibility({
 		giverId: existing.giverId,
 		giverRole: existing.giver.role,
@@ -305,7 +310,7 @@ export async function confirmHandover(
 		currentHolderId: existing.loan.borrowerId
 	});
 
-	if (!preCheckEligibility.valid) {
+	if (!alreadyConfirmedOutsideTx && !preCheckEligibility.valid) {
 		// Batalkan serah terima menggantung yang tidak lagi valid untuk loan ini sebelum menolak konfirmasi sebagai konflik
 		if (!outerTx) {
 			await prisma.$transaction(async (tx) => {
@@ -354,9 +359,30 @@ export async function confirmHandover(
 	}
 
 	const updated = await runInTx(outerTx, async (tx) => {
-		// Baca ulang Loan di dalam transaksi untuk menjamin konsistensi konkurensi
+		// Kunci eksklusif per handoverId agar konfirmasi paralel dari pemberi & penerima (atau klik ganda) dieksekusi berurutan (#5)
+		const lockKey = `handover:${handoverId}`;
+		await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+
+		// Baca ulang Handover dan Loan di dalam transaksi setelah kunci diperoleh untuk mencegah TOCTOU
+		const freshHandover = await tx.handover.findUniqueOrThrow({
+			where: { id: handoverId },
+			include: HANDOVER_INCLUDE
+		});
+
+		if (freshHandover.documentNo?.startsWith(SUPERSEDED_PREFIX)) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				'Konflik serah terima: serah terima ini sudah kedaluwarsa karena barang telah diserahterimakan ke pihak lain.',
+				{
+					handoverId: freshHandover.id,
+					currentHolderId: freshHandover.loan.borrower.id
+				},
+				409
+			);
+		}
+
 		const freshLoan = await tx.loan.findUniqueOrThrow({
-			where: { id: existing.loanId },
+			where: { id: freshHandover.loanId },
 			include: {
 				items: { where: { returnedAt: null } }
 			}
@@ -366,16 +392,27 @@ export async function confirmHandover(
 			throw new AppError(
 				'INVALID_STATUS_TRANSITION',
 				'Serah terima tidak dapat dikonfirmasi karena barang sudah dikembalikan.',
-				{ loanId: existing.loanId, loanStatus: freshLoan.status },
+				{ loanId: freshHandover.loanId, loanStatus: freshLoan.status },
 				409
 			);
 		}
 
+		// Bila pihak ini sudah pernah mengonfirmasi dan tidak mengirim evidenceId baru, kembalikan secara idempoten
+		const alreadyConfirmedByActor =
+			(isGiver && freshHandover.giverConfirmedAt !== null) ||
+			(isReceiver && freshHandover.receiverConfirmedAt !== null);
+		const hasNewEvidence = Boolean(
+			input.evidenceId && input.evidenceId !== freshHandover.evidenceId
+		);
+		if (alreadyConfirmedByActor && !hasNewEvidence) {
+			return freshHandover;
+		}
+
 		// 2. Pastikan pemberi adalah pemegang saat ini, kecuali kasus petugas menyerahkan ke peminjam yang memang sudah tercatat sebagai peminjam
 		const eligibility = verifyGiverEligibility({
-			giverId: existing.giverId,
-			giverRole: existing.giver.role,
-			receiverId: existing.receiverId,
+			giverId: freshHandover.giverId,
+			giverRole: freshHandover.giver.role,
+			receiverId: freshHandover.receiverId,
 			currentHolderId: freshLoan.borrowerId
 		});
 
@@ -384,29 +421,31 @@ export async function confirmHandover(
 				'INVALID_STATUS_TRANSITION',
 				'Konflik serah terima: pihak pemberi bukan lagi pemegang barang saat ini.',
 				{
-					handoverId: existing.id,
-					giverId: existing.giverId,
+					handoverId: freshHandover.id,
+					giverId: freshHandover.giverId,
 					currentHolderId: freshLoan.borrowerId
 				},
 				409
 			);
 		}
 
-		if (input.evidenceId && input.evidenceId !== existing.evidenceId) {
+		if (hasNewEvidence && input.evidenceId) {
 			await validateHandoverEvidence(tx, actor, input.evidenceId);
 		}
 
 		const now = new Date();
 		const nextGiverConfirmedAt = isGiver
-			? (existing.giverConfirmedAt ?? now)
-			: existing.giverConfirmedAt;
+			? (freshHandover.giverConfirmedAt ?? now)
+			: freshHandover.giverConfirmedAt;
 		const nextReceiverConfirmedAt = isReceiver
-			? (existing.receiverConfirmedAt ?? now)
-			: existing.receiverConfirmedAt;
+			? (freshHandover.receiverConfirmedAt ?? now)
+			: freshHandover.receiverConfirmedAt;
 
 		const bothConfirmed = Boolean(nextGiverConfirmedAt && nextReceiverConfirmedAt);
 		const nextDocumentNo =
-			bothConfirmed && !existing.documentNo ? generateHandoverDocumentNo() : existing.documentNo;
+			bothConfirmed && !freshHandover.documentNo
+				? generateHandoverDocumentNo()
+				: freshHandover.documentNo;
 
 		const handover = await tx.handover.update({
 			where: { id: handoverId },
@@ -425,15 +464,15 @@ export async function confirmHandover(
 		const holderTransferred =
 			bothConfirmed &&
 			!eligibility.isOfficerInitialDelivery &&
-			previousBorrowerId !== existing.receiverId;
+			previousBorrowerId !== freshHandover.receiverId;
 
 		const supersededHandoverIds: string[] = [];
 
 		if (holderTransferred) {
 			await tx.loan.update({
-				where: { id: existing.loanId },
+				where: { id: freshHandover.loanId },
 				data: {
-					borrowerId: existing.receiverId
+					borrowerId: freshHandover.receiverId
 				}
 			});
 
@@ -441,10 +480,10 @@ export async function confirmHandover(
 				actorId: actor.id,
 				action: 'LOAN_HOLDER_TRANSFERRED',
 				entityType: 'Loan',
-				entityId: existing.loanId,
+				entityId: freshHandover.loanId,
 				before: { borrowerId: previousBorrowerId },
 				after: {
-					borrowerId: existing.receiverId,
+					borrowerId: freshHandover.receiverId,
 					handoverId: handover.id,
 					documentNo: handover.documentNo
 				},
@@ -454,7 +493,7 @@ export async function confirmHandover(
 			// 3. Batalkan/tandai kedaluwarsa serah terima lain yang masih menunggu untuk peminjaman yang sama
 			const otherPendingHandovers = await tx.handover.findMany({
 				where: {
-					loanId: existing.loanId,
+					loanId: freshHandover.loanId,
 					id: { not: handoverId },
 					documentNo: null,
 					OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
@@ -478,7 +517,7 @@ export async function confirmHandover(
 					after: {
 						documentNo: marker,
 						supersededByHandoverId: handover.id,
-						newHolderId: existing.receiverId
+						newHolderId: freshHandover.receiverId
 					},
 					ip: ip ?? null
 				});
@@ -491,9 +530,9 @@ export async function confirmHandover(
 			entityType: 'Handover',
 			entityId: handover.id,
 			before: {
-				giverConfirmedAt: existing.giverConfirmedAt?.toISOString() ?? null,
-				receiverConfirmedAt: existing.receiverConfirmedAt?.toISOString() ?? null,
-				documentNo: existing.documentNo
+				giverConfirmedAt: freshHandover.giverConfirmedAt?.toISOString() ?? null,
+				receiverConfirmedAt: freshHandover.receiverConfirmedAt?.toISOString() ?? null,
+				documentNo: freshHandover.documentNo
 			},
 			after: {
 				confirmedByRole: isGiver ? 'GIVER' : 'RECEIVER',
@@ -501,7 +540,7 @@ export async function confirmHandover(
 				receiverConfirmedAt: handover.receiverConfirmedAt?.toISOString() ?? null,
 				documentNo: handover.documentNo,
 				holderTransferred,
-				newHolderId: holderTransferred ? existing.receiverId : previousBorrowerId,
+				newHolderId: holderTransferred ? freshHandover.receiverId : previousBorrowerId,
 				...(supersededHandoverIds.length > 0 ? { supersededHandoverIds } : {})
 			},
 			ip: ip ?? null
