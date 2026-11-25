@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '$lib/server/db';
-import { writeAuditLog, type DbTx } from '$lib/server/audit';
+import { runInTx, writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, type PolicyUser } from '$lib/server/policy';
 import { createEvidenceSignedUrl } from '$lib/server/storage';
 import { AppError } from '$lib/shared/errors';
@@ -137,13 +137,16 @@ function verifyGiverEligibility(params: {
 export async function createHandover(
 	actor: PolicyUser | null | undefined,
 	input: z.input<typeof createHandoverSchema>,
-	ip?: string
+	ip?: string,
+	outerTx?: DbTx
 ) {
 	if (!actor || actor.isActive === false) {
 		throw new AppError('UNAUTHENTICATED', 'Sesi login tidak valid.');
 	}
 
-	const loan = await prisma.loan.findUnique({
+	const db = outerTx ?? prisma;
+
+	const loan = await db.loan.findUnique({
 		where: { id: input.loanId },
 		include: {
 			items: { where: { returnedAt: null } }
@@ -181,8 +184,8 @@ export async function createHandover(
 	});
 
 	const [giverUser, receiverUser] = await Promise.all([
-		prisma.user.findUnique({ where: { id: giverId } }),
-		prisma.user.findUnique({ where: { id: receiverId } })
+		db.user.findUnique({ where: { id: giverId } }),
+		db.user.findUnique({ where: { id: receiverId } })
 	]);
 
 	if (!giverUser || !giverUser.isActive) {
@@ -214,7 +217,7 @@ export async function createHandover(
 	const now = new Date();
 	const giverConfirmedAt = (input.autoConfirmGiver ?? true) && actor.id === giverId ? now : null;
 
-	const created = await prisma.$transaction(async (tx) => {
+	const created = await runInTx(outerTx, async (tx) => {
 		if (input.evidenceId) {
 			await validateHandoverEvidence(tx, actor, input.evidenceId);
 		}
@@ -259,13 +262,16 @@ export async function confirmHandover(
 	actor: PolicyUser | null | undefined,
 	handoverId: string,
 	input: z.infer<typeof confirmHandoverSchema> = {},
-	ip?: string
+	ip?: string,
+	outerTx?: DbTx
 ) {
 	if (!actor || actor.isActive === false) {
 		throw new AppError('UNAUTHENTICATED', 'Sesi login tidak valid.');
 	}
 
-	const existing = await prisma.handover.findUnique({
+	const db = outerTx ?? prisma;
+
+	const existing = await db.handover.findUnique({
 		where: { id: handoverId },
 		include: {
 			giver: { select: { id: true, role: true } },
@@ -333,37 +339,39 @@ export async function confirmHandover(
 
 	if (!preCheckEligibility.valid) {
 		// Batalkan serah terima menggantung yang tidak lagi valid untuk loan ini sebelum menolak konfirmasi sebagai konflik
-		await prisma.$transaction(async (tx) => {
-			const staleHandovers = await tx.handover.findMany({
-				where: {
-					loanId: existing.loanId,
-					documentNo: null,
-					OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
+		if (!outerTx) {
+			await prisma.$transaction(async (tx) => {
+				const staleHandovers = await tx.handover.findMany({
+					where: {
+						loanId: existing.loanId,
+						documentNo: null,
+						OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
+					}
+				});
+				for (const stale of staleHandovers) {
+					if (stale.giverId !== existing.loan.borrowerId) {
+						const marker = generateSupersededMarker(stale.id);
+						await tx.handover.update({
+							where: { id: stale.id },
+							data: { documentNo: marker }
+						});
+						await writeAuditLog(tx, {
+							actorId: actor.id,
+							action: 'HANDOVER_SUPERSEDED',
+							entityType: 'Handover',
+							entityId: stale.id,
+							before: { documentNo: null },
+							after: {
+								documentNo: marker,
+								reason: 'GIVER_NOT_CURRENT_HOLDER',
+								currentHolderId: existing.loan.borrowerId
+							},
+							ip: ip ?? null
+						});
+					}
 				}
 			});
-			for (const stale of staleHandovers) {
-				if (stale.giverId !== existing.loan.borrowerId) {
-					const marker = generateSupersededMarker(stale.id);
-					await tx.handover.update({
-						where: { id: stale.id },
-						data: { documentNo: marker }
-					});
-					await writeAuditLog(tx, {
-						actorId: actor.id,
-						action: 'HANDOVER_SUPERSEDED',
-						entityType: 'Handover',
-						entityId: stale.id,
-						before: { documentNo: null },
-						after: {
-							documentNo: marker,
-							reason: 'GIVER_NOT_CURRENT_HOLDER',
-							currentHolderId: existing.loan.borrowerId
-						},
-						ip: ip ?? null
-					});
-				}
-			}
-		});
+		}
 
 		throw new AppError(
 			'INVALID_STATUS_TRANSITION',
@@ -377,7 +385,7 @@ export async function confirmHandover(
 		);
 	}
 
-	const updated = await prisma.$transaction(async (tx) => {
+	const updated = await runInTx(outerTx, async (tx) => {
 		// Baca ulang Loan di dalam transaksi untuk menjamin konsistensi konkurensi
 		const freshLoan = await tx.loan.findUniqueOrThrow({
 			where: { id: existing.loanId },

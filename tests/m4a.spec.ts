@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { PrismaClient } from '@prisma/client';
 import { prisma } from '../src/lib/server/db';
 import type { PolicyUser } from '../src/lib/server/policy';
 import { uploadEvidence } from '../src/lib/server/services/evidenceService';
@@ -550,5 +551,85 @@ describe('M4 Tahap 4A: Backend Sinkronisasi Offline (POST /api/v1/sync) — Idem
 			]
 		});
 		expect(syncReturnRecovery.results[0].status).toBe('ACCEPTED');
+	});
+
+	it('7. menahan beban 20 request sync paralel pada pool koneksi kecil (connection_limit=2) tanpa deadlock (1 transaksi / 1 koneksi per operasi)', async () => {
+		const baseUrl = process.env.DATABASE_URL ?? '';
+		const sep = baseUrl.includes('?') ? '&' : '?';
+		const smallPoolUrl = `${baseUrl}${sep}connection_limit=2&pool_timeout=15`;
+		const smallPoolPrisma = new PrismaClient({
+			datasources: {
+				db: {
+					url: smallPoolUrl
+				}
+			}
+		});
+		await smallPoolPrisma.$connect();
+
+		try {
+			const totalParallel = 20;
+			const suffix = randomUUID().slice(0, 6);
+
+			// Siapkan 15 barang dan 15 foto bukti (5 request sisanya akan menguji konflik & replay paralel pada pool kecil yang sama)
+			const assets = await Promise.all(
+				Array.from({ length: 15 }, (_, idx) =>
+					prisma.asset.create({
+						data: {
+							code: `AST-POOL-${suffix}-${idx}`,
+							qrToken: `qr-pool-${suffix}-${idx}-${randomUUID()}`,
+							name: `Barang Uji Pool Kecil #${idx}`,
+							categoryId,
+							status: 'AVAILABLE'
+						}
+					})
+				)
+			);
+
+			const evidences = await Promise.all(
+				Array.from({ length: totalParallel }, () => createEvidenceForActor(borrower1, 'CHECKOUT'))
+			);
+
+			const expectedReturnAt = new Date(Date.now() + 86400_000).toISOString();
+
+			// 20 request sync paralel memakai smallPoolPrisma (connection_limit=2):
+			// - 15 request meminjam barang berbeda (idx 0..14) -> harus ACCEPTED
+			// - 5 request meminjam ulang barang idx 0..4 dengan clientOpId baru -> harus CONFLICT (dan rollback transaksi utama lalu catat CONFLICT di transaksi terpisah tanpa deadlock!)
+			const parallelTasks = Array.from({ length: totalParallel }, (_, idx) => {
+				const targetAsset = assets[idx % 15];
+				const ev = evidences[idx];
+				return processSyncBatch(
+					borrower1,
+					{
+						operations: [
+							{
+								clientOpId: `pool-op-${suffix}-${idx}`,
+								type: 'LOAN_CREATE',
+								clientCreatedAt: new Date(Date.now() + idx).toISOString(),
+								payload: {
+									assetId: targetAsset.id,
+									evidenceId: ev.id,
+									purpose: `Uji Beban Pool Kecil #${idx}`,
+									expectedReturnAt
+								}
+							}
+						]
+					},
+					'127.0.0.1',
+					smallPoolPrisma
+				);
+			});
+
+			const outcomes = await Promise.all(parallelTasks);
+			expect(outcomes).toHaveLength(20);
+
+			const allResults = outcomes.map((o) => o.results[0]);
+			const acceptedCount = allResults.filter((r) => r.status === 'ACCEPTED').length;
+			const conflictCount = allResults.filter((r) => r.status === 'CONFLICT').length;
+
+			expect(acceptedCount).toBe(15);
+			expect(conflictCount).toBe(5);
+		} finally {
+			await smallPoolPrisma.$disconnect();
+		}
 	});
 });

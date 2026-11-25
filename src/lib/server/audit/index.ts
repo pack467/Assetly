@@ -1,6 +1,18 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
+import { prisma } from '$lib/server/db';
 
 export type DbTx = Prisma.TransactionClient | PrismaClient;
+
+export async function runInTx<T>(
+	tx: DbTx | undefined,
+	fn: (client: DbTx) => Promise<T>,
+	rootClient: PrismaClient = prisma
+): Promise<T> {
+	if (tx) {
+		return fn(tx);
+	}
+	return rootClient.$transaction((newTx) => fn(newTx));
+}
 
 export interface AuditLogEntryInput {
 	actorId?: string | null;

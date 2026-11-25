@@ -1,6 +1,6 @@
 import type { Prisma, ShiftStatus } from '@prisma/client';
 import { prisma } from '$lib/server/db';
-import { writeAuditLog } from '$lib/server/audit';
+import { runInTx, writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, type PolicyUser } from '$lib/server/policy';
 import { AppError } from '$lib/shared/errors';
 import { assertEvidenceNotUsed } from './loanService';
@@ -37,9 +37,9 @@ const SHIFT_DETAIL_INCLUDE = {
 /**
  * Mengambil seluruh LoanItem aktif (returnedAt IS NULL) dari database untuk pengecekan tutup shift (Bagian 7.4 & BR-12).
  */
-export async function getActiveOutstandingLoanItems() {
+export async function getActiveOutstandingLoanItems(db: DbTx = prisma) {
 	const now = new Date();
-	const items = await prisma.loanItem.findMany({
+	const items = await db.loanItem.findMany({
 		where: {
 			returnedAt: null,
 			loan: {
@@ -82,12 +82,14 @@ export async function getActiveOutstandingLoanItems() {
 export async function openShift(
 	actor: PolicyUser | null | undefined,
 	input: z.infer<typeof openShiftSchema> = {},
-	ip?: string
+	ip?: string,
+	outerTx?: DbTx
 ) {
 	assertCan(actor, 'shift:manage');
 	const officerActor = actor;
+	const db = outerTx ?? prisma;
 
-	const existingOpen = await prisma.shift.findFirst({
+	const existingOpen = await db.shift.findFirst({
 		where: {
 			userId: officerActor.id,
 			status: 'OPEN'
@@ -102,7 +104,7 @@ export async function openShift(
 		);
 	}
 
-	const created = await prisma.$transaction(async (tx) => {
+	const created = await runInTx(outerTx, async (tx) => {
 		const shift = await tx.shift.create({
 			data: {
 				userId: officerActor.id,
@@ -167,12 +169,14 @@ export async function closeShift(
 	actor: PolicyUser | null | undefined,
 	shiftId: string,
 	input: z.infer<typeof closeShiftSchema>,
-	ip?: string
+	ip?: string,
+	outerTx?: DbTx
 ) {
 	assertCan(actor, 'shift:manage');
 	const officerActor = actor;
+	const db = outerTx ?? prisma;
 
-	const existingShift = await prisma.shift.findUnique({
+	const existingShift = await db.shift.findUnique({
 		where: { id: shiftId }
 	});
 
@@ -189,7 +193,7 @@ export async function closeShift(
 	}
 
 	// Bagian 7.4 langkah 1 & BR-12: Server menghitung LoanItem aktif yang masih keluar dari database
-	const outstandingItems = await getActiveOutstandingLoanItems();
+	const outstandingItems = await getActiveOutstandingLoanItems(db);
 
 	const reasonMap = new Map<
 		string,
@@ -221,7 +225,7 @@ export async function closeShift(
 
 	const now = new Date();
 
-	const closed = await prisma.$transaction(async (tx) => {
+	const closed = await runInTx(outerTx, async (tx) => {
 		// Bila tutup shift melampirkan foto bukti (evidenceId), terapkan aturan Evidence yang sama
 		if (input.evidenceId) {
 			const ev = await tx.evidence.findUnique({ where: { id: input.evidenceId } });

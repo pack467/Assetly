@@ -1,6 +1,6 @@
 import { Prisma, type LoanStatus } from '@prisma/client';
 import { prisma } from '$lib/server/db';
-import { writeAuditLog, type DbTx } from '$lib/server/audit';
+import { runInTx, writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, can, type PolicyUser } from '$lib/server/policy';
 import { createEvidenceSignedUrl } from '$lib/server/storage';
 import { isValidAssetStatusTransition } from '$lib/shared/enums';
@@ -81,18 +81,20 @@ export async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Pr
 export async function createLoan(
 	actor: PolicyUser | null | undefined,
 	input: z.infer<typeof createLoanSchema>,
-	ip?: string
+	ip?: string,
+	outerTx?: DbTx
 ) {
 	if (!actor || actor.isActive === false) {
 		throw new AppError('UNAUTHENTICATED', 'Sesi login tidak valid.');
 	}
 
+	const db = outerTx ?? prisma;
 	const borrowerId = input.borrowerId ?? actor.id;
 	assertCan(actor, 'loan:create', { borrowerId });
 
 	// BR-14: Idempotensi melalui clientOpId
 	if (input.clientOpId) {
-		const existingByOp = await prisma.loan.findUnique({
+		const existingByOp = await db.loan.findUnique({
 			where: { clientOpId: input.clientOpId },
 			include: LOAN_DETAIL_INCLUDE
 		});
@@ -155,7 +157,7 @@ export async function createLoan(
 		evidenceIdsList.push(evId);
 	}
 
-	const evidences = await prisma.evidence.findMany({
+	const evidences = await db.evidence.findMany({
 		where: { id: { in: evidenceIdsList } }
 	});
 	if (evidences.length !== evidenceIdsList.length) {
@@ -165,7 +167,7 @@ export async function createLoan(
 	// Pemulihan idempoten bila operasi peminjaman milik pengguna sendiri sudah pernah berhasil
 	// sebelum SyncOperation sempat tercatat (mencegah CONFLICT/REJECTED palsu saat kirim ulang)
 	if (normalizedItems.length === 1) {
-		const recoveredItem = await prisma.loanItem.findFirst({
+		const recoveredItem = await db.loanItem.findFirst({
 			where: {
 				assetId: normalizedItems[0].assetId,
 				checkoutEvidenceId: evidenceIdsList[0],
@@ -217,7 +219,7 @@ export async function createLoan(
 	}
 
 	try {
-		const createdLoan = await prisma.$transaction(async (tx) => {
+		const createdLoan = await runInTx(outerTx, async (tx) => {
 			// 3. Satu Evidence hanya boleh dipakai sekali
 			await assertEvidenceNotUsed(tx, evidenceIdsList);
 
@@ -376,7 +378,7 @@ export async function createLoan(
 		// Tangkap pelanggaran unique partial index one_active_loan_per_asset atau clientOpId dari PostgreSQL
 		if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
 			const target = JSON.stringify(err.meta ?? '');
-			if (input.clientOpId && target.includes('clientOpId')) {
+			if (!outerTx && input.clientOpId && target.includes('clientOpId')) {
 				const existing = await prisma.loan.findUnique({
 					where: { clientOpId: input.clientOpId },
 					include: LOAN_DETAIL_INCLUDE
@@ -399,13 +401,16 @@ export async function returnLoanItem(
 	actor: PolicyUser | null | undefined,
 	loanItemId: string,
 	input: z.infer<typeof returnLoanItemSchema>,
-	ip?: string
+	ip?: string,
+	outerTx?: DbTx
 ) {
 	if (!actor || actor.isActive === false) {
 		throw new AppError('UNAUTHENTICATED', 'Sesi login tidak valid.');
 	}
 
-	const existingItem = await prisma.loanItem.findUnique({
+	const db = outerTx ?? prisma;
+
+	const existingItem = await db.loanItem.findUnique({
 		where: { id: loanItemId },
 		include: {
 			loan: true,
@@ -424,7 +429,7 @@ export async function returnLoanItem(
 		// Pemulihan idempoten bila pengembalian milik pengguna sendiri dengan foto bukti yang sama sudah berhasil
 		// sebelum SyncOperation tercatat (mencegah CONFLICT palsu saat kirim ulang)
 		if (existingItem.returnEvidenceId === input.evidenceId) {
-			const existingLoan = await prisma.loan.findUniqueOrThrow({
+			const existingLoan = await db.loan.findUniqueOrThrow({
 				where: { id: existingItem.loanId },
 				include: LOAN_DETAIL_INCLUDE
 			});
@@ -458,7 +463,7 @@ export async function returnLoanItem(
 		}
 	}
 
-	const evidence = await prisma.evidence.findUnique({
+	const evidence = await db.evidence.findUnique({
 		where: { id: input.evidenceId }
 	});
 	if (!evidence) {
@@ -503,7 +508,7 @@ export async function returnLoanItem(
 
 	const now = new Date();
 
-	const result = await prisma.$transaction(async (tx) => {
+	const result = await runInTx(outerTx, async (tx) => {
 		// 3. Satu Evidence hanya boleh dipakai sekali (tidak boleh sudah terpakai untuk pinjam atau kembali lain)
 		await assertEvidenceNotUsed(tx, [input.evidenceId]);
 

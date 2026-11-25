@@ -1,5 +1,5 @@
 import { ZodError } from 'zod';
-import { Prisma, type SyncStatus } from '@prisma/client';
+import { Prisma, type PrismaClient, type SyncStatus } from '@prisma/client';
 import { prisma } from '$lib/server/db';
 import { writeAuditLog, type DbTx } from '$lib/server/audit';
 import type { PolicyUser } from '$lib/server/policy';
@@ -37,7 +37,8 @@ export interface SyncOperationResultItem {
 async function executeSingleOperation(
 	actor: PolicyUser,
 	op: SyncOperationItemInput,
-	ip?: string
+	ip: string | undefined,
+	tx: DbTx
 ): Promise<unknown> {
 	const rawPayload = op.payload ?? {};
 
@@ -47,7 +48,7 @@ async function executeSingleOperation(
 				...rawPayload,
 				clientOpId: op.clientOpId
 			});
-			const res = await createLoan(actor, parsed, ip);
+			const res = await createLoan(actor, parsed, ip, tx);
 			return {
 				loanId: res.loan.id,
 				status: res.loan.status,
@@ -63,7 +64,7 @@ async function executeSingleOperation(
 			// oleh operasi dengan evidenceId yang sama (pemulihan crash sebelum SyncOperation tercatat)
 			if (!loanItemId && typeof rawPayload.assetId === 'string') {
 				const assetId = rawPayload.assetId.trim();
-				const activeLoanItem = await prisma.loanItem.findFirst({
+				const activeLoanItem = await tx.loanItem.findFirst({
 					where: {
 						assetId,
 						returnedAt: null
@@ -73,7 +74,7 @@ async function executeSingleOperation(
 				if (activeLoanItem) {
 					loanItemId = activeLoanItem.id;
 				} else if (typeof rawPayload.evidenceId === 'string') {
-					const alreadyReturnedBySameEv = await prisma.loanItem.findFirst({
+					const alreadyReturnedBySameEv = await tx.loanItem.findFirst({
 						where: {
 							assetId,
 							returnEvidenceId: rawPayload.evidenceId.trim()
@@ -97,7 +98,7 @@ async function executeSingleOperation(
 				...rawPayload,
 				clientOpId: op.clientOpId
 			});
-			const res = await returnLoanItem(actor, loanItemId, parsed, ip);
+			const res = await returnLoanItem(actor, loanItemId, parsed, ip, tx);
 			return {
 				loanItemId: res.loanItem.id,
 				loanId: res.loan.id,
@@ -107,7 +108,7 @@ async function executeSingleOperation(
 
 		case 'HANDOVER_CREATE': {
 			const parsed = createHandoverSchema.parse(rawPayload);
-			const res = await createHandover(actor, parsed, ip);
+			const res = await createHandover(actor, parsed, ip, tx);
 			return { handoverId: res.handover.id, isConfirmed: res.handover.isConfirmed };
 		}
 
@@ -118,7 +119,7 @@ async function executeSingleOperation(
 				throw new AppError('VALIDATION_ERROR', 'handoverId wajib disertakan.');
 			}
 			const parsed = confirmHandoverSchema.parse(rawPayload);
-			const res = await confirmHandover(actor, handoverId, parsed, ip);
+			const res = await confirmHandover(actor, handoverId, parsed, ip, tx);
 			return {
 				handoverId: res.handover.id,
 				isConfirmed: res.handover.isConfirmed,
@@ -128,14 +129,14 @@ async function executeSingleOperation(
 
 		case 'SHIFT_OPEN': {
 			const parsed = openShiftSchema.parse(rawPayload);
-			const res = await openShift(actor, parsed, ip);
+			const res = await openShift(actor, parsed, ip, tx);
 			return { shiftId: res.shift.id, status: res.shift.status };
 		}
 
 		case 'SHIFT_CLOSE': {
 			let shiftId = typeof rawPayload.shiftId === 'string' ? rawPayload.shiftId.trim() : '';
 			if (!shiftId) {
-				const openForUser = await prisma.shift.findFirst({
+				const openForUser = await tx.shift.findFirst({
 					where: { userId: actor.id, status: 'OPEN' },
 					select: { id: true }
 				});
@@ -150,7 +151,7 @@ async function executeSingleOperation(
 				);
 			}
 			const parsed = closeShiftSchema.parse(rawPayload);
-			const res = await closeShift(actor, shiftId, parsed, ip);
+			const res = await closeShift(actor, shiftId, parsed, ip, tx);
 			return { shiftId: res.shift.id, status: res.shift.status };
 		}
 
@@ -245,17 +246,87 @@ function buildReplayOrHijackResult(
 }
 
 /**
- * Memproses satu operasi sinkronisasi di bawah kunci eksklusif PostgreSQL pg_advisory_xact_lock(hashtext(clientOpId))
- * sehingga tahan terhadap pengiriman ulang maupun request paralel dengan clientOpId yang sama.
+ * Ketika operasi domain gagal (mis. AppError / ZodError / pelanggaran constraint SQL),
+ * transaksi utama sudah di-rollback (karena di PostgreSQL error SQL membuat transaksi berstatus aborted).
+ * Fungsi ini mencatat status CONFLICT / REJECTED di transaksi singkat terpisah dengan penanganan P2002.
+ */
+async function recordFailedSyncOperationSeparately(
+	dbClient: PrismaClient,
+	actor: PolicyUser,
+	op: SyncOperationItemInput,
+	clientCreatedAt: Date,
+	err: AppError | ZodError,
+	ip?: string
+): Promise<SyncOperationResultItem> {
+	const isAppErr = err instanceof AppError;
+	const isConflict = isAppErr && CONFLICT_ERROR_CODES.has(err.code);
+	const syncStatus: SyncStatus = isConflict ? 'CONFLICT' : 'REJECTED';
+	const errorCode: ErrorCode = isAppErr ? err.code : 'VALIDATION_ERROR';
+	const reason = isAppErr
+		? err.message
+		: err.issues.map((i) => `${i.path.join('.') || 'payload'}: ${i.message}`).join('; ');
+
+	try {
+		return await dbClient.$transaction(
+			async (errTx) => {
+				await errTx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${op.clientOpId}))`;
+
+				const { record, alreadyExisted } = await saveSyncOperationInTx(errTx, {
+					actorId: actor.id,
+					op,
+					clientCreatedAt,
+					status: syncStatus,
+					conflictReason: reason,
+					ip
+				});
+
+				if (alreadyExisted) {
+					return buildReplayOrHijackResult(record, actor.id, op.type);
+				}
+
+				return {
+					clientOpId: op.clientOpId,
+					type: op.type,
+					status: syncStatus,
+					code: errorCode,
+					conflictReason: reason,
+					...(isAppErr && err.details ? { details: err.details } : {}),
+					idempotentReplay: false,
+					syncOperationId: record.id
+				};
+			},
+			{
+				maxWait: 15000,
+				timeout: 15000
+			}
+		);
+	} catch (recordErr) {
+		if (recordErr instanceof Prisma.PrismaClientKnownRequestError && recordErr.code === 'P2002') {
+			const existing = await dbClient.syncOperation.findUnique({
+				where: { clientOpId: op.clientOpId }
+			});
+			if (existing) {
+				return buildReplayOrHijackResult(existing, actor.id, op.type);
+			}
+		}
+		throw recordErr;
+	}
+}
+
+/**
+ * Memproses satu operasi sinkronisasi dalam SATU transaksi database (1 koneksi per operasi)
+ * di bawah kunci eksklusif PostgreSQL pg_advisory_xact_lock(hashtext(clientOpId)).
+ * Bila operasi gagal, transaksi utama di-rollback penuh lalu hasil CONFLICT/REJECTED dicatat di transaksi singkat terpisah.
  */
 async function processSingleSyncOperationWithLock(
 	actor: PolicyUser,
 	op: SyncOperationItemInput,
 	clientCreatedAt: Date,
-	ip?: string
+	ip?: string,
+	dbClient: PrismaClient = prisma
 ): Promise<SyncOperationResultItem> {
 	try {
-		return await prisma.$transaction(
+		return await dbClient.$transaction(
 			async (lockTx) => {
 				// 1. Kunci eksklusif tingkat transaksi PostgreSQL per clientOpId
 				await lockTx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${op.clientOpId}))`;
@@ -269,98 +340,41 @@ async function processSingleSyncOperationWithLock(
 					return buildReplayOrHijackResult(existingSyncOp, actor.id, op.type);
 				}
 
-				// 3. Eksekusi operasi bisnis selama kunci pg_advisory_xact_lock masih dipegang
-				try {
-					const data = await executeSingleOperation(actor, op, ip);
-					const { record, alreadyExisted } = await saveSyncOperationInTx(lockTx, {
-						actorId: actor.id,
-						op,
-						clientCreatedAt,
-						status: 'ACCEPTED',
-						conflictReason: null,
-						ip
-					});
+				// 3. Eksekusi operasi domain & catat SyncOperation ACCEPTED di dalam transaksi lockTx yang sama (1 koneksi)
+				const data = await executeSingleOperation(actor, op, ip, lockTx);
+				const { record, alreadyExisted } = await saveSyncOperationInTx(lockTx, {
+					actorId: actor.id,
+					op,
+					clientCreatedAt,
+					status: 'ACCEPTED',
+					conflictReason: null,
+					ip
+				});
 
-					return {
-						clientOpId: op.clientOpId,
-						type: op.type,
-						status: record.status,
-						conflictReason: record.conflictReason,
-						idempotentReplay: alreadyExisted,
-						syncOperationId: record.id,
-						data
-					};
-				} catch (err) {
-					if (err instanceof AppError) {
-						const isConflict = CONFLICT_ERROR_CODES.has(err.code);
-						const syncStatus: SyncStatus = isConflict ? 'CONFLICT' : 'REJECTED';
-
-						const { record, alreadyExisted } = await saveSyncOperationInTx(lockTx, {
-							actorId: actor.id,
-							op,
-							clientCreatedAt,
-							status: syncStatus,
-							conflictReason: err.message,
-							ip
-						});
-
-						if (alreadyExisted) {
-							return buildReplayOrHijackResult(record, actor.id, op.type);
-						}
-
-						return {
-							clientOpId: op.clientOpId,
-							type: op.type,
-							status: syncStatus,
-							code: err.code,
-							conflictReason: err.message,
-							...(err.details ? { details: err.details } : {}),
-							idempotentReplay: false,
-							syncOperationId: record.id
-						};
-					}
-
-					if (err instanceof ZodError) {
-						const reason = err.issues
-							.map((i) => `${i.path.join('.') || 'payload'}: ${i.message}`)
-							.join('; ');
-
-						const { record, alreadyExisted } = await saveSyncOperationInTx(lockTx, {
-							actorId: actor.id,
-							op,
-							clientCreatedAt,
-							status: 'REJECTED',
-							conflictReason: reason,
-							ip
-						});
-
-						if (alreadyExisted) {
-							return buildReplayOrHijackResult(record, actor.id, op.type);
-						}
-
-						return {
-							clientOpId: op.clientOpId,
-							type: op.type,
-							status: 'REJECTED',
-							code: 'VALIDATION_ERROR',
-							conflictReason: reason,
-							idempotentReplay: false,
-							syncOperationId: record.id
-						};
-					}
-
-					throw err;
-				}
+				return {
+					clientOpId: op.clientOpId,
+					type: op.type,
+					status: record.status,
+					conflictReason: record.conflictReason,
+					idempotentReplay: alreadyExisted,
+					syncOperationId: record.id,
+					data
+				};
 			},
 			{
-				maxWait: 10000,
+				maxWait: 15000,
 				timeout: 20000
 			}
 		);
 	} catch (err) {
+		// Transaksi lockTx di atas sudah di-rollback penuh dan koneksinya sudah dilepas kembali ke pool.
+		if (err instanceof AppError || err instanceof ZodError) {
+			return recordFailedSyncOperationSeparately(dbClient, actor, op, clientCreatedAt, err, ip);
+		}
+
 		// Pengaman tambahan: bila terjadi pelanggaran unique clientOpId (P2002), kembalikan hasil yang sudah tersimpan
 		if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-			const existing = await prisma.syncOperation.findUnique({
+			const existing = await dbClient.syncOperation.findUnique({
 				where: { clientOpId: op.clientOpId }
 			});
 			if (existing) {
@@ -377,7 +391,8 @@ async function processSingleSyncOperationWithLock(
 export async function processSyncBatch(
 	actor: PolicyUser | null | undefined,
 	input: SyncBatchRequestInput,
-	ip?: string
+	ip?: string,
+	dbClient: PrismaClient = prisma
 ) {
 	if (!actor || actor.isActive === false) {
 		throw new AppError('UNAUTHENTICATED', 'Sesi login tidak valid.');
@@ -407,7 +422,8 @@ export async function processSyncBatch(
 			actor,
 			entry.op,
 			entry.clientCreatedAt,
-			ip
+			ip,
+			dbClient
 		);
 		results.push(itemResult);
 	}
