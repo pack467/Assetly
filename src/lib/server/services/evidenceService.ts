@@ -20,7 +20,8 @@ export async function uploadEvidence(
 		meta: z.infer<typeof uploadEvidenceMetaSchema>;
 		fileBuffer: Buffer;
 	},
-	ip?: string
+	ip?: string,
+	sessionId?: string | null
 ) {
 	assertCan(actor, 'asset:read');
 	const currentUser = actor;
@@ -184,6 +185,17 @@ export async function uploadEvidence(
 					riskReasons: riskEvaluation.riskReasons
 				},
 				ip: ip ?? null
+			});
+
+			// Perbarui Session.lastSeenAt setelah konteks risiko dibaca dan bukti berhasil disimpan (#6)
+			await tx.session.updateMany({
+				where: {
+					...(sessionId ? { id: sessionId } : { userId: currentUser.id }),
+					revokedAt: null
+				},
+				data: {
+					lastSeenAt: receivedAtServer
+				}
 			});
 
 			return evidence;

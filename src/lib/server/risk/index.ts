@@ -401,8 +401,9 @@ export async function loadUserEvidenceRiskContext(
 				userId,
 				revokedAt: null
 			},
-			orderBy: { createdAt: 'desc' },
+			orderBy: [{ lastSeenAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
 			select: {
+				lastSeenAt: true,
 				createdAt: true
 			}
 		})
@@ -415,15 +416,15 @@ export async function loadUserEvidenceRiskContext(
 			)
 		: null;
 
-	const sessionCreatedAt = latestActiveSession?.createdAt ?? null;
+	const sessionSeenAt = latestActiveSession?.lastSeenAt ?? latestActiveSession?.createdAt ?? null;
 	let lastOnlineActivityAt: Date | null = null;
-	if (latestEvidenceEffectiveAt && sessionCreatedAt) {
+	if (latestEvidenceEffectiveAt && sessionSeenAt) {
 		lastOnlineActivityAt =
-			latestEvidenceEffectiveAt.getTime() >= sessionCreatedAt.getTime()
+			latestEvidenceEffectiveAt.getTime() >= sessionSeenAt.getTime()
 				? latestEvidenceEffectiveAt
-				: sessionCreatedAt;
+				: sessionSeenAt;
 	} else {
-		lastOnlineActivityAt = latestEvidenceEffectiveAt ?? sessionCreatedAt;
+		lastOnlineActivityAt = latestEvidenceEffectiveAt ?? sessionSeenAt;
 	}
 
 	return {

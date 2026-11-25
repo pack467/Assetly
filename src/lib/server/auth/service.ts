@@ -54,7 +54,8 @@ export async function loginUser(params: LoginParams) {
 
 	const rawRefreshToken = generateRefreshToken();
 	const refreshTokenHash = hashRefreshToken(rawRefreshToken);
-	const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
+	const now = new Date();
+	const expiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS);
 
 	const session = await prisma.$transaction(async (tx) => {
 		const createdSession = await tx.session.create({
@@ -62,6 +63,8 @@ export async function loginUser(params: LoginParams) {
 				userId: user.id,
 				refreshTokenHash,
 				deviceInfo: params.deviceInfo ?? null,
+				createdAt: now,
+				lastSeenAt: now,
 				expiresAt
 			}
 		});
@@ -128,13 +131,15 @@ export async function refreshUserSession(params: {
 
 	const newRawRefreshToken = generateRefreshToken();
 	const newRefreshTokenHash = hashRefreshToken(newRawRefreshToken);
-	const newExpiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
+	const now = new Date();
+	const newExpiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS);
 
 	const updatedSession = await prisma.$transaction(async (tx) => {
 		const updated = await tx.session.update({
 			where: { id: existingSession.id },
 			data: {
 				refreshTokenHash: newRefreshTokenHash,
+				lastSeenAt: now,
 				expiresAt: newExpiresAt,
 				...(params.deviceInfo ? { deviceInfo: params.deviceInfo } : {})
 			}
@@ -277,4 +282,39 @@ export async function resolveAuthenticatedSession(rawAccessToken: string | null 
 			isActive: session.user.isActive
 		}
 	};
+}
+
+/**
+ * Memperbarui Session.lastSeenAt ketika request terautentikasi (seperti /api/v1/sync atau /api/v1/evidence) berhasil.
+ */
+export async function touchSessionLastSeen(params: {
+	sessionId?: string | null;
+	userId?: string | null;
+	at?: Date;
+}): Promise<void> {
+	const timestamp = params.at ?? new Date();
+	if (params.sessionId) {
+		await prisma.session.updateMany({
+			where: {
+				id: params.sessionId,
+				revokedAt: null
+			},
+			data: {
+				lastSeenAt: timestamp
+			}
+		});
+		return;
+	}
+
+	if (params.userId) {
+		await prisma.session.updateMany({
+			where: {
+				userId: params.userId,
+				revokedAt: null
+			},
+			data: {
+				lastSeenAt: timestamp
+			}
+		});
+	}
 }

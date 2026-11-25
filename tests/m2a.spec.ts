@@ -1046,12 +1046,79 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			expect(returnAuditCount).toBe(1);
 		});
 
-		it('menyimpan rawClockSkewSec dan offlineDelaySec di tabel Evidence serta menetapkan LoanItem.returnedAt memakai waktu server (bukan takenAtDevice mentah) (#6)', async () => {
+		it('menggunakan Session.lastSeenAt (bukan createdAt sesi lama) untuk menangkap pemunduran jam HP pada sesi berumur 3 hari (lastSeenAt 5 menit lalu -> CLOCK_SKEW_LARGE) dan meloloskan foto offline jujur 2 jam pada sesi lama (lastSeenAt 2 jam lalu -> NORMAL) (#6)', async () => {
 			const suffix = randomUUID().slice(0, 8);
-			// Buat pengguna baru tanpa aktivitas online sebelumnya dalam 2 jam terakhir
-			const offlineUserRow = await prisma.user.create({
+			const threeDaysAgo = new Date(Date.now() - 3 * 86400 * 1000);
+			const twoHoursAgo = new Date(Date.now() - 2 * 3600 * 1000);
+			const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+
+			// A. Skenario 1: Pengguna memundurkan jam HP saat online pada sesi yang sudah berumur 3 hari,
+			//    tetapi baru saja aktif online 5 menit lalu (Session.lastSeenAt = 5 menit lalu).
+			const spoofUserRow = await prisma.user.create({
 				data: {
-					name: 'Petugas Gudang Offline',
+					name: 'Pengguna Sesi Lama Rewind Jam',
+					email: `m2a-spoof-oldsession-${suffix}@example.com`,
+					passwordHash: 'hash',
+					role: 'BORROWER',
+					isActive: true
+				}
+			});
+			const spoofActor: PolicyUser = {
+				id: spoofUserRow.id,
+				role: 'BORROWER',
+				isActive: true
+			};
+
+			const spoofSession = await prisma.session.create({
+				data: {
+					userId: spoofUserRow.id,
+					refreshTokenHash: `hash-spoof-${randomUUID()}`,
+					createdAt: threeDaysAgo,
+					lastSeenAt: fiveMinutesAgo,
+					expiresAt: new Date(Date.now() + 27 * 86400 * 1000)
+				}
+			});
+
+			const spoofUploaded = await uploadEvidence(
+				spoofActor,
+				{
+					meta: {
+						purpose: 'CHECKOUT',
+						captureSource: 'CAMERA',
+						takenAtDevice: twoHoursAgo.toISOString(),
+						uploadedAtDevice: new Date().toISOString(),
+						gpsAvailable: true,
+						latitude: -6.2,
+						longitude: 106.8166,
+						accuracyM: 10,
+						isMockLocation: false,
+						locationId: location1Id
+					},
+					fileBuffer: VALID_JPEG_BUFFER
+				},
+				undefined,
+				spoofSession.id
+			);
+
+			// Meskipun Session.createdAt berumur 3 hari, Session.lastSeenAt adalah 5 menit lalu,
+			// sehingga klaim offline 2 jam dibatasi maksimal ~20 menit (5m + 15m toleransi) dan sisanya (~6000s) tetap CLOCK_SKEW_LARGE!
+			expect(spoofUploaded.evidence.riskLevel).toBe('SUSPICIOUS');
+			expect(spoofUploaded.evidence.riskReasons).toContain('CLOCK_SKEW_LARGE');
+			expect(spoofUploaded.evidence.offlineDelaySec).toBeLessThanOrEqual(1210);
+			expect(spoofUploaded.evidence.clockSkewSec).toBeGreaterThanOrEqual(5980);
+
+			// Pastikan Session.lastSeenAt diperbarui setelah request /api/v1/evidence berhasil
+			const updatedSpoofSession = await prisma.session.findUniqueOrThrow({
+				where: { id: spoofSession.id }
+			});
+			expect(updatedSpoofSession.lastSeenAt!.getTime()).toBeGreaterThan(
+				fiveMinutesAgo.getTime() + 4 * 60 * 1000
+			);
+
+			// B. Skenario 2: Sesi lama (createdAt 3 hari lalu) + foto offline jujur 2 jam dengan Session.lastSeenAt = 2 jam lalu -> NORMAL
+			const honestUserRow = await prisma.user.create({
+				data: {
+					name: 'Petugas Gudang Offline Sesi Lama',
 					email: `m2a-offline-${suffix}@example.com`,
 					passwordHash: 'hash',
 					role: 'BORROWER',
@@ -1059,10 +1126,20 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				}
 			});
 			const offlineActor: PolicyUser = {
-				id: offlineUserRow.id,
+				id: honestUserRow.id,
 				role: 'BORROWER',
 				isActive: true
 			};
+
+			const honestOldSession = await prisma.session.create({
+				data: {
+					userId: honestUserRow.id,
+					refreshTokenHash: `hash-honest-${randomUUID()}`,
+					createdAt: threeDaysAgo,
+					lastSeenAt: twoHoursAgo,
+					expiresAt: new Date(Date.now() + 27 * 86400 * 1000)
+				}
+			});
 
 			const offlineAsset = await prisma.asset.create({
 				data: {
@@ -1074,25 +1151,30 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				}
 			});
 
-			const checkoutTakenAt = new Date(Date.now() - 2 * 3600 * 1000); // 2 jam lalu
 			const checkoutUploadedAt = new Date();
-			const uploadedCheckout = await uploadEvidence(offlineActor, {
-				meta: {
-					purpose: 'CHECKOUT',
-					captureSource: 'CAMERA',
-					takenAtDevice: checkoutTakenAt.toISOString(),
-					uploadedAtDevice: checkoutUploadedAt.toISOString(),
-					gpsAvailable: true,
-					latitude: -6.2,
-					longitude: 106.8166,
-					accuracyM: 10,
-					isMockLocation: false,
-					locationId: location1Id
+			const uploadedCheckout = await uploadEvidence(
+				offlineActor,
+				{
+					meta: {
+						purpose: 'CHECKOUT',
+						captureSource: 'CAMERA',
+						takenAtDevice: twoHoursAgo.toISOString(),
+						uploadedAtDevice: checkoutUploadedAt.toISOString(),
+						gpsAvailable: true,
+						latitude: -6.2,
+						longitude: 106.8166,
+						accuracyM: 10,
+						isMockLocation: false,
+						locationId: location1Id
+					},
+					fileBuffer: VALID_JPEG_BUFFER
 				},
-				fileBuffer: VALID_JPEG_BUFFER
-			});
+				undefined,
+				honestOldSession.id
+			);
 
 			expect(uploadedCheckout.evidence.riskLevel).toBe('NORMAL');
+			expect(uploadedCheckout.evidence.riskReasons).toEqual([]);
 			expect(uploadedCheckout.evidence.clockSkewSec).toBeLessThanOrEqual(5);
 			expect(uploadedCheckout.evidence.rawClockSkewSec).toBeGreaterThanOrEqual(7195);
 			expect(uploadedCheckout.evidence.offlineDelaySec).toBeGreaterThanOrEqual(7195);
@@ -1105,24 +1187,34 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			});
 			const loanItemId = createdLoan.loan.items[0].id;
 
-			// Foto pengembalian diambil offline 1 jam lalu (lebih baru dari foto pinjam 2 jam lalu), diunggah sekarang
-			const returnTakenAt = new Date(Date.now() - 3600 * 1000);
-			const beforeReturnServerMs = Date.now();
-			const uploadedReturn = await uploadEvidence(offlineActor, {
-				meta: {
-					purpose: 'RETURN',
-					captureSource: 'CAMERA',
-					takenAtDevice: returnTakenAt.toISOString(),
-					uploadedAtDevice: new Date().toISOString(),
-					gpsAvailable: true,
-					latitude: -6.2,
-					longitude: 106.8166,
-					accuracyM: 10,
-					isMockLocation: false,
-					locationId: location1Id
-				},
-				fileBuffer: VALID_JPEG_BUFFER
+			// Simulasikan petugas kembali offline selama 1 jam berikutnya (lastSeenAt adalah 1 jam lalu)
+			const oneHourAgo = new Date(Date.now() - 3600 * 1000);
+			await prisma.session.update({
+				where: { id: honestOldSession.id },
+				data: { lastSeenAt: oneHourAgo }
 			});
+
+			const beforeReturnServerMs = Date.now();
+			const uploadedReturn = await uploadEvidence(
+				offlineActor,
+				{
+					meta: {
+						purpose: 'RETURN',
+						captureSource: 'CAMERA',
+						takenAtDevice: oneHourAgo.toISOString(),
+						uploadedAtDevice: new Date().toISOString(),
+						gpsAvailable: true,
+						latitude: -6.2,
+						longitude: 106.8166,
+						accuracyM: 10,
+						isMockLocation: false,
+						locationId: location1Id
+					},
+					fileBuffer: VALID_JPEG_BUFFER
+				},
+				undefined,
+				honestOldSession.id
+			);
 
 			expect(uploadedReturn.evidence.riskLevel).toBe('NORMAL');
 			expect(uploadedReturn.evidence.rawClockSkewSec).toBeGreaterThanOrEqual(3595);
@@ -1139,7 +1231,7 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				beforeReturnServerMs - 1000
 			);
 			expect(returned.loanItem.returnedAt!.getTime()).toBeGreaterThan(
-				returnTakenAt.getTime() + 3500 * 1000
+				oneHourAgo.getTime() + 3500 * 1000
 			);
 		});
 	});

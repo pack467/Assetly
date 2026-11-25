@@ -401,11 +401,23 @@ export async function processSyncBatch(
 	actor: PolicyUser | null | undefined,
 	input: SyncBatchRequestInput,
 	ip?: string,
-	dbClient: PrismaClient = prisma
+	dbClient: PrismaClient = prisma,
+	sessionId?: string | null
 ) {
 	if (!actor || actor.isActive === false) {
 		throw new AppError('UNAUTHENTICATED', 'Sesi login tidak valid.');
 	}
+
+	// Perbarui Session.lastSeenAt saat request /api/v1/sync berhasil terautentikasi (#6)
+	await dbClient.session.updateMany({
+		where: {
+			...(sessionId ? { id: sessionId } : { userId: actor.id }),
+			revokedAt: null
+		},
+		data: {
+			lastSeenAt: new Date()
+		}
+	});
 
 	// Bagian 10.2: Server memproses operasi per pengguna berdasarkan clientCreatedAt
 	const indexedOps = input.operations.map((op, index) => {

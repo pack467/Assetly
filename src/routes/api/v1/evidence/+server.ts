@@ -40,7 +40,12 @@ export const POST: RequestHandler = async (event) => {
 				mimeType: filePart.type || 'image/jpeg'
 			});
 
-			const result = await uploadEvidence(event.locals.user, { meta, fileBuffer }, ip);
+			const result = await uploadEvidence(
+				event.locals.user,
+				{ meta, fileBuffer },
+				ip,
+				event.locals.sessionId
+			);
 			return json(result, { status: 201 });
 		}
 
@@ -56,7 +61,12 @@ export const POST: RequestHandler = async (event) => {
 		const cleanedBase64 = meta.imageBase64.replace(/^data:image\/\w+;base64,/, '');
 		const fileBuffer = Buffer.from(cleanedBase64, 'base64');
 
-		const result = await uploadEvidence(event.locals.user, { meta, fileBuffer }, ip);
+		const result = await uploadEvidence(
+			event.locals.user,
+			{ meta, fileBuffer },
+			ip,
+			event.locals.sessionId
+		);
 		return json(result, { status: 201 });
 	} catch (err) {
 		return toErrorResponse(err);

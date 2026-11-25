@@ -126,6 +126,7 @@ model Session {
   refreshTokenHash String    @unique
   deviceInfo       String?
   createdAt        DateTime  @default(now())
+  lastSeenAt       DateTime? @default(now())
   expiresAt        DateTime
   revokedAt        DateTime? // admin bisa mencabut sesi (HP hilang)
 

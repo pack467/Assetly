@@ -31,7 +31,13 @@ export const POST: RequestHandler = async (event) => {
 		const body = await event.request.json();
 		const parsed = syncBatchRequestSchema.parse(body);
 		const ip = event.getClientAddress?.() ?? undefined;
-		const result = await processSyncBatch(event.locals.user, parsed, ip);
+		const result = await processSyncBatch(
+			event.locals.user,
+			parsed,
+			ip,
+			undefined,
+			event.locals.sessionId
+		);
 		return json(result);
 	} catch (err) {
 		return toErrorResponse(err);
