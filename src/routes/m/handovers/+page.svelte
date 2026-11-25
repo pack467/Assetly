@@ -1,12 +1,16 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { mobileApi } from '$lib/client/api';
+	import { getOfflineQueueStorage } from '$lib/client/offlineQueue';
+	import { enqueueOfflineOperation, syncPendingOperations } from '$lib/client/syncManager';
 	import {
 		computeCompressedDimensions,
 		DEFAULT_JPEG_QUALITY,
 		drawWatermarkToContext,
+		findNearestLocation,
 		formatFriendlyErrorMessage,
-		formatWatermarkLines
+		formatWatermarkLines,
+		type LocationCandidate
 	} from '$lib/shared/mobile/watermark';
 
 	interface Participant {
@@ -54,12 +58,13 @@
 	let handovers = $state<HandoverRecord[]>([]);
 	let participants = $state<Participant[]>([]);
 	let activeLoans = $state<ActiveLoanOption[]>([]);
-	let locations = $state<Array<{ id: string; name: string }>>([]);
+	let locations = $state<LocationCandidate[]>([]);
 	let currentUserId = $state('');
 	let currentUserName = $state('Pengguna');
 	let loading = $state(true);
 	let errorMsg = $state('');
 	let successMsg = $state('');
+	let queuedMsg = $state('');
 
 	// Form buat serah terima baru
 	let showCreateForm = $state(false);
@@ -68,6 +73,14 @@
 	let selectedLocationId = $state('');
 	let submitting = $state(false);
 
+	// State GPS untuk foto bukti serah terima (Bagian 7.1 & 7.2)
+	let gpsLoading = $state(false);
+	let gpsAvailable = $state(false);
+	let latitude = $state<number | null>(null);
+	let longitude = $state<number | null>(null);
+	let accuracyM = $state<number | null>(null);
+	let gpsMessage = $state('Belum mengambil titik GPS.');
+
 	// Kamera bukti serah terima (opsional, hanya kamera langsung - BR-04)
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	let cameraOpen = $state(false);
@@ -75,6 +88,50 @@
 	let stream: MediaStream | null = null;
 	let capturedDataUrl = $state<string | null>(null);
 	let capturedTakenAt = $state<string | null>(null);
+
+	function acquireGpsOnce() {
+		if (typeof navigator === 'undefined' || !navigator.geolocation) {
+			gpsAvailable = false;
+			gpsMessage =
+				'GPS tidak didukung oleh browser ini. Pilih Lokasi Serah Terima di bawah (BR-06).';
+			return;
+		}
+
+		gpsLoading = true;
+		gpsMessage = 'Mengambil koordinat GPS...';
+
+		navigator.geolocation.getCurrentPosition(
+			(pos) => {
+				gpsLoading = false;
+				gpsAvailable = true;
+				latitude = pos.coords.latitude;
+				longitude = pos.coords.longitude;
+				accuracyM = pos.coords.accuracy;
+				gpsMessage = `GPS Terkunci: ${latitude.toFixed(5)}, ${longitude.toFixed(5)} (±${Math.round(accuracyM)} m)`;
+
+				if (locations.length > 0 && latitude !== null && longitude !== null) {
+					const nearest = findNearestLocation(latitude, longitude, locations);
+					if (nearest) {
+						selectedLocationId = nearest.location.id;
+					}
+				}
+			},
+			() => {
+				gpsLoading = false;
+				gpsAvailable = false;
+				latitude = null;
+				longitude = null;
+				accuracyM = null;
+				gpsMessage =
+					'Sinyal GPS tidak terbaca / ditolak. Pekerjaan tidak diblokir — pilih Lokasi Resmi di bawah (BR-06).';
+			},
+			{
+				enableHighAccuracy: true,
+				timeout: 8000,
+				maximumAge: 30000
+			}
+		);
+	}
 
 	async function loadData() {
 		loading = true;
@@ -119,8 +176,48 @@
 					selectedLocationId = locations[0].id;
 				}
 			}
+
+			try {
+				sessionStorage.setItem(
+					'itam_handovers_cache',
+					JSON.stringify({
+						currentUserId,
+						currentUserName,
+						handovers,
+						participants,
+						activeLoans,
+						locations
+					})
+				);
+			} catch {
+				// Abaikan bila storage penuh
+			}
 		} catch {
-			errorMsg = 'Gagal memuat data serah terima.';
+			try {
+				const cached = sessionStorage.getItem('itam_handovers_cache');
+				if (cached) {
+					const parsed = JSON.parse(cached);
+					currentUserId = parsed.currentUserId ?? '';
+					currentUserName = parsed.currentUserName ?? 'Pengguna';
+					handovers = parsed.handovers ?? [];
+					participants = parsed.participants ?? [];
+					activeLoans = parsed.activeLoans ?? [];
+					locations = parsed.locations ?? [];
+					if (!selectedReceiverId && participants.length > 0) {
+						selectedReceiverId = participants[0].id;
+					}
+					if (!selectedLoanId && activeLoans.length > 0) {
+						selectedLoanId = activeLoans[0].id;
+					}
+					if (!selectedLocationId && locations.length > 0) {
+						selectedLocationId = locations[0].id;
+					}
+					return;
+				}
+			} catch {
+				// Abaikan
+			}
+			errorMsg = 'Gagal memuat data serah terima. Periksa koneksi internet HP Anda.';
 		} finally {
 			loading = false;
 		}
@@ -185,7 +282,10 @@
 			assetCode: firstItem?.code ?? '-',
 			userName: currentUserName,
 			takenAt: now,
-			gpsAvailable: false,
+			gpsAvailable,
+			latitude,
+			longitude,
+			accuracyM,
 			locationName: locName
 		});
 
@@ -199,52 +299,75 @@
 		e.preventDefault();
 		errorMsg = '';
 		successMsg = '';
+		queuedMsg = '';
 
 		if (!selectedLoanId || !selectedReceiverId) {
 			errorMsg = 'Pilih peminjaman aktif dan pihak penerima terlebih dahulu.';
 			return;
 		}
 
+		if (capturedDataUrl && !gpsAvailable && !selectedLocationId) {
+			errorMsg = 'Karena GPS tidak tersedia, pilih Lokasi Serah Terima dari daftar (BR-06).';
+			return;
+		}
+
+		const loan = activeLoans.find((l) => l.id === selectedLoanId);
+		const firstAsset = loan?.items[0]?.asset;
+		const receiver = participants.find((p) => p.id === selectedReceiverId);
+
 		submitting = true;
 		try {
-			let evidenceId: string | null = null;
-			if (capturedDataUrl && capturedTakenAt) {
-				const evRes = await mobileApi.post('/api/v1/evidence', {
-					purpose: 'HANDOVER',
-					captureSource: 'CAMERA',
-					takenAtDevice: capturedTakenAt,
-					gpsAvailable: false,
-					isMockLocation: false,
-					locationId: selectedLocationId || null,
-					imageBase64: capturedDataUrl,
-					mimeType: 'image/jpeg'
-				});
-				const evData = await evRes.json();
-				if (!evRes.ok) {
-					errorMsg = formatFriendlyErrorMessage(evData, 'Gagal mengunggah foto bukti.');
-					return;
-				}
-				evidenceId = evData.evidence.id;
-			}
-
-			const res = await mobileApi.post('/api/v1/handovers', {
-				loanId: selectedLoanId,
-				giverId: currentUserId,
-				receiverId: selectedReceiverId,
-				evidenceId,
-				autoConfirmGiver: true
+			const queued = await enqueueOfflineOperation({
+				type: 'HANDOVER_CREATE',
+				label: `Serah Terima ${firstAsset?.code ?? 'Pinjaman'} ke ${receiver?.name ?? 'Penerima'}`,
+				assetCode: firstAsset?.code ?? null,
+				assetName: firstAsset?.name ?? null,
+				payload: {
+					loanId: selectedLoanId,
+					giverId: currentUserId || undefined,
+					receiverId: selectedReceiverId,
+					autoConfirmGiver: true
+				},
+				pendingEvidence:
+					capturedDataUrl && capturedTakenAt
+						? {
+								purpose: 'HANDOVER',
+								captureSource: 'CAMERA',
+								takenAtDevice: capturedTakenAt,
+								gpsAvailable,
+								latitude: gpsAvailable ? latitude : null,
+								longitude: gpsAvailable ? longitude : null,
+								accuracyM: gpsAvailable ? accuracyM : null,
+								isMockLocation: false,
+								locationId: selectedLocationId || null,
+								imageBase64: capturedDataUrl,
+								mimeType: 'image/jpeg'
+							}
+						: null
 			});
-			const data = await res.json();
-			if (!res.ok) {
-				errorMsg = formatFriendlyErrorMessage(data, 'Gagal membuat serah terima.');
-				return;
-			}
 
-			successMsg =
-				'Serah terima berhasil dibuat dan dikonfirmasi oleh Anda sebagai Pemberi. Menunggu konfirmasi Penerima.';
-			showCreateForm = false;
-			capturedDataUrl = null;
-			await loadData();
+			await syncPendingOperations({ force: true });
+			const latest = await getOfflineQueueStorage().getById(queued.clientOpId);
+
+			if (latest?.syncState === 'ACCEPTED') {
+				successMsg =
+					'Serah terima berhasil dibuat dan dikonfirmasi oleh Anda sebagai Pemberi. Menunggu konfirmasi Penerima.';
+				showCreateForm = false;
+				capturedDataUrl = null;
+				await loadData();
+			} else if (latest?.syncState === 'CONFLICT' || latest?.syncState === 'REJECTED') {
+				errorMsg =
+					latest.conflictReason ||
+					latest.lastError ||
+					'Serah terima tidak dapat diproses karena terjadi konflik di server.';
+			} else {
+				queuedMsg =
+					'Tersimpan di Antrean Lokal HP! Data serah terima beserta foto bukti sudah aman di HP dan akan dikirim otomatis begitu sinyal kembali.';
+				showCreateForm = false;
+				capturedDataUrl = null;
+			}
+		} catch {
+			errorMsg = 'Gagal menyimpan serah terima ke antrean lokal HP.';
 		} finally {
 			submitting = false;
 		}
@@ -253,19 +376,33 @@
 	async function handleConfirmHandover(handoverId: string) {
 		errorMsg = '';
 		successMsg = '';
-		const res = await mobileApi.post(`/api/v1/handovers/${handoverId}/confirm`, {});
-		const data = await res.json();
-		if (!res.ok) {
-			errorMsg = formatFriendlyErrorMessage(data, 'Gagal mengonfirmasi serah terima.');
+		queuedMsg = '';
+
+		if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+			errorMsg =
+				'HP Anda sedang offline. Konfirmasi serah terima oleh pihak kedua memerlukan koneksi internet aktif untuk memverifikasi status pinjaman terbaru dan menerbitkan Nomor Berita Acara resmi di server.';
 			return;
 		}
-		successMsg = data.handover.isConfirmed
-			? `Serah terima lengkap dikonfirmasi dua pihak! Nomor BA: ${data.handover.documentNo}`
-			: 'Konfirmasi Anda berhasil dicatat.';
-		await loadData();
+
+		try {
+			const res = await mobileApi.post(`/api/v1/handovers/${handoverId}/confirm`, {});
+			const data = await res.json();
+			if (!res.ok) {
+				errorMsg = formatFriendlyErrorMessage(data, 'Gagal mengonfirmasi serah terima.');
+				return;
+			}
+			successMsg = data.handover.isConfirmed
+				? `Serah terima lengkap dikonfirmasi dua pihak! Nomor BA: ${data.handover.documentNo}`
+				: 'Konfirmasi Anda berhasil dicatat.';
+			await loadData();
+		} catch {
+			errorMsg =
+				'Tidak dapat terhubung ke server untuk mengonfirmasi serah terima. Pastikan HP terhubung ke internet lalu tekan Konfirmasi kembali.';
+		}
 	}
 
 	onMount(() => {
+		acquireGpsOnce();
 		loadData();
 	});
 
@@ -294,6 +431,19 @@
 		</button>
 	</div>
 
+	{#if queuedMsg}
+		<div
+			class="rounded-2xl border-2 border-amber-300 bg-amber-50 p-4 text-sm font-bold text-amber-950"
+		>
+			<div>{queuedMsg}</div>
+			<div class="mt-2">
+				<a href="/m/sync" class="text-xs font-bold text-amber-900 underline">
+					Lihat Antrean Sinkronisasi (/m/sync) →
+				</a>
+			</div>
+		</div>
+	{/if}
+
 	{#if errorMsg}
 		<div class="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-700">
 			{errorMsg}
@@ -312,7 +462,24 @@
 			onsubmit={handleCreateHandover}
 			class="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-2xs"
 		>
-			<h2 class="text-base font-bold text-slate-900">Buat Serah Terima Dua Pihak</h2>
+			<div class="flex items-center justify-between">
+				<h2 class="text-base font-bold text-slate-900">Buat Serah Terima Dua Pihak</h2>
+				<button
+					type="button"
+					onclick={acquireGpsOnce}
+					class="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700"
+				>
+					{gpsLoading ? 'Mencari GPS...' : 'Segarkan GPS'}
+				</button>
+			</div>
+
+			<div
+				class="rounded-xl border p-3 text-xs {gpsAvailable
+					? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+					: 'border-amber-200 bg-amber-50 text-amber-900'}"
+			>
+				{gpsMessage}
+			</div>
 
 			<div>
 				<label for="ho-loan" class="block text-sm font-bold text-slate-800">
@@ -354,9 +521,9 @@
 			</div>
 
 			<div>
-				<label for="ho-loc" class="block text-sm font-bold text-slate-800"
-					>Lokasi Serah Terima</label
-				>
+				<label for="ho-loc" class="block text-sm font-bold text-slate-800">
+					Lokasi Serah Terima
+				</label>
 				<select
 					id="ho-loc"
 					bind:value={selectedLocationId}
@@ -371,7 +538,7 @@
 			<!-- KAMERA BUKTI SERAH TERIMA OPSIONAL (HANYA KAMERA LANGSUNG) -->
 			<div class="space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-3">
 				<div class="text-xs font-bold text-slate-700">
-					Foto Bukti Serah Terima (Opsional, Kamera Langsung)
+					Foto Bukti Serah Terima (Opsional, Kamera Langsung + GPS Watermark)
 				</div>
 				{#if cameraError}
 					<div class="text-xs text-red-700">{cameraError}</div>

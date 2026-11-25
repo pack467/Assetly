@@ -1,6 +1,8 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { mobileApi } from '$lib/client/api';
+	import { getOfflineQueueStorage, subscribeOfflineQueue } from '$lib/client/offlineQueue';
+	import { enqueueOfflineOperation, syncPendingOperations } from '$lib/client/syncManager';
 	import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
 
 	interface OutstandingLoanItem {
@@ -52,11 +54,25 @@
 	let loading = $state(true);
 	let errorMsg = $state('');
 	let successMsg = $state('');
+	let queuedMsg = $state('');
+	let unsyncedAssetOpsCount = $state(0);
 
 	let openNote = $state('');
 	let closeNote = $state('');
 	let reasonsByLoanItemId = $state<Record<string, string>>({});
 	let submitting = $state(false);
+	let unsubscribeQueue: (() => void) | null = null;
+
+	async function checkUnsyncedAssetOps(): Promise<number> {
+		const all = await getOfflineQueueStorage().listAll();
+		const count = all.filter(
+			(op) =>
+				(op.syncState === 'PENDING' || op.syncState === 'SYNCING') &&
+				(op.type === 'LOAN_CREATE' || op.type === 'LOAN_RETURN' || op.type === 'HANDOVER_CREATE')
+		).length;
+		unsyncedAssetOpsCount = count;
+		return count;
+	}
 
 	async function loadShiftState() {
 		loading = true;
@@ -80,8 +96,38 @@
 				initialReasons[item.loanItemId] = reasonsByLoanItemId[item.loanItemId] || '';
 			}
 			reasonsByLoanItemId = initialReasons;
+
+			try {
+				sessionStorage.setItem(
+					'itam_shift_state_cache',
+					JSON.stringify({
+						currentShift,
+						outstandingItems,
+						previousClosedShift
+					})
+				);
+			} catch {
+				// Abaikan bila storage penuh
+			}
 		} catch {
-			errorMsg = 'Gagal memuat status shift.';
+			try {
+				const cached = sessionStorage.getItem('itam_shift_state_cache');
+				if (cached) {
+					const parsed = JSON.parse(cached);
+					currentShift = parsed.currentShift ?? null;
+					outstandingItems = parsed.outstandingItems ?? [];
+					previousClosedShift = parsed.previousClosedShift ?? null;
+					const initialReasons: Record<string, string> = {};
+					for (const item of outstandingItems) {
+						initialReasons[item.loanItemId] = reasonsByLoanItemId[item.loanItemId] || '';
+					}
+					reasonsByLoanItemId = initialReasons;
+					return;
+				}
+			} catch {
+				// Abaikan
+			}
+			errorMsg = 'Gagal memuat status shift. Periksa koneksi internet Anda.';
 		} finally {
 			loading = false;
 		}
@@ -91,19 +137,34 @@
 		e.preventDefault();
 		errorMsg = '';
 		successMsg = '';
+		queuedMsg = '';
 		submitting = true;
 		try {
-			const res = await mobileApi.post('/api/v1/shifts/open', {
-				note: openNote.trim() || null
+			const queued = await enqueueOfflineOperation({
+				type: 'SHIFT_OPEN',
+				label: 'Buka Shift Kerja Petugas',
+				payload: {
+					note: openNote.trim() || null
+				}
 			});
-			const data = await res.json();
-			if (!res.ok) {
-				errorMsg = formatFriendlyErrorMessage(data, 'Gagal membuka shift.');
-				return;
+
+			await syncPendingOperations({ force: true });
+			const latest = await getOfflineQueueStorage().getById(queued.clientOpId);
+
+			if (latest?.syncState === 'ACCEPTED') {
+				successMsg = 'Shift kerja berhasil dibuka dan tersinkron ke server.';
+				openNote = '';
+				await loadShiftState();
+			} else if (latest?.syncState === 'CONFLICT' || latest?.syncState === 'REJECTED') {
+				errorMsg =
+					latest.conflictReason || latest.lastError || 'Gagal membuka shift kerja di server.';
+			} else {
+				queuedMsg =
+					'Tersimpan di Antrean Lokal HP! Pembukaan shift akan dikirim otomatis ke server saat sinyal kembali.';
+				openNote = '';
 			}
-			successMsg = 'Shift kerja berhasil dibuka.';
-			openNote = '';
-			await loadShiftState();
+		} catch {
+			errorMsg = 'Gagal menyimpan pembukaan shift ke antrean lokal HP.';
 		} finally {
 			submitting = false;
 		}
@@ -114,6 +175,14 @@
 		if (!currentShift) return;
 		errorMsg = '';
 		successMsg = '';
+		queuedMsg = '';
+
+		// Pastikan tidak ada transaksi pinjam/kembali offline di HP ini yang belum punya loanItemId server
+		const pendingAssetOps = await checkUnsyncedAssetOps();
+		if (pendingAssetOps > 0) {
+			errorMsg = `Masih terdapat ${pendingAssetOps} transaksi barang offline di HP ini yang belum tersinkron ke server (belum memiliki ID server). Silakan buka menu Sinkron (/m/sync) dan sinkronkan terlebih dahulu sebelum menutup shift.`;
+			return;
+		}
 
 		// Validasi lokal awal agar pengguna tahu barang mana yang belum diisi alasannya
 		for (const item of outstandingItems) {
@@ -126,32 +195,60 @@
 
 		submitting = true;
 		try {
-			const res = await mobileApi.post(`/api/v1/shifts/${currentShift.id}/close`, {
-				note: closeNote.trim() || null,
-				items: outstandingItems.map((item) => ({
-					loanItemId: item.loanItemId,
-					reason: (reasonsByLoanItemId[item.loanItemId] || '').trim(),
-					responsibleUserId: item.defaultResponsibleUserId
-				}))
+			const queued = await enqueueOfflineOperation({
+				type: 'SHIFT_CLOSE',
+				label: `Tutup Shift Kerja (${outstandingItems.length} barang keluar)`,
+				payload: {
+					shiftId: currentShift.id,
+					note: closeNote.trim() || null,
+					items: outstandingItems.map((item) => ({
+						loanItemId: item.loanItemId,
+						reason: (reasonsByLoanItemId[item.loanItemId] || '').trim(),
+						responsibleUserId: item.defaultResponsibleUserId
+					}))
+				}
 			});
-			const data = await res.json();
-			if (!res.ok) {
-				errorMsg = formatFriendlyErrorMessage(data, 'Gagal menutup shift.');
-				return;
+
+			await syncPendingOperations({ force: true });
+			const latest = await getOfflineQueueStorage().getById(queued.clientOpId);
+
+			if (latest?.syncState === 'ACCEPTED') {
+				successMsg =
+					outstandingItems.length > 0
+						? `Shift berhasil ditutup dengan mencatat ${outstandingItems.length} barang yang masih keluar.`
+						: 'Shift berhasil ditutup dengan bersih (semua barang telah kembali).';
+				closeNote = '';
+				await loadShiftState();
+			} else if (latest?.syncState === 'CONFLICT' || latest?.syncState === 'REJECTED') {
+				errorMsg =
+					latest.conflictReason ||
+					latest.lastError ||
+					'Penutupan shift ditolak server (kemungkinan ada barang keluar baru yang belum diberi alasan). Muat ulang halaman ini.';
+			} else {
+				queuedMsg =
+					'Tersimpan di Antrean Lokal HP! Data penutupan shift dan alasan per barang sudah aman di HP serta akan dikirim otomatis saat sinyal kembali.';
+				closeNote = '';
 			}
-			successMsg =
-				outstandingItems.length > 0
-					? `Shift berhasil ditutup dengan mencatat ${outstandingItems.length} barang yang masih keluar.`
-					: 'Shift berhasil ditutup dengan bersih (semua barang telah kembali).';
-			closeNote = '';
-			await loadShiftState();
+		} catch {
+			errorMsg = 'Gagal menyimpan penutupan shift ke antrean lokal HP.';
 		} finally {
 			submitting = false;
 		}
 	}
 
 	onMount(() => {
+		unsubscribeQueue = subscribeOfflineQueue(() => {
+			checkUnsyncedAssetOps();
+		});
+		checkUnsyncedAssetOps();
 		loadShiftState();
+	});
+
+	onDestroy(() => {
+		if (unsubscribeQueue) {
+			unsubscribeQueue();
+			unsubscribeQueue = null;
+		}
 	});
 </script>
 
@@ -163,6 +260,34 @@
 			alasan (Bagian 7.4 & BR-12).
 		</p>
 	</div>
+
+	{#if unsyncedAssetOpsCount > 0}
+		<div
+			class="rounded-2xl border-2 border-amber-300 bg-amber-50 p-4 text-xs font-medium text-amber-950"
+		>
+			<div class="font-extrabold">
+				Perhatian Sebelum Tutup Shift ({unsyncedAssetOpsCount} Transaksi Offline Belum Terkirim)
+			</div>
+			<p class="mt-1">
+				HP ini masih menyimpan transaksi pinjam/kembali/serah terima offline yang belum memiliki ID
+				server. Sinkronkan terlebih dahulu di
+				<a href="/m/sync" class="font-bold underline">Menu Sinkron (/m/sync)</a> sebelum menutup shift.
+			</p>
+		</div>
+	{/if}
+
+	{#if queuedMsg}
+		<div
+			class="rounded-2xl border-2 border-amber-300 bg-amber-50 p-4 text-sm font-bold text-amber-950"
+		>
+			<div>{queuedMsg}</div>
+			<div class="mt-2">
+				<a href="/m/sync" class="text-xs font-bold text-amber-900 underline">
+					Lihat Antrean Sinkronisasi (/m/sync) →
+				</a>
+			</div>
+		</div>
+	{/if}
 
 	{#if errorMsg}
 		<div class="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-700">
@@ -347,7 +472,7 @@
 
 				<button
 					type="submit"
-					disabled={submitting}
+					disabled={submitting || unsyncedAssetOpsCount > 0}
 					class="w-full rounded-xl bg-slate-900 py-4 text-base font-extrabold text-white active:bg-slate-800 disabled:opacity-50"
 				>
 					{submitting ? 'Menutup Shift...' : 'TUTUP SHIFT SEKARANG'}

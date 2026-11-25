@@ -412,4 +412,141 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 			expect(content).not.toMatch(/\bfetch\s*\(/);
 		}
 	});
+
+	it('6. menyinkronkan HANDOVER_CREATE (dengan foto bukti ber-GPS) serta SHIFT_OPEN dan SHIFT_CLOSE lewat antrean offline', async () => {
+		const tokenStorage = createMemoryTokenStorage({
+			accessToken: 'valid-access-token',
+			refreshToken: 'valid-refresh-token'
+		});
+
+		const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+		const mockFetch: typeof fetch = async (input, init) => {
+			const url = String(input);
+			const parsedBody = init?.body
+				? (JSON.parse(String(init.body)) as Record<string, unknown>)
+				: {};
+			calls.push({ url, body: parsedBody });
+
+			if (url.endsWith('/api/v1/evidence')) {
+				return new Response(
+					JSON.stringify({
+						evidence: {
+							id: '77777777-6666-4555-8444-333333333333'
+						}
+					}),
+					{ status: 201, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+
+			if (url.endsWith('/api/v1/sync')) {
+				const ops = parsedBody.operations as Array<{ clientOpId: string; type: string }>;
+				return new Response(
+					JSON.stringify({
+						results: ops.map((op) => ({
+							clientOpId: op.clientOpId,
+							status: 'ACCEPTED',
+							idempotentReplay: false,
+							conflictReason: null
+						}))
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+
+			return new Response('{}', { status: 404 });
+		};
+
+		const apiClient = createMobileApiClient({
+			baseUrl: 'http://localhost:5173',
+			storage: tokenStorage,
+			fetchFn: mockFetch
+		});
+
+		const handoverOp = await enqueueOfflineOperation(
+			{
+				type: 'HANDOVER_CREATE',
+				label: 'Serah Terima AST-0001 ke Peminjam 2',
+				assetCode: 'AST-0001',
+				assetName: 'Laptop Dell',
+				clientCreatedAt: '2026-11-25T10:00:00.000Z',
+				payload: {
+					loanId: '11111111-1111-4111-8111-111111111111',
+					receiverId: '22222222-2222-4222-8222-222222222222',
+					autoConfirmGiver: true
+				},
+				pendingEvidence: {
+					purpose: 'HANDOVER',
+					captureSource: 'CAMERA',
+					takenAtDevice: '2026-11-25T10:00:00.000Z',
+					gpsAvailable: true,
+					latitude: -6.2001,
+					longitude: 106.8167,
+					accuracyM: 9,
+					isMockLocation: false,
+					locationId: '33333333-3333-4333-8333-333333333333',
+					imageBase64: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
+					mimeType: 'image/jpeg'
+				}
+			},
+			queueStorage
+		);
+
+		const shiftOpenOp = await enqueueOfflineOperation(
+			{
+				type: 'SHIFT_OPEN',
+				label: 'Buka Shift Kerja Petugas',
+				clientCreatedAt: '2026-11-25T10:01:00.000Z',
+				payload: {
+					note: 'Shift Pagi'
+				}
+			},
+			queueStorage
+		);
+
+		const shiftCloseOp = await enqueueOfflineOperation(
+			{
+				type: 'SHIFT_CLOSE',
+				label: 'Tutup Shift Kerja (1 barang keluar)',
+				clientCreatedAt: '2026-11-25T10:02:00.000Z',
+				payload: {
+					shiftId: '44444444-4444-4444-8444-444444444444',
+					note: 'Tutup shift sore',
+					items: [
+						{
+							loanItemId: '55555555-5555-4555-8555-555555555555',
+							reason: 'Masih dipakai seminar malam',
+							responsibleUserId: '22222222-2222-4222-8222-222222222222'
+						}
+					]
+				}
+			},
+			queueStorage
+		);
+
+		const outcome = await syncPendingOperations({
+			apiClient,
+			storage: queueStorage,
+			force: true
+		});
+		expect(outcome.accepted).toBe(3);
+
+		// Pastikan unggah foto bukti HANDOVER menyertakan koordinat GPS asli (gpsAvailable: true)
+		const evCall = calls.find((c) => c.url.endsWith('/api/v1/evidence'));
+		expect(evCall).toBeDefined();
+		expect(evCall?.body.purpose).toBe('HANDOVER');
+		expect(evCall?.body.gpsAvailable).toBe(true);
+		expect(evCall?.body.latitude).toBe(-6.2001);
+		expect(evCall?.body.longitude).toBe(106.8167);
+
+		// Pastikan HANDOVER_CREATE menerima evidenceId dari hasil unggah foto latar belakang
+		const syncedHo = await queueStorage.getById(handoverOp.clientOpId);
+		expect(syncedHo?.syncState).toBe('ACCEPTED');
+		expect(syncedHo?.payload.evidenceId).toBe('77777777-6666-4555-8444-333333333333');
+
+		const syncedOpen = await queueStorage.getById(shiftOpenOp.clientOpId);
+		expect(syncedOpen?.syncState).toBe('ACCEPTED');
+
+		const syncedClose = await queueStorage.getById(shiftCloseOp.clientOpId);
+		expect(syncedClose?.syncState).toBe('ACCEPTED');
+	});
 });
