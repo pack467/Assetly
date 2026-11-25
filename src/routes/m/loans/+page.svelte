@@ -33,6 +33,7 @@
 
 	let loans = $state<LoanEntry[]>([]);
 	let loading = $state(true);
+	let isFromOfflineCache = $state(false);
 	let activeTab = $state<'active' | 'history'>('active');
 
 	async function loadMyLoans() {
@@ -42,8 +43,28 @@
 			if (res.ok) {
 				const data = await res.json();
 				loans = data.items ?? [];
+				isFromOfflineCache = false;
+				try {
+					sessionStorage.setItem('itam_my_loans_cache', JSON.stringify(loans));
+				} catch {
+					// Abaikan bila storage penuh
+				}
+				return;
 			}
+		} catch {
+			// Fallback ke cache lokal saat offline
 		} finally {
+			try {
+				if (loans.length === 0) {
+					const cached = sessionStorage.getItem('itam_my_loans_cache');
+					if (cached) {
+						loans = JSON.parse(cached);
+						isFromOfflineCache = true;
+					}
+				}
+			} catch {
+				// Abaikan
+			}
 			loading = false;
 		}
 	}
@@ -67,6 +88,14 @@
 		<p class="mt-1 text-xs text-slate-600">
 			Daftar barang yang sedang Anda pinjam beserta riwayat pengembalian.
 		</p>
+		{#if isFromOfflineCache}
+			<div
+				class="mt-2 rounded-xl border border-amber-300 bg-amber-50 p-2.5 text-xs font-medium text-amber-900"
+			>
+				<strong>Cache Offline:</strong> Menampilkan daftar peminjaman terakhir yang tersimpan di HP (mungkin
+				tidak terkini).
+			</div>
+		{/if}
 	</div>
 
 	<div class="grid grid-cols-2 gap-2 rounded-xl bg-slate-200 p-1">

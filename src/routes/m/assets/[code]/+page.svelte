@@ -2,7 +2,11 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { mobileApi } from '$lib/client/api';
-	import { getOfflineQueueStorage } from '$lib/client/offlineQueue';
+	import {
+		findCachedAssetByCodeOrQr,
+		getOfflineQueueStorage,
+		saveCachedAssetScanPayload
+	} from '$lib/client/offlineQueue';
 	import { enqueueOfflineOperation, syncPendingOperations } from '$lib/client/syncManager';
 	import { AssetStatusLabels, type AssetStatusKey } from '$lib/shared/enums';
 	import {
@@ -57,6 +61,7 @@
 	let locations = $state<LocationCandidate[]>([]);
 	let currentUserName = $state('Pengguna');
 	let loading = $state(true);
+	let isFromOfflineCache = $state(false);
 	let errorMsg = $state('');
 	let successBanner = $state('');
 	let queuedBanner = $state('');
@@ -231,10 +236,12 @@
 			} catch {
 				// Abaikan
 			}
+			saveCachedAssetScanPayload(data);
+			isFromOfflineCache = false;
 
 			applyLoadedAssetState(data);
 		} catch {
-			// Jika sedang offline, coba muat dari cache sesi terakhir agar form pinjam/kembali tetap bisa diisi
+			// Jika sedang offline, coba muat dari cache sesi/daftar barang terakhir agar form pinjam/kembali tetap bisa diisi
 			try {
 				const cachedUser = sessionStorage.getItem('itam_user_name_cache');
 				if (cachedUser) currentUserName = cachedUser;
@@ -242,9 +249,10 @@
 				const cachedLocs = sessionStorage.getItem('itam_locations_cache');
 				if (cachedLocs) locations = JSON.parse(cachedLocs);
 
-				const cachedAsset = sessionStorage.getItem(cacheKey);
+				const cachedAsset = findCachedAssetByCodeOrQr(codeParam);
 				if (cachedAsset) {
-					applyLoadedAssetState(JSON.parse(cachedAsset));
+					isFromOfflineCache = true;
+					applyLoadedAssetState(cachedAsset as unknown as AssetScanPayload);
 					return;
 				}
 			} catch {
@@ -426,7 +434,7 @@
 
 	async function handleReturnSubmit(e: SubmitEvent) {
 		e.preventDefault();
-		if (!scanData?.activeLoanItem) return;
+		if (!scanData) return;
 		errorMsg = '';
 		successBanner = '';
 		queuedBanner = '';
@@ -456,7 +464,8 @@
 				assetCode: scanData.asset.code,
 				assetName: scanData.asset.name,
 				payload: {
-					loanItemId: scanData.activeLoanItem.id,
+					...(scanData.activeLoanItem?.id ? { loanItemId: scanData.activeLoanItem.id } : {}),
+					assetId: scanData.asset.id,
 					returnCondition,
 					damageNote: returnCondition === 'DAMAGED' ? damageNote.trim() : null,
 					accessoryChecks: returnChecks.map((c) => ({
@@ -586,6 +595,20 @@
 			Memuat informasi barang...
 		</div>
 	{:else if scanData}
+		{#if isFromOfflineCache}
+			<div
+				class="rounded-2xl border-2 border-amber-300 bg-amber-50 p-3.5 text-xs font-medium text-amber-950"
+			>
+				<div class="font-extrabold uppercase tracking-wider text-amber-900">
+					⚠ Data Cache Offline — Status Mungkin Tidak Terkini
+				</div>
+				<p class="mt-1 text-amber-900">
+					Informasi barang ini dimuat dari salinan terakhir di HP karena koneksi sedang offline.
+					Anda tetap dapat melakukan peminjaman/pengembalian ke antrean lokal; keputusan akhir tetap
+					divalidasi oleh server saat sinkronisasi (Bagian 10.2).
+				</p>
+			</div>
+		{/if}
 		<!-- KARTU INFO BARANG (Bagian 7.1 & 8.1) -->
 		<div class="rounded-2xl border border-slate-200 bg-white p-5 shadow-2xs space-y-3">
 			<div class="flex items-start justify-between gap-2">

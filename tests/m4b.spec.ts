@@ -4,8 +4,13 @@ import { join } from 'node:path';
 import { createMobileApiClient } from '../src/lib/client/api';
 import { createMemoryTokenStorage } from '../src/lib/client/tokenStorage';
 import {
+	clearCachedAssets,
 	computeOfflineQueueSummary,
 	createMemoryOfflineQueueStorage,
+	findCachedAssetByCodeOrQr,
+	getCachedAssetsList,
+	saveCachedAssetScanPayload,
+	saveCachedAssetsList,
 	setOfflineQueueStorage,
 	subscribeOfflineQueue,
 	type OfflineQueueStorage
@@ -40,6 +45,7 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 	beforeEach(() => {
 		queueStorage = createMemoryOfflineQueueStorage();
 		setOfflineQueueStorage(queueStorage);
+		clearCachedAssets();
 	});
 
 	it('1. menyimpan operasi ke antrean lokal, menghitung ringkasan status, dan memicu notifikasi reaktif UI', async () => {
@@ -810,5 +816,77 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 		});
 		expect(runRecovered.accepted).toBe(2);
 		expect(runRecovered.stillPending).toBe(0);
+	});
+
+	it('9. menyediakan cache daftar barang dan detail scan untuk pencarian offline berdasarkan kode, qrToken, atau nomor seri (#3)', () => {
+		saveCachedAssetsList([
+			{
+				id: 'a-100',
+				code: 'AST-0100',
+				qrToken: 'qr-secret-token-100',
+				name: 'Laptop ThinkPad X1',
+				status: 'AVAILABLE',
+				serialNumber: 'SN-X1-9988',
+				category: {
+					id: 'cat-1',
+					name: 'Laptop',
+					requiresApproval: false
+				},
+				homeLocation: {
+					id: 'loc-1',
+					name: 'Gudang IT'
+				},
+				accessories: [{ id: 'acc-1', name: 'Charger 65W', quantity: 1 }]
+			}
+		]);
+
+		expect(getCachedAssetsList()).toHaveLength(1);
+
+		// 1. Pencarian offline lewat kode barang (case-insensitive)
+		const byCode = findCachedAssetByCodeOrQr('ast-0100');
+		expect(byCode).not.toBeNull();
+		expect(byCode?.asset.code).toBe('AST-0100');
+		expect(byCode?.allowedActions).toContain('BORROW');
+
+		// 2. Pencarian offline lewat qrToken
+		const byQr = findCachedAssetByCodeOrQr('qr-secret-token-100');
+		expect(byQr).not.toBeNull();
+		expect(byQr?.asset.name).toBe('Laptop ThinkPad X1');
+
+		// 3. Pencarian offline lewat nomor seri
+		const bySerial = findCachedAssetByCodeOrQr('sn-x1-9988');
+		expect(bySerial).not.toBeNull();
+		expect(bySerial?.asset.id).toBe('a-100');
+
+		// 4. Menyimpan detail scan penuh mengutamakan data scan terbaru
+		saveCachedAssetScanPayload({
+			asset: {
+				id: 'a-100',
+				code: 'AST-0100',
+				qrToken: 'qr-secret-token-100',
+				name: 'Laptop ThinkPad X1',
+				status: 'BORROWED',
+				serialNumber: 'SN-X1-9988',
+				notes: null,
+				category: { id: 'cat-1', name: 'Laptop', requiresApproval: false },
+				homeLocation: { id: 'loc-1', name: 'Gudang IT' },
+				accessories: []
+			},
+			allowedActions: ['RETURN'],
+			currentHolder: 'Budi',
+			requiresApproval: false,
+			activeLoanItem: {
+				id: 'li-100',
+				loanId: 'loan-100',
+				borrowerId: 'u-budi',
+				purpose: 'Seminar',
+				expectedReturnAt: '2026-11-27T10:00:00.000Z',
+				accessoryChecks: []
+			}
+		});
+
+		const updatedFromScanCache = findCachedAssetByCodeOrQr('AST-0100');
+		expect(updatedFromScanCache?.asset.status).toBe('BORROWED');
+		expect(updatedFromScanCache?.activeLoanItem?.id).toBe('li-100');
 	});
 });

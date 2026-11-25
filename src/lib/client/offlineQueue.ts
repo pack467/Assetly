@@ -372,3 +372,221 @@ export async function computeOfflineQueueSummary(
 		totalCount: items.length
 	};
 }
+
+/**
+ * Cache Barang Offline (Bagian 10.2 PROJECT_SPEC.md — #3)
+ * -------------------------------------------------------
+ * Menyimpan salinan daftar barang dan detail scan terakhir hanya untuk pencarian
+ * dan tampilan saat HP sedang offline (disertai label "mungkin tidak terkini").
+ * Seluruh aksi tetap divalidasi oleh server saat sinkronisasi.
+ */
+export interface CachedAssetSummary {
+	id: string;
+	code: string;
+	qrToken?: string | null;
+	name: string;
+	status: string;
+	serialNumber: string | null;
+	notes?: string | null;
+	currentHolder?: string | null;
+	category?: {
+		id: string;
+		name: string;
+		requiresApproval: boolean;
+	} | null;
+	homeLocation?: {
+		id: string;
+		name: string;
+	} | null;
+	accessories?: Array<{ id: string; name: string; quantity: number }>;
+}
+
+export interface CachedAssetScanPayload {
+	asset: {
+		id: string;
+		code: string;
+		qrToken?: string | null;
+		name: string;
+		status: string;
+		serialNumber: string | null;
+		notes: string | null;
+		category: {
+			id: string;
+			name: string;
+			requiresApproval: boolean;
+		};
+		homeLocation: {
+			id: string;
+			name: string;
+		} | null;
+		accessories: Array<{ id: string; name: string; quantity: number }>;
+	};
+	allowedActions: string[];
+	currentHolder: string | null;
+	requiresApproval: boolean;
+	activeLoanItem: {
+		id: string;
+		loanId: string;
+		borrowerId: string;
+		purpose: string;
+		expectedReturnAt: string;
+		accessoryChecks: Array<{
+			id: string;
+			name: string;
+			quantity: number;
+			outOk: boolean;
+			returnOk: boolean | null;
+		}>;
+	} | null;
+	cachedAt?: string;
+}
+
+const ASSET_LIST_CACHE_KEY = 'itam_offline_asset_list_v1';
+const ASSET_SCAN_MAP_CACHE_KEY = 'itam_offline_asset_scan_map_v1';
+
+let memoryAssetListCache: CachedAssetSummary[] = [];
+let memoryAssetScanMapCache: Record<string, CachedAssetScanPayload> = {};
+
+function readSessionJson<T>(key: string): T | null {
+	if (typeof window === 'undefined' || !window.sessionStorage) return null;
+	try {
+		const raw = window.sessionStorage.getItem(key);
+		return raw ? (JSON.parse(raw) as T) : null;
+	} catch {
+		return null;
+	}
+}
+
+function writeSessionJson(key: string, value: unknown): void {
+	if (typeof window === 'undefined' || !window.sessionStorage) return;
+	try {
+		window.sessionStorage.setItem(key, JSON.stringify(value));
+	} catch {
+		// Abaikan jika storage penuh
+	}
+}
+
+export function saveCachedAssetsList(assets: CachedAssetSummary[]): void {
+	const cloned = JSON.parse(JSON.stringify(assets)) as CachedAssetSummary[];
+	memoryAssetListCache = cloned;
+	writeSessionJson(ASSET_LIST_CACHE_KEY, cloned);
+}
+
+export function getCachedAssetsList(): CachedAssetSummary[] {
+	const fromSession = readSessionJson<CachedAssetSummary[]>(ASSET_LIST_CACHE_KEY);
+	if (fromSession && Array.isArray(fromSession)) {
+		memoryAssetListCache = fromSession;
+		return JSON.parse(JSON.stringify(fromSession)) as CachedAssetSummary[];
+	}
+	return JSON.parse(JSON.stringify(memoryAssetListCache)) as CachedAssetSummary[];
+}
+
+export function saveCachedAssetScanPayload(payload: CachedAssetScanPayload): void {
+	if (!payload?.asset?.code) return;
+	const codeKey = payload.asset.code.trim().toUpperCase();
+	const withTimestamp: CachedAssetScanPayload = {
+		...JSON.parse(JSON.stringify(payload)),
+		cachedAt: payload.cachedAt ?? new Date().toISOString()
+	};
+	const currentMap =
+		readSessionJson<Record<string, CachedAssetScanPayload>>(ASSET_SCAN_MAP_CACHE_KEY) ??
+		memoryAssetScanMapCache;
+	currentMap[codeKey] = withTimestamp;
+	memoryAssetScanMapCache = currentMap;
+	writeSessionJson(ASSET_SCAN_MAP_CACHE_KEY, currentMap);
+	writeSessionJson(`itam_asset_cache_${codeKey}`, withTimestamp);
+}
+
+function buildDisplayScanPayloadFromSummary(item: CachedAssetSummary): CachedAssetScanPayload {
+	const allowedActions: string[] = [];
+	if (item.status === 'AVAILABLE') {
+		allowedActions.push('BORROW');
+	} else if (item.status === 'BORROWED') {
+		allowedActions.push('RETURN');
+	}
+
+	return {
+		asset: {
+			id: item.id,
+			code: item.code,
+			qrToken: item.qrToken ?? null,
+			name: item.name,
+			status: item.status,
+			serialNumber: item.serialNumber ?? null,
+			notes: item.notes ?? null,
+			category: item.category ?? {
+				id: '',
+				name: 'Umum',
+				requiresApproval: false
+			},
+			homeLocation: item.homeLocation ?? null,
+			accessories: item.accessories ?? []
+		},
+		allowedActions,
+		currentHolder: item.currentHolder ?? null,
+		requiresApproval: Boolean(item.category?.requiresApproval),
+		activeLoanItem: null,
+		cachedAt: new Date().toISOString()
+	};
+}
+
+/**
+ * Mencari barang di cache lokal berdasarkan kode barang (AST-XXXX), qrToken, atau nomor seri.
+ */
+export function findCachedAssetByCodeOrQr(rawQuery: string): CachedAssetScanPayload | null {
+	const q = (rawQuery ?? '').trim();
+	if (!q) return null;
+	const upper = q.toUpperCase();
+
+	const scanMap =
+		readSessionJson<Record<string, CachedAssetScanPayload>>(ASSET_SCAN_MAP_CACHE_KEY) ??
+		memoryAssetScanMapCache;
+
+	if (scanMap[upper]) {
+		return JSON.parse(JSON.stringify(scanMap[upper])) as CachedAssetScanPayload;
+	}
+
+	const legacyPerCode = readSessionJson<CachedAssetScanPayload>(`itam_asset_cache_${upper}`);
+	if (legacyPerCode?.asset?.code) {
+		return legacyPerCode;
+	}
+
+	// Cari di scanMap berdasarkan qrToken atau serialNumber
+	for (const entry of Object.values(scanMap)) {
+		if (
+			entry.asset.code.toUpperCase() === upper ||
+			(entry.asset.qrToken && entry.asset.qrToken === q) ||
+			(entry.asset.serialNumber && entry.asset.serialNumber.toUpperCase() === upper)
+		) {
+			return JSON.parse(JSON.stringify(entry)) as CachedAssetScanPayload;
+		}
+	}
+
+	// Cari di daftar ringkas barang (hasil cache /api/v1/assets)
+	const list = getCachedAssetsList();
+	const foundInList = list.find(
+		(item) =>
+			item.code.toUpperCase() === upper ||
+			(item.qrToken && item.qrToken === q) ||
+			(item.serialNumber && item.serialNumber.toUpperCase() === upper)
+	);
+
+	if (foundInList) {
+		return buildDisplayScanPayloadFromSummary(foundInList);
+	}
+
+	return null;
+}
+
+export function clearCachedAssets(): void {
+	memoryAssetListCache = [];
+	memoryAssetScanMapCache = {};
+	if (typeof window !== 'undefined' && window.sessionStorage) {
+		try {
+			window.sessionStorage.removeItem(ASSET_LIST_CACHE_KEY);
+			window.sessionStorage.removeItem(ASSET_SCAN_MAP_CACHE_KEY);
+		} catch {
+			// ignore
+		}
+	}
+}

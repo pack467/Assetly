@@ -2,20 +2,23 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { mobileApi } from '$lib/client/api';
+	import {
+		findCachedAssetByCodeOrQr,
+		getCachedAssetsList,
+		saveCachedAssetsList,
+		type CachedAssetSummary
+	} from '$lib/client/offlineQueue';
 	import { AssetStatusLabels, type AssetStatusKey } from '$lib/shared/enums';
 	import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
 
-	interface QuickAsset {
-		id: string;
-		code: string;
-		name: string;
+	interface QuickAsset extends CachedAssetSummary {
 		status: AssetStatusKey;
-		serialNumber: string | null;
 	}
 
 	let manualCode = $state('');
 	let errorMsg = $state('');
 	let searching = $state(false);
+	let isUsingOfflineCache = $state(false);
 
 	let videoEl = $state<HTMLVideoElement | null>(null);
 	let cameraActive = $state(false);
@@ -29,11 +32,24 @@
 	async function loadQuickAssets() {
 		loadingAssets = true;
 		try {
-			const res = await mobileApi.get('/api/v1/assets?pageSize=20');
+			const res = await mobileApi.get('/api/v1/assets?pageSize=50');
 			if (res.ok) {
 				const data = await res.json();
-				quickAssets = data.items ?? [];
+				const items = (data.items ?? []) as QuickAsset[];
+				quickAssets = items;
+				isUsingOfflineCache = false;
+				saveCachedAssetsList(items);
+				return;
 			}
+			const cached = getCachedAssetsList() as QuickAsset[];
+			if (cached.length > 0) {
+				quickAssets = cached;
+				isUsingOfflineCache = true;
+			}
+		} catch {
+			const cached = getCachedAssetsList() as QuickAsset[];
+			quickAssets = cached;
+			isUsingOfflineCache = cached.length > 0;
 		} finally {
 			loadingAssets = false;
 		}
@@ -135,6 +151,16 @@
 				dataCode,
 				`Barang dengan kode atau QR "${rawValue}" tidak ditemukan.`
 			);
+		} catch {
+			// Bagian 10.2 (#3): Saat offline, cari dari cache barang lokal (kode, qrToken, atau nomor seri)
+			const cached = findCachedAssetByCodeOrQr(rawValue);
+			if (cached) {
+				isUsingOfflineCache = true;
+				stopQrCamera();
+				await goto(`/m/assets/${encodeURIComponent(cached.asset.code)}`);
+				return;
+			}
+			errorMsg = `HP sedang offline dan barang dengan kode/QR "${rawValue}" belum tersimpan di cache lokal HP.`;
 		} finally {
 			searching = false;
 		}
@@ -241,9 +267,24 @@
 
 	<!-- DAFTAR CEPAT BARANG TERDAFTAR -->
 	<div class="space-y-2.5">
-		<div class="text-xs font-bold uppercase tracking-wider text-slate-500">
-			Pilih Cepat dari Daftar Barang
+		<div class="flex flex-wrap items-center justify-between gap-2">
+			<div class="text-xs font-bold uppercase tracking-wider text-slate-500">
+				Pilih Cepat dari Daftar Barang
+			</div>
+			{#if isUsingOfflineCache}
+				<span
+					class="rounded-full border border-amber-300 bg-amber-100 px-2.5 py-0.5 text-[11px] font-bold text-amber-900"
+				>
+					Cache Offline — Status mungkin tidak terkini
+				</span>
+			{/if}
 		</div>
+		{#if isUsingOfflineCache}
+			<div class="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+				<strong>Mode Offline:</strong> Menampilkan salinan daftar barang terakhir di HP (status mungkin
+				tidak terkini). Keputusan akhir tetap divalidasi oleh server saat sinkronisasi.
+			</div>
+		{/if}
 		{#if loadingAssets}
 			<div
 				class="rounded-2xl border border-slate-200 bg-white p-4 text-center text-xs text-slate-500"
