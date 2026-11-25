@@ -512,14 +512,28 @@ export async function returnLoanItem(
 		// 3. Satu Evidence hanya boleh dipakai sekali (tidak boleh sudah terpakai untuk pinjam atau kembali lain)
 		await assertEvidenceNotUsed(tx, [input.evidenceId]);
 
-		const updatedItem = await tx.loanItem.update({
-			where: { id: loanItemId },
+		const claimed = await tx.loanItem.updateMany({
+			where: {
+				id: loanItemId,
+				returnedAt: null
+			},
 			data: {
 				returnedAt: now,
 				returnCondition: input.returnCondition,
 				returnEvidenceId: input.evidenceId,
 				damageNote: input.damageNote?.trim() || null
 			}
+		});
+
+		if (claimed.count === 0) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				'Barang ini sudah dikembalikan sebelumnya (klaim atomik gagal).'
+			);
+		}
+
+		const updatedItem = await tx.loanItem.findUniqueOrThrow({
+			where: { id: loanItemId }
 		});
 
 		if (input.accessoryChecks && input.accessoryChecks.length > 0) {

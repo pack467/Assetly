@@ -792,5 +792,60 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				process.env.EVIDENCE_SIGNING_SECRET = origSigningSecret;
 			}
 		});
+
+		it('Mencegah pengembalian ganda pada permintaan returnLoanItem paralel dengan dua foto bukti berbeda (klaim atomik returnedAt: null)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const raceAsset = await prisma.asset.create({
+				data: {
+					code: `AST-M2RET-${suffix}`,
+					qrToken: `qr-m2ret-${randomUUID()}`,
+					name: 'Proyektor Uji Balapan Return Paralel',
+					categoryId: standardCategoryId,
+					status: 'AVAILABLE'
+				}
+			});
+
+			const checkoutEv = await createTestEvidence(borrower1, 'CHECKOUT');
+			const createdLoan = await createLoan(borrower1, {
+				assetId: raceAsset.id,
+				evidenceId: checkoutEv.id,
+				purpose: 'Uji Balapan Return Paralel',
+				expectedReturnAt: new Date(Date.now() + 86400_000).toISOString()
+			});
+			const targetLoanItemId = createdLoan.loan.items[0].id;
+
+			const [retEv1, retEv2] = await Promise.all([
+				createTestEvidence(borrower1, 'RETURN'),
+				createTestEvidence(borrower1, 'RETURN')
+			]);
+
+			const results = await Promise.allSettled([
+				returnLoanItem(borrower1, targetLoanItemId, {
+					returnCondition: 'NORMAL',
+					evidenceId: retEv1.id
+				}),
+				returnLoanItem(borrower1, targetLoanItemId, {
+					returnCondition: 'NORMAL',
+					evidenceId: retEv2.id
+				})
+			]);
+
+			const fulfilled = results.filter((r) => r.status === 'fulfilled');
+			const rejected = results.filter((r) => r.status === 'rejected');
+
+			expect(fulfilled).toHaveLength(1);
+			expect(rejected).toHaveLength(1);
+			expect((rejected[0].reason as { code?: string })?.code).toBe('INVALID_STATUS_TRANSITION');
+
+			// Pastikan hanya ada TEPAT SATU AuditLog LOAN_ITEM_RETURNED untuk item tersebut
+			const returnAuditCount = await prisma.auditLog.count({
+				where: {
+					entityType: 'LoanItem',
+					entityId: targetLoanItemId,
+					action: 'LOAN_ITEM_RETURNED'
+				}
+			});
+			expect(returnAuditCount).toBe(1);
+		});
 	});
 });
