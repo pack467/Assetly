@@ -4,6 +4,7 @@ import { assertCan, type PolicyUser } from '$lib/server/policy';
 import { evaluateEvidenceRisk, loadRecentUserEvidencesForRisk } from '$lib/server/risk';
 import {
 	createEvidenceSignedUrl,
+	deletePrivateEvidenceFile,
 	generateEvidenceImageKey,
 	savePrivateEvidenceFile,
 	validateJpegBuffer
@@ -124,48 +125,54 @@ export async function uploadEvidence(
 	}
 
 	const imageKey = generateEvidenceImageKey(meta.purpose);
-	savePrivateEvidenceFile(imageKey, fileBuffer);
+	await savePrivateEvidenceFile(imageKey, fileBuffer);
 
-	const created = await prisma.$transaction(async (tx) => {
-		const evidence = await tx.evidence.create({
-			data: {
-				purpose: meta.purpose,
-				imageKey,
-				userId: currentUser.id,
-				takenAtDevice,
-				receivedAtServer,
-				clockSkewSec: riskEvaluation.clockSkewSec,
-				gpsAvailable: hasCoords,
-				latitude: hasCoords ? meta.latitude : null,
-				longitude: hasCoords ? meta.longitude : null,
-				accuracyM: hasCoords ? (meta.accuracyM ?? null) : null,
-				isMockLocation: meta.isMockLocation,
-				locationId: selectedLocation?.id ?? null,
-				locationNote: meta.locationNote ?? null,
-				distanceToLocationM: riskEvaluation.distanceToLocationM,
-				riskLevel: riskEvaluation.riskLevel,
-				riskReasons: riskEvaluation.riskReasons
-			}
+	let created;
+	try {
+		created = await prisma.$transaction(async (tx) => {
+			const evidence = await tx.evidence.create({
+				data: {
+					purpose: meta.purpose,
+					imageKey,
+					userId: currentUser.id,
+					takenAtDevice,
+					receivedAtServer,
+					clockSkewSec: riskEvaluation.clockSkewSec,
+					gpsAvailable: hasCoords,
+					latitude: hasCoords ? meta.latitude : null,
+					longitude: hasCoords ? meta.longitude : null,
+					accuracyM: hasCoords ? (meta.accuracyM ?? null) : null,
+					isMockLocation: meta.isMockLocation,
+					locationId: selectedLocation?.id ?? null,
+					locationNote: meta.locationNote ?? null,
+					distanceToLocationM: riskEvaluation.distanceToLocationM,
+					riskLevel: riskEvaluation.riskLevel,
+					riskReasons: riskEvaluation.riskReasons
+				}
+			});
+
+			await writeAuditLog(tx, {
+				actorId: currentUser.id,
+				action: 'EVIDENCE_UPLOADED',
+				entityType: 'Evidence',
+				entityId: evidence.id,
+				after: {
+					purpose: evidence.purpose,
+					gpsAvailable: evidence.gpsAvailable,
+					locationId: evidence.locationId,
+					clockSkewSec: evidence.clockSkewSec,
+					riskLevel: evidence.riskLevel,
+					riskReasons: riskEvaluation.riskReasons
+				},
+				ip: ip ?? null
+			});
+
+			return evidence;
 		});
-
-		await writeAuditLog(tx, {
-			actorId: currentUser.id,
-			action: 'EVIDENCE_UPLOADED',
-			entityType: 'Evidence',
-			entityId: evidence.id,
-			after: {
-				purpose: evidence.purpose,
-				gpsAvailable: evidence.gpsAvailable,
-				locationId: evidence.locationId,
-				clockSkewSec: evidence.clockSkewSec,
-				riskLevel: evidence.riskLevel,
-				riskReasons: riskEvaluation.riskReasons
-			},
-			ip: ip ?? null
-		});
-
-		return evidence;
-	});
+	} catch (err) {
+		await deletePrivateEvidenceFile(imageKey);
+		throw err;
+	}
 
 	const signedUrl = createEvidenceSignedUrl(created.id, created.imageKey);
 

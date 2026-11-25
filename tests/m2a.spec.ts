@@ -3,7 +3,14 @@ import { randomUUID } from 'node:crypto';
 import { prisma } from '../src/lib/server/db';
 import type { PolicyUser } from '../src/lib/server/policy';
 import { evaluateEvidenceRisk } from '../src/lib/server/risk';
-import { verifyEvidenceSignedUrl, getEvidenceSigningSecret } from '../src/lib/server/storage';
+import {
+	deletePrivateEvidenceFile,
+	generateEvidenceImageKey,
+	getEvidenceSigningSecret,
+	readPrivateEvidenceFile,
+	savePrivateEvidenceFile,
+	verifyEvidenceSignedUrl
+} from '../src/lib/server/storage';
 import { uploadEvidence, getEvidenceDetail } from '../src/lib/server/services/evidenceService';
 import {
 	createLoan,
@@ -460,6 +467,20 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 					nowEpochSec: Math.floor(Date.now() / 1000) + 600 // +10 menit (lewat TTL 5 menit)
 				})
 			).toBe(false);
+		});
+
+		it('menyimpan, membaca, dan menghapus berkas foto yatim secara asinkron (fs/promises)', async () => {
+			const tempKey = generateEvidenceImageKey('CHECKOUT');
+			await savePrivateEvidenceFile(tempKey, VALID_JPEG_BUFFER);
+
+			const readBuf = await readPrivateEvidenceFile(tempKey);
+			expect(readBuf.equals(VALID_JPEG_BUFFER)).toBe(true);
+
+			await deletePrivateEvidenceFile(tempKey);
+			await expect(readPrivateEvidenceFile(tempKey)).rejects.toMatchObject({
+				code: 'NOT_FOUND',
+				status: 404
+			});
 		});
 	});
 

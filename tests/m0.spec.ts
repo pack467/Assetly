@@ -13,7 +13,12 @@ import {
 	revokeSessionByAdmin,
 	resolveAuthenticatedSession
 } from '../src/lib/server/auth/service';
-import { clearLoginRateLimit } from '../src/lib/server/auth/rateLimit';
+import {
+	clearLoginRateLimit,
+	getRateLimitBucketCount,
+	recordFailedLoginAttempt,
+	sweepExpiredRateLimitBuckets
+} from '../src/lib/server/auth/rateLimit';
 import { signAccessToken, verifyAccessToken, getAccessSecret } from '../src/lib/server/auth/tokens';
 import { SignJWT } from 'jose';
 import { GET as healthHandler } from '../src/routes/api/v1/health/+server';
@@ -413,6 +418,22 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 			).rejects.toMatchObject({ code: 'RATE_LIMITED', status: 429 });
 
 			clearLoginRateLimit(key);
+		});
+
+		it('Menyapu otomatis entri rateLimit yang sudah kedaluwarsa saat jumlah bucket melampaui ambang batas', () => {
+			const t0 = 1_700_000_000_000;
+			for (let i = 0; i < 210; i++) {
+				recordFailedLoginAttempt(`expired-${i}@example.com:10.0.0.1`, t0);
+			}
+			expect(getRateLimitBucketCount()).toBeGreaterThanOrEqual(200);
+
+			// 16 menit kemudian (> 15 menit window), percobaan baru memicu sapu otomatis atas 210 entri kedaluwarsa
+			const tAfterWindow = t0 + 16 * 60 * 1000;
+			recordFailedLoginAttempt('fresh-user@example.com:10.0.0.2', tAfterWindow);
+
+			expect(getRateLimitBucketCount()).toBe(1);
+			sweepExpiredRateLimitBuckets(tAfterWindow + 16 * 60 * 1000);
+			expect(getRateLimitBucketCount()).toBe(0);
 		});
 
 		it('Menolak JWT_ACCESS_SECRET yang kosong atau terlalu pendek (< 32 karakter)', async () => {

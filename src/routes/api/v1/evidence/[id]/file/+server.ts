@@ -31,7 +31,7 @@ export const GET: RequestHandler = async (event) => {
 			);
 		}
 
-		const buffer = readPrivateEvidenceFile(evidence.imageKey);
+		const buffer = await readPrivateEvidenceFile(evidence.imageKey);
 
 		return new Response(new Uint8Array(buffer), {
 			status: 200,

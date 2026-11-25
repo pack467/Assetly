@@ -9,7 +9,7 @@ Dokumen ini mencatat penyesuaian teknis terhadap lingkungan pengembangan atau pe
   1. Pada saat M0 dikerjakan, Docker belum terpasang di mesin host sehingga disediakan skrip `scripts/local-pg.mjs` (`npm run db:local:start` / `npm run db:local:stop`) yang menjalankan cluster PostgreSQL 18 lokal di `.pgdata` (port `5433`) untuk keperluan `npm run dev` dan `npm test`.
   2. **Pembaruan Pra-M4C:** Docker Desktop (`Docker 29.9.3` & `Docker Compose v5.7.0`) kini telah terpasang di mesin pengembangan. Seluruh stack `docker compose up -d --build` (`app`, `db` dengan `postgres:18-alpine`, dan `caddy` dengan `caddy:2.9-alpine`) telah diverifikasi berjalan penuh dari awal.
 - **Konfigurasi Stack Docker & Mode Dev:**
-  1. Hanya kontainer `caddy` yang mempublikasikan port ke host (`80` dan `443`), sedangkan `db` dan `app` berjalan eksklusif di jaringan internal Docker.
+  1. Hanya kontainer `caddy` yang mempublikasikan port ke host (`80` dan `443`), sedangkan `db` dan `app` berjalan eksklusif di jaringan internal Docker. Berkas konfigurasi Docker (`Dockerfile`, `docker-compose.yml`, `Caddyfile`) disimpan sebagai satu sumber kebenaran di root repositori.
   2. Data PostgreSQL 18 disimpan pada volume persisten `pgdata` (`PGDATA=/var/lib/postgresql/data/pgdata`) dan foto bukti disimpan pada volume persisten `evidence_data` (`/app/.storage`), sehingga keduanya tetap utuh saat kontainer dibuat ulang (`--force-recreate`).
   3. Mode pengembangan lokal dengan PostgreSQL 18 port `5433` (`scripts/local-pg.mjs`) tetap dipertahankan agar `npm test` (Vitest) dan `npm run dev` dapat berjalan cepat tanpa tergantung pada kontainer yang sedang menyala.
 

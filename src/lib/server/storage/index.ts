@@ -1,5 +1,5 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { env } from '$env/dynamic/private';
 import { AppError } from '$lib/shared/errors';
@@ -65,23 +65,37 @@ export function generateEvidenceImageKey(purpose: string): string {
 	return `${purpose.toLowerCase()}/${datePrefix}/${randomUUID()}.jpg`;
 }
 
-export function savePrivateEvidenceFile(imageKey: string, buffer: Buffer): void {
+function resolveSafeEvidencePath(imageKey: string): string {
 	const safeRelPath = imageKey.replace(/\.\./g, '').replace(/^\/+/, '');
 	const fullPath = resolve(STORAGE_ROOT, safeRelPath);
 	if (!fullPath.startsWith(STORAGE_ROOT)) {
 		throw new AppError('VALIDATION_ERROR', 'Kunci objek foto tidak sah.');
 	}
-	mkdirSync(dirname(fullPath), { recursive: true });
-	writeFileSync(fullPath, buffer);
+	return fullPath;
 }
 
-export function readPrivateEvidenceFile(imageKey: string): Buffer {
-	const safeRelPath = imageKey.replace(/\.\./g, '').replace(/^\/+/, '');
-	const fullPath = resolve(STORAGE_ROOT, safeRelPath);
-	if (!fullPath.startsWith(STORAGE_ROOT) || !existsSync(fullPath)) {
+export async function savePrivateEvidenceFile(imageKey: string, buffer: Buffer): Promise<void> {
+	const fullPath = resolveSafeEvidencePath(imageKey);
+	await mkdir(dirname(fullPath), { recursive: true });
+	await writeFile(fullPath, buffer);
+}
+
+export async function readPrivateEvidenceFile(imageKey: string): Promise<Buffer> {
+	const fullPath = resolveSafeEvidencePath(imageKey);
+	try {
+		return await readFile(fullPath);
+	} catch {
 		throw new AppError('NOT_FOUND', 'Berkas foto bukti tidak ditemukan di storage privat.');
 	}
-	return readFileSync(fullPath);
+}
+
+export async function deletePrivateEvidenceFile(imageKey: string): Promise<void> {
+	const fullPath = resolveSafeEvidencePath(imageKey);
+	try {
+		await unlink(fullPath);
+	} catch {
+		// Abaikan bila berkas sudah tidak ada
+	}
 }
 
 function computeSignature(evidenceId: string, imageKey: string, expiresEpochSec: number): string {
