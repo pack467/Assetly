@@ -1,11 +1,22 @@
 import { env } from '$env/dynamic/public';
-import { getTokenStorage, type TokenPair, type TokenStorageAdapter } from './tokenStorage';
+import {
+	decodeJwtDisplayProfile,
+	getTokenStorage,
+	type MobileDisplayProfile,
+	type TokenPair,
+	type TokenStorageAdapter
+} from './tokenStorage';
 
 export interface MobileApiClientOptions {
 	baseUrl?: string;
 	fetchFn?: typeof fetch;
 	storage?: TokenStorageAdapter;
 	onUnauthorized?: () => void;
+}
+
+export interface ResolvedMobileSession {
+	user: MobileDisplayProfile | null;
+	fromOfflineCache: boolean;
 }
 
 export interface MobileApiClient {
@@ -21,6 +32,7 @@ export interface MobileApiClient {
 	}): Promise<Response>;
 	logout(): Promise<void>;
 	refreshSession(): Promise<TokenPair | null>;
+	resolveSessionUser(): Promise<ResolvedMobileSession>;
 }
 
 type UnauthorizedListener = () => void;
@@ -273,12 +285,17 @@ export function createMobileApiClient(options: MobileApiClientOptions = {}): Mob
 
 			if (res.ok) {
 				const cloned = res.clone();
-				const data = (await cloned.json()) as Partial<TokenPair>;
+				const data = (await cloned.json()) as Partial<TokenPair> & {
+					user?: MobileDisplayProfile;
+				};
 				if (data.accessToken && data.refreshToken) {
 					await storage.setTokens({
 						accessToken: data.accessToken,
 						refreshToken: data.refreshToken
 					});
+				}
+				if (data.user && storage.setCachedProfile) {
+					await storage.setCachedProfile(data.user);
 				}
 			}
 
@@ -289,13 +306,76 @@ export function createMobileApiClient(options: MobileApiClientOptions = {}): Mob
 			const storage = getStorage();
 			try {
 				await performRequest('/api/v1/auth/logout', { method: 'POST' }, true);
+			} catch {
+				// Tetap bersihkan token lokal meskipun sedang offline saat menekan logout
 			} finally {
 				await storage.clearTokens();
+				if (storage.clearCachedProfile) {
+					await storage.clearCachedProfile();
+				}
 			}
 		},
 
 		refreshSession() {
 			return executeSingleFlightRefresh();
+		},
+
+		async resolveSessionUser(): Promise<ResolvedMobileSession> {
+			const storage = getStorage();
+			const stored = await storage.getTokens();
+			if (!stored?.accessToken && !stored?.refreshToken) {
+				if (storage.clearCachedProfile) {
+					await storage.clearCachedProfile();
+				}
+				return { user: null, fromOfflineCache: false };
+			}
+
+			const getOfflineDisplayFallback = async (): Promise<ResolvedMobileSession> => {
+				const tokensStillPresent = await storage.getTokens();
+				if (!tokensStillPresent?.accessToken && !tokensStillPresent?.refreshToken) {
+					if (storage.clearCachedProfile) {
+						await storage.clearCachedProfile();
+					}
+					return { user: null, fromOfflineCache: false };
+				}
+				const cached =
+					(await storage.getCachedProfile?.()) ??
+					decodeJwtDisplayProfile(tokensStillPresent?.accessToken);
+				return {
+					user: cached ?? null,
+					fromOfflineCache: Boolean(cached)
+				};
+			};
+
+			try {
+				const res = await performRequest('/api/v1/auth/me', { method: 'GET' }, false);
+				if (res.ok) {
+					const data = (await res.json()) as { user?: MobileDisplayProfile };
+					if (data.user) {
+						if (storage.setCachedProfile) {
+							await storage.setCachedProfile(data.user);
+						}
+						return { user: data.user, fromOfflineCache: false };
+					}
+				}
+
+				if (res.status === 401 || res.status === 403) {
+					// Bila refresh juga sudah ditolak oleh server, performRequest -> executeSingleFlightRefresh telah menghapus token.
+					// Bila token masih ada di storage, berarti refresh gagal karena HP sedang offline (network error).
+					const tokensAfter401 = await storage.getTokens();
+					if (!tokensAfter401?.accessToken && !tokensAfter401?.refreshToken) {
+						if (storage.clearCachedProfile) {
+							await storage.clearCachedProfile();
+						}
+						return { user: null, fromOfflineCache: false };
+					}
+				}
+
+				return await getOfflineDisplayFallback();
+			} catch {
+				// Gangguan jaringan (offline) saat memanggil /api/v1/auth/me -> gunakan cache profil tampilan
+				return await getOfflineDisplayFallback();
+			}
 		}
 	};
 }

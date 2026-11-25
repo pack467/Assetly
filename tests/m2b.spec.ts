@@ -396,5 +396,120 @@ describe('M2 Tahap 2B: UI Mobile (/m/*), Watermark Canvas, Kompresi 1280px, GPS 
 			expect(redirectedToLogin).toBe(true);
 			expect(await storage.getTokens()).toBeNull();
 		});
+
+		it('mempertahankan profil tampilan pengguna saat offline dan menghapus cache profil saat logout atau sesi ditolak server (#1)', async () => {
+			const storage = createMemoryTokenStorage();
+			let isOffline = false;
+			let serverRevoked = false;
+
+			const mockFetch: typeof fetch = async (input) => {
+				if (isOffline) {
+					throw new TypeError('Failed to fetch (offline)');
+				}
+
+				const url = String(input);
+				if (url.endsWith('/api/v1/auth/login')) {
+					return new Response(
+						JSON.stringify({
+							accessToken: 'acc-1',
+							refreshToken: 'ref-1',
+							user: {
+								id: 'u-off-1',
+								name: 'Siti Petugas Lapangan',
+								email: 'siti@itam.local',
+								role: 'OFFICER',
+								isActive: true
+							}
+						}),
+						{ status: 200, headers: { 'content-type': 'application/json' } }
+					);
+				}
+
+				if (url.endsWith('/api/v1/auth/me')) {
+					if (serverRevoked) {
+						return new Response(JSON.stringify({ error: { code: 'UNAUTHENTICATED' } }), {
+							status: 401
+						});
+					}
+					return new Response(
+						JSON.stringify({
+							user: {
+								id: 'u-off-1',
+								name: 'Siti Petugas Lapangan',
+								email: 'siti@itam.local',
+								role: 'OFFICER',
+								isActive: true
+							}
+						}),
+						{ status: 200, headers: { 'content-type': 'application/json' } }
+					);
+				}
+
+				if (url.endsWith('/api/v1/auth/refresh')) {
+					if (serverRevoked) {
+						return new Response(JSON.stringify({ error: { code: 'UNAUTHENTICATED' } }), {
+							status: 401
+						});
+					}
+					return new Response(
+						JSON.stringify({
+							accessToken: 'acc-2',
+							refreshToken: 'ref-2'
+						}),
+						{ status: 200, headers: { 'content-type': 'application/json' } }
+					);
+				}
+
+				if (url.endsWith('/api/v1/auth/logout')) {
+					return new Response(JSON.stringify({ ok: true }), { status: 200 });
+				}
+
+				return new Response('Not found', { status: 404 });
+			};
+
+			const client = createMobileApiClient({
+				baseUrl: 'http://localhost:5173',
+				fetchFn: mockFetch,
+				storage
+			});
+
+			// 1. Login online menyimpan token sekaligus cache profil tampilan
+			const loginRes = await client.login({
+				email: 'siti@itam.local',
+				password: 'secret'
+			});
+			expect(loginRes.ok).toBe(true);
+			expect(await storage.getCachedProfile?.()).toMatchObject({
+				id: 'u-off-1',
+				name: 'Siti Petugas Lapangan',
+				role: 'OFFICER'
+			});
+
+			// 2. Saat HP offline dan memuat ulang /m/*, resolveSessionUser mengembalikan profil dari cache lokal (tidak melempar ke login)
+			isOffline = true;
+			const offlineResolved = await client.resolveSessionUser();
+			expect(offlineResolved.fromOfflineCache).toBe(true);
+			expect(offlineResolved.user).toMatchObject({
+				id: 'u-off-1',
+				name: 'Siti Petugas Lapangan'
+			});
+
+			// 3. Saat sinyal kembali tetapi sesi ternyata telah dicabut di server (401 pada /auth/me dan /auth/refresh), cache profil wajib dihapus
+			isOffline = false;
+			serverRevoked = true;
+			const revokedResolved = await client.resolveSessionUser();
+			expect(revokedResolved.user).toBeNull();
+			expect(revokedResolved.fromOfflineCache).toBe(false);
+			expect(await storage.getTokens()).toBeNull();
+			expect(await storage.getCachedProfile?.()).toBeNull();
+
+			// 4. Login ulang lalu logout eksplisit juga wajib menghapus cache profil
+			serverRevoked = false;
+			await client.login({ email: 'siti@itam.local', password: 'secret' });
+			expect(await storage.getCachedProfile?.()).not.toBeNull();
+			await client.logout();
+			expect(await storage.getTokens()).toBeNull();
+			expect(await storage.getCachedProfile?.()).toBeNull();
+		});
 	});
 });

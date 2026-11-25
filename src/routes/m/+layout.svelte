@@ -53,18 +53,8 @@
 	async function checkSession() {
 		loadingAuth = true;
 		try {
-			const stored = await getTokenStorage().getTokens();
-			if (!stored?.accessToken && !stored?.refreshToken) {
-				currentUser = null;
-				return;
-			}
-			const res = await mobileApi.get('/api/v1/auth/me');
-			if (res.ok) {
-				const data = await res.json();
-				currentUser = data.user;
-			} else {
-				currentUser = null;
-			}
+			const resolved = await mobileApi.resolveSessionUser();
+			currentUser = resolved.user;
 		} catch {
 			currentUser = null;
 		} finally {
@@ -113,9 +103,16 @@
 		isOnline = navigator.onLine;
 		const onOnline = () => {
 			isOnline = true;
-			if (currentUser) {
-				syncPendingOperations().catch(() => {});
-			}
+			// Verifikasi ulang sesi ke server saat sinyal kembali, lalu jalankan sinkronisasi antrean
+			mobileApi
+				.resolveSessionUser()
+				.then((resolved) => {
+					currentUser = resolved.user;
+					if (currentUser) {
+						syncPendingOperations().catch(() => {});
+					}
+				})
+				.catch(() => {});
 		};
 		const onOffline = () => (isOnline = false);
 		window.addEventListener('online', onOnline);
@@ -127,6 +124,7 @@
 		refreshQueueSummary();
 
 		unsubscribeUnauthorized = onMobileUnauthorized(() => {
+			getTokenStorage().clearCachedProfile?.().catch(() => {});
 			currentUser = null;
 			loginError = 'Sesi Anda telah berakhir. Silakan masuk kembali.';
 			if (page.url.pathname !== '/m') {
