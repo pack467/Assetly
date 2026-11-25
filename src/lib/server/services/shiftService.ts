@@ -156,24 +156,26 @@ export async function openShift(
 ) {
 	assertCan(actor, 'shift:manage');
 	const officerActor = actor;
-	const db = outerTx ?? prisma;
-
-	const existingOpen = await db.shift.findFirst({
-		where: {
-			userId: officerActor.id,
-			status: 'OPEN'
-		}
-	});
-
-	if (existingOpen) {
-		throw new AppError(
-			'DUPLICATE_OPERATION',
-			'Anda masih memiliki shift yang sedang terbuka. Tutup shift aktif terlebih dahulu sebelum membuka shift baru.',
-			{ shiftId: existingOpen.id }
-		);
-	}
 
 	const created = await runInTx(outerTx, async (tx) => {
+		const lockKey = `shift_open:${officerActor.id}`;
+		await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+
+		const existingOpen = await tx.shift.findFirst({
+			where: {
+				userId: officerActor.id,
+				status: 'OPEN'
+			}
+		});
+
+		if (existingOpen) {
+			throw new AppError(
+				'DUPLICATE_OPERATION',
+				'Anda masih memiliki shift yang sedang terbuka. Tutup shift aktif terlebih dahulu sebelum membuka shift baru.',
+				{ shiftId: existingOpen.id }
+			);
+		}
+
 		const shift = await tx.shift.create({
 			data: {
 				userId: officerActor.id,
@@ -206,6 +208,36 @@ export async function openShift(
 			forceClosedByAdmin: null
 		}
 	};
+}
+
+async function throwAlreadyClosedShiftError(db: DbTx, shiftId: string): Promise<never> {
+	const forceLog = await db.auditLog.findFirst({
+		where: {
+			entityType: 'Shift',
+			entityId: shiftId,
+			action: 'SHIFT_FORCE_CLOSED_BY_ADMIN'
+		},
+		orderBy: { createdAt: 'desc' }
+	});
+	const forceInfo = forceLog ? parseForceCloseAuditAfter(forceLog.after) : null;
+	if (forceInfo) {
+		throw new AppError(
+			'INVALID_STATUS_TRANSITION',
+			`Shift ini telah ditutup secara darurat oleh Admin (${forceInfo.adminName}) dengan alasan: "${forceInfo.emergencyCloseReason}". Anda dapat menghapus operasi tutup shift ini dari antrean HP.`,
+			{
+				shiftId,
+				forceClosedByAdmin: forceInfo
+			},
+			409
+		);
+	}
+
+	throw new AppError(
+		'INVALID_STATUS_TRANSITION',
+		'Shift ini sudah ditutup sebelumnya. Anda dapat menghapus catatan ini dari antrean.',
+		{ shiftId },
+		409
+	);
 }
 
 export async function getCurrentShiftState(actor: PolicyUser | null | undefined) {
@@ -284,33 +316,7 @@ export async function closeShift(
 	}
 
 	if (existingShift.status !== 'OPEN') {
-		const forceLog = await db.auditLog.findFirst({
-			where: {
-				entityType: 'Shift',
-				entityId: existingShift.id,
-				action: 'SHIFT_FORCE_CLOSED_BY_ADMIN'
-			},
-			orderBy: { createdAt: 'desc' }
-		});
-		const forceInfo = forceLog ? parseForceCloseAuditAfter(forceLog.after) : null;
-		if (forceInfo) {
-			throw new AppError(
-				'INVALID_STATUS_TRANSITION',
-				`Shift ini telah ditutup secara darurat oleh Admin (${forceInfo.adminName}) dengan alasan: "${forceInfo.emergencyCloseReason}". Anda dapat menghapus operasi tutup shift ini dari antrean HP.`,
-				{
-					shiftId: existingShift.id,
-					forceClosedByAdmin: forceInfo
-				},
-				409
-			);
-		}
-
-		throw new AppError(
-			'INVALID_STATUS_TRANSITION',
-			'Shift ini sudah ditutup sebelumnya. Anda dapat menghapus catatan ini dari antrean.',
-			{ shiftId: existingShift.id },
-			409
-		);
+		await throwAlreadyClosedShiftError(db, existingShift.id);
 	}
 
 	const emergencyCloseReason = (input.emergencyCloseReason ?? '').trim();
@@ -404,6 +410,23 @@ export async function closeShift(
 			});
 		}
 
+		// Klaim atomik transisi OPEN -> CLOSED sebelum menyisipkan ShiftItem agar dua request paralel tidak membuat ShiftItem ganda (#4)
+		const claimed = await tx.shift.updateMany({
+			where: {
+				id: shiftId,
+				status: 'OPEN'
+			},
+			data: {
+				status: 'CLOSED',
+				closedAt: now,
+				...(input.note !== undefined ? { note: input.note?.trim() || existingShift.note } : {})
+			}
+		});
+
+		if (claimed.count === 0) {
+			await throwAlreadyClosedShiftError(tx, shiftId);
+		}
+
 		if (outstandingItems.length > 0) {
 			await tx.shiftItem.createMany({
 				data: outstandingItems.map((activeItem) => {
@@ -419,13 +442,8 @@ export async function closeShift(
 			});
 		}
 
-		const updatedShift = await tx.shift.update({
+		const updatedShift = await tx.shift.findUniqueOrThrow({
 			where: { id: shiftId },
-			data: {
-				status: 'CLOSED',
-				closedAt: now,
-				...(input.note !== undefined ? { note: input.note?.trim() || existingShift.note } : {})
-			},
 			include: SHIFT_DETAIL_INCLUDE
 		});
 

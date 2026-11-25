@@ -790,6 +790,80 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			);
 			expect(lateSyncRes.results[0].conflictReason).toContain(emergencyReasonText);
 		});
+
+		it('mencegah duplikasi shift OPEN dan duplikasi ShiftItem pada request openShift serta closeShift paralel (#4)', async () => {
+			// Bersihkan dulu pinjaman aktif dari test sebelumnya
+			await prisma.loanItem.updateMany({
+				where: { returnedAt: null },
+				data: { returnedAt: new Date(), returnCondition: 'NORMAL' }
+			});
+
+			// 1. Dua panggilan openShift paralel untuk petugas yang sama: tepat 1 berhasil, 1 ditolak DUPLICATE_OPERATION
+			const openResults = await Promise.allSettled([
+				openShift(officer2, { note: 'Buka Paralel 1' }),
+				openShift(officer2, { note: 'Buka Paralel 2' })
+			]);
+			const openFulfilled = openResults.filter((r) => r.status === 'fulfilled');
+			const openRejected = openResults.filter((r) => r.status === 'rejected');
+			expect(openFulfilled).toHaveLength(1);
+			expect(openRejected).toHaveLength(1);
+			expect((openRejected[0] as PromiseRejectedResult).reason).toMatchObject({
+				code: 'DUPLICATE_OPERATION',
+				status: 409
+			});
+
+			const activeShiftId = (
+				openFulfilled[0] as PromiseFulfilledResult<Awaited<ReturnType<typeof openShift>>>
+			).value.shift.id;
+
+			// Buat 1 barang yang sedang keluar selama shift ini
+			const suffix = randomUUID().slice(0, 8);
+			const raceAsset = await prisma.asset.create({
+				data: {
+					code: `AST-RACE-SHF-${suffix}`,
+					qrToken: `qr-race-shf-${randomUUID()}`,
+					name: 'Proyektor Uji Balapan Tutup Shift',
+					categoryId,
+					status: 'AVAILABLE'
+				}
+			});
+			const ev = await createEvidenceForActor(borrower1, 'CHECKOUT');
+			const activeLoan = await createLoan(borrower1, {
+				assetId: raceAsset.id,
+				evidenceId: ev.id,
+				purpose: 'Uji Balapan Tutup Shift',
+				expectedReturnAt: new Date(Date.now() + 86400_000).toISOString()
+			});
+			const raceLoanItemId = activeLoan.loan.items[0].id;
+
+			// 2. Dua panggilan closeShift paralel untuk shiftId yang sama: tepat 1 berhasil, 1 ditolak INVALID_STATUS_TRANSITION,
+			//    dan ShiftItem di database hanya tercatat 1 baris (tidak ada duplikasi).
+			const closeResults = await Promise.allSettled([
+				closeShift(officer2, activeShiftId, {
+					note: 'Tutup Paralel A',
+					items: [{ loanItemId: raceLoanItemId, reason: 'Masih dipakai seminar paralel' }]
+				}),
+				closeShift(adminActor, activeShiftId, {
+					emergencyCloseReason: 'Tutup darurat paralel bersamaan dengan petugas',
+					note: 'Tutup Paralel B',
+					items: [{ loanItemId: raceLoanItemId, reason: 'Masih dipakai seminar paralel' }]
+				})
+			]);
+
+			const closeFulfilled = closeResults.filter((r) => r.status === 'fulfilled');
+			const closeRejected = closeResults.filter((r) => r.status === 'rejected');
+			expect(closeFulfilled).toHaveLength(1);
+			expect(closeRejected).toHaveLength(1);
+			expect((closeRejected[0] as PromiseRejectedResult).reason).toMatchObject({
+				code: 'INVALID_STATUS_TRANSITION',
+				status: 409
+			});
+
+			const shiftItemsCount = await prisma.shiftItem.count({
+				where: { shiftId: activeShiftId }
+			});
+			expect(shiftItemsCount).toBe(1);
+		});
 	});
 
 	describe('3. Penanganan CORS Ketat untuk Origin Capacitor (Bagian 12)', () => {
