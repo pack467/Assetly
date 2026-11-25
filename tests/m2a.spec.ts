@@ -16,6 +16,7 @@ import {
 	createLoan,
 	returnLoanItem,
 	approveLoan,
+	rejectLoan,
 	getDashboardSummary
 } from '../src/lib/server/services/loanService';
 import { GET as evidenceFileHandler } from '../src/routes/api/v1/evidence/[id]/file/+server';
@@ -308,6 +309,27 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			);
 			expect(flaggedOnly.riskLevel).toBe('SUSPICIOUS');
 			expect(flaggedOnly.shouldBlock).toBe(false);
+		});
+
+		it('membuktikan perilaku CLOCK_SKEW saat ini: foto yang diambil saat offline 2 jam lalu dan baru diunggah sekarang dinilai jam melenceng (CLOCK_SKEW_LARGE / SUSPICIOUS) (#6)', () => {
+			// Skenario nyata offline: foto diambil pukul 01:00 UTC di gudang tanpa sinyal (jam HP akurat),
+			// lalu baru terunggah ke server pukul 03:00 UTC (2 jam kemudian = 7200 detik) saat sinyal kembali.
+			const takenOfflineTwoHoursAgo = new Date(now.getTime() - 2 * 3600 * 1000);
+			const offlinePhotoRisk = evaluateEvidenceRisk({
+				takenAtDevice: takenOfflineTwoHoursAgo,
+				receivedAtServer: now,
+				gpsAvailable: true,
+				latitude: -6.2001,
+				longitude: 106.8167,
+				accuracyM: 12,
+				isMockLocation: false,
+				location: baseLoc
+			});
+
+			// Bukti bahwa implementasi saat ini membandingkan takenAtDevice langsung dengan receivedAtServer (selisih 7200 detik > 3600 detik)
+			expect(offlinePhotoRisk.clockSkewSec).toBe(7200);
+			expect(offlinePhotoRisk.riskReasons).toContain('CLOCK_SKEW_LARGE');
+			expect(offlinePhotoRisk.riskLevel).toBe('SUSPICIOUS');
 		});
 	});
 
@@ -636,6 +658,37 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			const approved = await approveLoan(adminActor, pendingLoanRes.loan.id);
 			expect(approved.loan.status).toBe('ACTIVE');
 			expect(approved.loan.items[0].asset.status).toBe('BORROWED');
+
+			// 8. Klaim atomik approveLoan vs rejectLoan paralel (#8): tepat satu berhasil, satu ditolak INVALID_STATUS_TRANSITION
+			const contestedApprovalAsset = await prisma.asset.create({
+				data: {
+					code: `AST-APPRACE-${suffix}`,
+					qrToken: `qr-apprace-${randomUUID()}`,
+					name: 'Kamera Uji Balapan Approval',
+					categoryId: approvalCategoryId,
+					status: 'AVAILABLE'
+				}
+			});
+			const raceAppEv = await createTestEvidence(borrower1, 'CHECKOUT');
+			const racePendingLoan = await createLoan(borrower1, {
+				assetId: contestedApprovalAsset.id,
+				evidenceId: raceAppEv.id,
+				purpose: 'Uji Balapan Approve vs Reject',
+				expectedReturnAt
+			});
+			expect(racePendingLoan.loan.status).toBe('PENDING_APPROVAL');
+
+			const raceDecisionResults = await Promise.allSettled([
+				approveLoan(adminActor, racePendingLoan.loan.id),
+				rejectLoan(adminActor, racePendingLoan.loan.id, 'Ditolak bersamaan')
+			]);
+			const decisionFulfilled = raceDecisionResults.filter((r) => r.status === 'fulfilled');
+			const decisionRejected = raceDecisionResults.filter((r) => r.status === 'rejected');
+			expect(decisionFulfilled).toHaveLength(1);
+			expect(decisionRejected).toHaveLength(1);
+			expect((decisionRejected[0] as PromiseRejectedResult).reason).toMatchObject({
+				code: 'INVALID_STATUS_TRANSITION'
+			});
 		});
 
 		it('Menegakkan 5 aturan ketat Evidence: purpose CHECKOUT vs RETURN, pemilik Evidence, pemakaian sekali (DUPLICATE_OPERATION), MOCK_LOCATION pada return, dan validasi EVIDENCE_SIGNING_SECRET', async () => {

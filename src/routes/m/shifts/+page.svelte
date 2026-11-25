@@ -77,6 +77,9 @@
 	let submitting = $state(false);
 	let unsubscribeQueue: (() => void) | null = null;
 
+	const hasPendingShiftOpen = $derived(pendingQueueOps.some((op) => op.type === 'SHIFT_OPEN'));
+	const hasPendingShiftClose = $derived(pendingQueueOps.some((op) => op.type === 'SHIFT_CLOSE'));
+
 	function getItemKey(item: OutstandingLoanItem): string {
 		return item.loanItemId || item.assetId || item.asset.id;
 	}
@@ -209,6 +212,11 @@
 
 	async function handleOpenShift(e: SubmitEvent) {
 		e.preventDefault();
+		if (hasPendingShiftOpen) {
+			queuedMsg =
+				'Pembukaan shift Anda sudah berada di antrean offline dan sedang menunggu sinkronisasi.';
+			return;
+		}
 		errorMsg = '';
 		successMsg = '';
 		queuedMsg = '';
@@ -247,6 +255,11 @@
 	async function handleCloseShift(e: SubmitEvent) {
 		e.preventDefault();
 		if (!currentShift) return;
+		if (hasPendingShiftClose) {
+			queuedMsg =
+				'Penutupan shift Anda sudah berada di antrean offline dan sedang menunggu sinkronisasi.';
+			return;
+		}
 		errorMsg = '';
 		successMsg = '';
 		queuedMsg = '';
@@ -454,10 +467,14 @@
 				</div>
 				<button
 					type="submit"
-					disabled={submitting}
+					disabled={submitting || hasPendingShiftOpen}
 					class="w-full rounded-xl bg-slate-900 py-4 text-base font-extrabold text-white active:bg-slate-800 disabled:opacity-50"
 				>
-					{submitting ? 'Membuka Shift...' : 'BUKA SHIFT SEKARANG'}
+					{hasPendingShiftOpen
+						? 'Menunggu Sinkronisasi Buka Shift...'
+						: submitting
+							? 'Membuka Shift...'
+							: 'BUKA SHIFT SEKARANG'}
 				</button>
 			</form>
 		{:else}
@@ -556,10 +573,14 @@
 
 				<button
 					type="submit"
-					disabled={submitting}
+					disabled={submitting || hasPendingShiftClose}
 					class="w-full rounded-xl bg-slate-900 py-4 text-base font-extrabold text-white active:bg-slate-800 disabled:opacity-50"
 				>
-					{submitting ? 'Menutup Shift...' : 'TUTUP SHIFT SEKARANG'}
+					{hasPendingShiftClose
+						? 'Menunggu Sinkronisasi Tutup Shift...'
+						: submitting
+							? 'Menutup Shift...'
+							: 'TUTUP SHIFT SEKARANG'}
 				</button>
 			</form>
 		{/if}

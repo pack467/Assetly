@@ -110,20 +110,13 @@ export function decodeJwtDisplayProfile(
 		const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
 		const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
 		const jsonStr =
-			typeof atob === 'function'
-				? atob(padded)
-				: Buffer.from(padded, 'base64').toString('utf8');
+			typeof atob === 'function' ? atob(padded) : Buffer.from(padded, 'base64').toString('utf8');
 		const payload = JSON.parse(jsonStr) as Record<string, unknown>;
 		const id = typeof payload.sub === 'string' ? payload.sub : '';
 		const name = typeof payload.name === 'string' ? payload.name : '';
 		const email = typeof payload.email === 'string' ? payload.email : '';
 		const role = payload.role;
-		if (
-			id &&
-			name &&
-			email &&
-			(role === 'ADMIN' || role === 'OFFICER' || role === 'BORROWER')
-		) {
+		if (id && name && email && (role === 'ADMIN' || role === 'OFFICER' || role === 'BORROWER')) {
 			return {
 				id,
 				name,

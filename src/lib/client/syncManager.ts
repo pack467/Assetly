@@ -525,9 +525,40 @@ export async function retryRejectedShiftCloseWithReasons(
 	}
 
 	const missingList = extractMissingShiftCloseAssets(existing);
-	const prevItems = Array.isArray(existing.payload.items)
+	const rawPrevItems = Array.isArray(existing.payload.items)
 		? [...(existing.payload.items as Array<Record<string, unknown>>)]
 		: [];
+
+	// Upsert helper (#7): ganti entri lama yang cocok berdasarkan loanItemId, assetId, atau assetCode
+	const prevItems = [...rawPrevItems];
+	function upsertShiftCloseReasonItem(entry: {
+		loanItemId?: string;
+		assetId?: string;
+		assetCode?: string;
+		reason: string;
+	}) {
+		const normCode = entry.assetCode?.trim().toUpperCase();
+		const idx = prevItems.findIndex((it) => {
+			const itCode = typeof it.assetCode === 'string' ? it.assetCode.trim().toUpperCase() : '';
+			return (
+				(entry.loanItemId && it.loanItemId === entry.loanItemId) ||
+				(entry.assetId && it.assetId === entry.assetId) ||
+				(normCode && itCode === normCode)
+			);
+		});
+		const nextObj: Record<string, unknown> = {
+			...(idx >= 0 ? prevItems[idx] : {}),
+			...(entry.loanItemId ? { loanItemId: entry.loanItemId } : {}),
+			...(entry.assetId ? { assetId: entry.assetId } : {}),
+			...(entry.assetCode ? { assetCode: entry.assetCode } : {}),
+			reason: entry.reason
+		};
+		if (idx >= 0) {
+			prevItems[idx] = nextObj;
+		} else {
+			prevItems.push(nextObj);
+		}
+	}
 
 	for (const missing of missingList) {
 		const reasonText = (
@@ -538,7 +569,7 @@ export async function retryRejectedShiftCloseWithReasons(
 		).trim();
 
 		if (reasonText.length >= 3) {
-			prevItems.push({
+			upsertShiftCloseReasonItem({
 				...(missing.loanItemId ? { loanItemId: missing.loanItemId } : {}),
 				...(missing.assetId ? { assetId: missing.assetId } : {}),
 				assetCode: missing.assetCode,
@@ -547,20 +578,15 @@ export async function retryRejectedShiftCloseWithReasons(
 		}
 	}
 
-	// Tambahkan juga alasan tambahan dari map jika belum ada di missingList
+	// Tambahkan atau perbarui juga alasan dari map berdasarkan key
 	for (const [key, val] of Object.entries(reasonsByAssetCodeOrId)) {
 		const trimmed = val.trim();
 		if (trimmed.length < 3) continue;
-		const alreadyAdded = prevItems.some(
-			(it) => it.assetCode === key || it.assetId === key || it.loanItemId === key
-		);
-		if (!alreadyAdded) {
-			const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key);
-			prevItems.push({
-				...(isUuid ? { assetId: key } : { assetCode: key }),
-				reason: trimmed
-			});
-		}
+		const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key);
+		upsertShiftCloseReasonItem({
+			...(isUuid ? { assetId: key } : { assetCode: key }),
+			reason: trimmed
+		});
 	}
 
 	await storage.remove(oldClientOpId);
@@ -569,6 +595,7 @@ export async function retryRejectedShiftCloseWithReasons(
 		{
 			type: 'SHIFT_CLOSE',
 			label: existing.label,
+			clientCreatedAt: existing.clientCreatedAt,
 			payload: {
 				...existing.payload,
 				items: prevItems

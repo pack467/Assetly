@@ -581,6 +581,26 @@ export async function approveLoan(
 
 	const now = new Date();
 	const updated = await prisma.$transaction(async (tx) => {
+		// Klaim atomik status Loan PENDING_APPROVAL -> ACTIVE (#8)
+		const claimedLoan = await tx.loan.updateMany({
+			where: {
+				id: loanId,
+				status: 'PENDING_APPROVAL'
+			},
+			data: {
+				status: 'ACTIVE',
+				approvedById: adminActor.id,
+				approvedAt: now
+			}
+		});
+
+		if (claimedLoan.count === 0) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				'Peminjaman ini sudah diproses (disetujui atau ditolak) oleh Admin lain.'
+			);
+		}
+
 		for (const item of existing.items) {
 			if (!isValidAssetStatusTransition(item.asset.status, 'BORROWED')) {
 				throw new AppError(
@@ -588,28 +608,32 @@ export async function approveLoan(
 					`Barang ${item.asset.code} tidak dalam status PENDING_APPROVAL.`
 				);
 			}
-			await tx.asset.update({
-				where: { id: item.assetId },
+			const claimedAsset = await tx.asset.updateMany({
+				where: {
+					id: item.assetId,
+					status: 'PENDING_APPROVAL'
+				},
 				data: { status: 'BORROWED', version: { increment: 1 } }
 			});
+			if (claimedAsset.count === 0) {
+				throw new AppError(
+					'INVALID_STATUS_TRANSITION',
+					`Barang ${item.asset.code} tidak dalam status PENDING_APPROVAL.`
+				);
+			}
 			await writeAuditLog(tx, {
 				actorId: adminActor.id,
 				action: 'ASSET_STATUS_CHANGED',
 				entityType: 'Asset',
 				entityId: item.assetId,
-				before: { status: item.asset.status },
+				before: { status: 'PENDING_APPROVAL' },
 				after: { status: 'BORROWED', loanId },
 				ip: ip ?? null
 			});
 		}
 
-		const loan = await tx.loan.update({
+		const loan = await tx.loan.findUniqueOrThrow({
 			where: { id: loanId },
-			data: {
-				status: 'ACTIVE',
-				approvedById: adminActor.id,
-				approvedAt: now
-			},
 			include: LOAN_DETAIL_INCLUDE
 		});
 
@@ -654,6 +678,26 @@ export async function rejectLoan(
 
 	const now = new Date();
 	const updated = await prisma.$transaction(async (tx) => {
+		// Klaim atomik status Loan PENDING_APPROVAL -> REJECTED (#8)
+		const claimedLoan = await tx.loan.updateMany({
+			where: {
+				id: loanId,
+				status: 'PENDING_APPROVAL'
+			},
+			data: {
+				status: 'REJECTED',
+				rejectedReason: reason.trim(),
+				completedAt: now
+			}
+		});
+
+		if (claimedLoan.count === 0) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				'Peminjaman ini sudah diproses (disetujui atau ditolak) oleh Admin lain.'
+			);
+		}
+
 		for (const item of existing.items) {
 			await tx.asset.update({
 				where: { id: item.assetId },
@@ -664,7 +708,7 @@ export async function rejectLoan(
 				action: 'ASSET_STATUS_CHANGED',
 				entityType: 'Asset',
 				entityId: item.assetId,
-				before: { status: item.asset.status },
+				before: { status: 'PENDING_APPROVAL' },
 				after: { status: 'AVAILABLE', loanId, reason: 'LOAN_REJECTED' },
 				ip: ip ?? null
 			});
@@ -676,13 +720,8 @@ export async function rejectLoan(
 			data: { returnedAt: now }
 		});
 
-		const loan = await tx.loan.update({
+		const loan = await tx.loan.findUniqueOrThrow({
 			where: { id: loanId },
-			data: {
-				status: 'REJECTED',
-				rejectedReason: reason.trim(),
-				completedAt: now
-			},
 			include: LOAN_DETAIL_INCLUDE
 		});
 

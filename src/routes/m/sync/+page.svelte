@@ -300,8 +300,8 @@
 				Terdapat operasi yang sudah gagal dikirim ≥ {STUCK_OPERATION_RETRY_THRESHOLD} kali berturut-turut.
 			</div>
 			<p class="text-xs text-amber-900 leading-relaxed">
-				Karena antrean dikirim berurutan (FIFO) untuk menjaga urutan transaksi, operasi yang macet di
-				urutan terdepan akan menahan operasi berikutnya. Anda dapat menekan
+				Karena antrean dikirim berurutan (FIFO) untuk menjaga urutan transaksi, operasi yang macet
+				di urutan terdepan akan menahan operasi berikutnya. Anda dapat menekan
 				<strong>"Coba Kirim Sekarang"</strong> atau menekan
 				<strong>"Batalkan Operasi Macet"</strong> dengan konfirmasi bila operasi tersebut tidak lagi diperlukan.
 			</p>
@@ -537,12 +537,10 @@
 							<div
 								class="space-y-2.5 rounded-xl border border-red-300 bg-red-50 p-3 text-xs text-red-950"
 							>
-								<div class="font-bold">
-									Konfirmasi Batalkan & Hapus Operasi dari Antrean?
-								</div>
+								<div class="font-bold">Konfirmasi Batalkan & Hapus Operasi dari Antrean?</div>
 								<p class="text-red-800">
-									Operasi <strong>{item.label}</strong> belum tersimpan di server. Jika dibatalkan,
-									catatan lokal ini akan dihapus dan antrean berikutnya akan dilanjutkan.
+									Operasi <strong>{item.label}</strong> belum tersimpan di server. Jika dibatalkan, catatan
+									lokal ini akan dihapus dan antrean berikutnya akan dilanjutkan.
 								</p>
 								<div class="flex gap-2">
 									<button

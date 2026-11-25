@@ -633,9 +633,15 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 			{
 				type: 'SHIFT_CLOSE',
 				label: 'Tutup Shift Sore',
+				clientCreatedAt: '2026-11-25T16:30:00.000Z',
 				payload: {
 					shiftId: '44444444-4444-4444-8444-444444444444',
-					items: []
+					items: [
+						{
+							assetCode: 'AST-0099',
+							reason: 'x'
+						}
+					]
 				}
 			},
 			queueStorage
@@ -672,6 +678,8 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 		expect(outcome.accepted).toBe(1);
 		expect(newItem.syncState).toBe('ACCEPTED');
 		expect(newItem.clientOpId).not.toBe(initialClose.clientOpId);
+		// #7: clientCreatedAt asli wajib dipertahankan dan item lama AST-0099 diganti (upsert, bukan duplikat)
+		expect(newItem.clientCreatedAt).toBe('2026-11-25T16:30:00.000Z');
 
 		const secondItems = sentPayloads[1].items as Array<{
 			assetCode: string;

@@ -124,7 +124,9 @@
 		refreshQueueSummary();
 
 		unsubscribeUnauthorized = onMobileUnauthorized(() => {
-			getTokenStorage().clearCachedProfile?.().catch(() => {});
+			getTokenStorage()
+				.clearCachedProfile?.()
+				.catch(() => {});
 			currentUser = null;
 			loginError = 'Sesi Anda telah berakhir. Silakan masuk kembali.';
 			if (page.url.pathname !== '/m') {

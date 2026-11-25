@@ -125,10 +125,23 @@
 		}
 	}
 
-	function openForceCloseForm(shift: ShiftReport) {
+	async function refreshOutstandingItems() {
+		try {
+			const currRes = await fetch('/api/v1/shifts/current');
+			if (currRes.ok) {
+				const currData = await currRes.json();
+				outstandingItems = currData.outstandingItems ?? [];
+			}
+		} catch {
+			// Abaikan bila gagal menyegarkan
+		}
+	}
+
+	async function openForceCloseForm(shift: ShiftReport) {
 		activeForceCloseShiftId = shift.id;
 		emergencyCloseReason = '';
 		emergencyNote = '';
+		await refreshOutstandingItems();
 		const map: Record<string, string> = {};
 		for (const item of outstandingItems) {
 			map[item.loanItemId] = '';
@@ -172,6 +185,7 @@
 			const data = await res.json();
 			if (!res.ok) {
 				errorMsg = data?.error?.message || 'Gagal menutup shift secara darurat.';
+				await refreshOutstandingItems();
 				return;
 			}
 
