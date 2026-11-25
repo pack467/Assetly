@@ -1,5 +1,6 @@
+import type { EvidencePurpose } from '@prisma/client';
 import { prisma } from '$lib/server/db';
-import { writeAuditLog } from '$lib/server/audit';
+import { writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, type PolicyUser } from '$lib/server/policy';
 import { evaluateEvidenceRisk, loadRecentUserEvidencesForRisk } from '$lib/server/risk';
 import {
@@ -212,4 +213,136 @@ export async function getEvidenceDetail(actor: PolicyUser | null | undefined, ev
 		signedUrl: signedUrl.url,
 		signedUrlExpiresAt: signedUrl.expiresAt
 	};
+}
+
+/**
+ * Memastikan foto bukti (Evidence) belum pernah digunakan pada LoanItem (pinjam/kembali),
+ * Handover (serah terima), maupun tutup shift (SHIFT_CLOSED).
+ */
+export async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Promise<void> {
+	const [usedInLoanItem, usedInHandover, usedInShiftClose] = await Promise.all([
+		tx.loanItem.findFirst({
+			where: {
+				OR: [{ checkoutEvidenceId: { in: evidenceIds } }, { returnEvidenceId: { in: evidenceIds } }]
+			},
+			select: { id: true, checkoutEvidenceId: true, returnEvidenceId: true }
+		}),
+		tx.handover.findFirst({
+			where: { evidenceId: { in: evidenceIds } },
+			select: { id: true, evidenceId: true }
+		}),
+		tx.auditLog.findFirst({
+			where: {
+				action: 'SHIFT_CLOSED',
+				OR: evidenceIds.map((id) => ({
+					after: {
+						path: ['evidenceId'],
+						equals: id
+					}
+				}))
+			},
+			select: { id: true }
+		})
+	]);
+
+	if (usedInLoanItem || usedInHandover || usedInShiftClose) {
+		const duplicateId =
+			usedInLoanItem?.checkoutEvidenceId ??
+			usedInLoanItem?.returnEvidenceId ??
+			usedInHandover?.evidenceId ??
+			evidenceIds[0];
+		throw new AppError(
+			'DUPLICATE_OPERATION',
+			'Foto bukti (Evidence) ini sudah pernah digunakan dan tidak boleh dipakai ulang.',
+			{ evidenceId: duplicateId }
+		);
+	}
+}
+
+/**
+ * Memvalidasi 3 aturan wajib pada kumpulan Evidence:
+ * 1. Purpose cocok dengan aksi (CHECKOUT / RETURN / HANDOVER).
+ * 2. Diunggah oleh pengguna yang sedang melakukan aksi (userId === actor.id).
+ * 3. Tidak menggunakan lokasi palsu (MOCK_LOCATION, BR-07) saat RISK_BLOCK_ON_MOCK aktif.
+ */
+export function validateEvidenceOwnershipAndPurpose(params: {
+	evidences: Array<{
+		id: string;
+		purpose: EvidencePurpose;
+		userId: string;
+		isMockLocation: boolean;
+		riskLevel?: string;
+	}>;
+	actor: PolicyUser;
+	expectedPurpose: EvidencePurpose;
+	actionLabel: string;
+}): void {
+	const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
+
+	for (const ev of params.evidences) {
+		if (ev.purpose !== params.expectedPurpose) {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				`Foto bukti untuk ${params.actionLabel} wajib ber-purpose ${params.expectedPurpose} (diterima: ${ev.purpose}).`,
+				{
+					evidenceId: ev.id,
+					expectedPurpose: params.expectedPurpose,
+					actualPurpose: ev.purpose
+				}
+			);
+		}
+
+		if (ev.userId !== params.actor.id) {
+			throw new AppError(
+				'FORBIDDEN',
+				`Foto bukti ${params.actionLabel} harus diunggah oleh pengguna yang sedang melakukan aksi.`,
+				{ evidenceId: ev.id }
+			);
+		}
+
+		if (ev.isMockLocation && blockOnMock) {
+			throw new AppError(
+				'MOCK_LOCATION_BLOCKED',
+				`Bukti ${params.actionLabel} menggunakan lokasi palsu (mock location) dan diblokir sesuai kebijakan keamanan (BR-07).`,
+				{
+					evidenceId: ev.id,
+					...(ev.riskLevel ? { riskLevel: ev.riskLevel } : {})
+				}
+			);
+		}
+	}
+}
+
+/**
+ * Memuat Evidence dari database, memvalidasi purpose + kepemilikan + aturan MOCK_LOCATION,
+ * serta memastikan Evidence belum pernah dipakai (sekali pakai).
+ */
+export async function validateAndAssertEvidenceUnused(
+	tx: DbTx,
+	params: {
+		actor: PolicyUser;
+		evidenceIds: string[];
+		expectedPurpose: EvidencePurpose;
+		actionLabel: string;
+	}
+): Promise<void> {
+	const evidences = await tx.evidence.findMany({
+		where: { id: { in: params.evidenceIds } }
+	});
+
+	if (evidences.length !== params.evidenceIds.length) {
+		throw new AppError(
+			'EVIDENCE_REQUIRED',
+			`Data foto bukti ${params.actionLabel} tidak ditemukan.`
+		);
+	}
+
+	validateEvidenceOwnershipAndPurpose({
+		evidences,
+		actor: params.actor,
+		expectedPurpose: params.expectedPurpose,
+		actionLabel: params.actionLabel
+	});
+
+	await assertEvidenceNotUsed(tx, params.evidenceIds);
 }

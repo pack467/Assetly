@@ -5,8 +5,11 @@ import { assertCan, can, type PolicyUser } from '$lib/server/policy';
 import { createEvidenceSignedUrl } from '$lib/server/storage';
 import { isValidAssetStatusTransition } from '$lib/shared/enums';
 import { AppError } from '$lib/shared/errors';
+import { assertEvidenceNotUsed, validateEvidenceOwnershipAndPurpose } from './evidenceService';
 import type { z } from 'zod';
 import type { createLoanSchema, returnLoanItemSchema } from '$lib/shared/schemas/loan';
+
+export { assertEvidenceNotUsed };
 
 const LOAN_DETAIL_INCLUDE = {
 	borrower: {
@@ -37,46 +40,6 @@ const LOAN_DETAIL_INCLUDE = {
 	},
 	handovers: true
 } satisfies Prisma.LoanInclude;
-
-export async function assertEvidenceNotUsed(tx: DbTx, evidenceIds: string[]): Promise<void> {
-	const [usedInLoanItem, usedInHandover, usedInShiftClose] = await Promise.all([
-		tx.loanItem.findFirst({
-			where: {
-				OR: [{ checkoutEvidenceId: { in: evidenceIds } }, { returnEvidenceId: { in: evidenceIds } }]
-			},
-			select: { id: true, checkoutEvidenceId: true, returnEvidenceId: true }
-		}),
-		tx.handover.findFirst({
-			where: { evidenceId: { in: evidenceIds } },
-			select: { id: true, evidenceId: true }
-		}),
-		tx.auditLog.findFirst({
-			where: {
-				action: 'SHIFT_CLOSED',
-				OR: evidenceIds.map((id) => ({
-					after: {
-						path: ['evidenceId'],
-						equals: id
-					}
-				}))
-			},
-			select: { id: true }
-		})
-	]);
-
-	if (usedInLoanItem || usedInHandover || usedInShiftClose) {
-		const duplicateId =
-			usedInLoanItem?.checkoutEvidenceId ??
-			usedInLoanItem?.returnEvidenceId ??
-			usedInHandover?.evidenceId ??
-			evidenceIds[0];
-		throw new AppError(
-			'DUPLICATE_OPERATION',
-			'Foto bukti (Evidence) ini sudah pernah digunakan dan tidak boleh dipakai ulang.',
-			{ evidenceId: duplicateId }
-		);
-	}
-}
 
 export async function createLoan(
 	actor: PolicyUser | null | undefined,
@@ -189,34 +152,12 @@ export async function createLoan(
 		}
 	}
 
-	const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
-	for (const ev of evidences) {
-		// 1. Saat pinjam, foto bukti harus ber-purpose CHECKOUT
-		if (ev.purpose !== 'CHECKOUT') {
-			throw new AppError(
-				'VALIDATION_ERROR',
-				`Foto bukti untuk peminjaman wajib ber-purpose CHECKOUT (diterima: ${ev.purpose}).`,
-				{ evidenceId: ev.id, expectedPurpose: 'CHECKOUT', actualPurpose: ev.purpose }
-			);
-		}
-
-		// 2. Foto bukti harus diunggah oleh user yang sedang melakukan aksi
-		if (ev.userId !== actor.id) {
-			throw new AppError(
-				'FORBIDDEN',
-				'Foto bukti peminjaman harus diunggah oleh pengguna yang sedang melakukan aksi.',
-				{ evidenceId: ev.id }
-			);
-		}
-
-		// 4. Aturan MOCK_LOCATION (BR-07)
-		if (ev.isMockLocation && blockOnMock) {
-			throw new AppError(
-				'MOCK_LOCATION_BLOCKED',
-				'Bukti menggunakan lokasi palsu (mock location) dan tidak dapat dipakai meminjam (BR-07).'
-			);
-		}
-	}
+	validateEvidenceOwnershipAndPurpose({
+		evidences,
+		actor,
+		expectedPurpose: 'CHECKOUT',
+		actionLabel: 'peminjaman'
+	});
 
 	try {
 		const createdLoan = await runInTx(outerTx, async (tx) => {
@@ -470,33 +411,12 @@ export async function returnLoanItem(
 		throw new AppError('EVIDENCE_REQUIRED', 'Foto bukti pengembalian tidak ditemukan.');
 	}
 
-	// 1. Saat kembali, foto bukti harus ber-purpose RETURN
-	if (evidence.purpose !== 'RETURN') {
-		throw new AppError(
-			'VALIDATION_ERROR',
-			`Foto bukti untuk pengembalian wajib ber-purpose RETURN (diterima: ${evidence.purpose}).`,
-			{ evidenceId: evidence.id, expectedPurpose: 'RETURN', actualPurpose: evidence.purpose }
-		);
-	}
-
-	// 2. Foto bukti harus diunggah oleh user yang sedang melakukan aksi
-	if (evidence.userId !== actor.id) {
-		throw new AppError(
-			'FORBIDDEN',
-			'Foto bukti pengembalian harus diunggah oleh pengguna yang sedang memproses pengembalian.',
-			{ evidenceId: evidence.id }
-		);
-	}
-
-	// 4. Terapkan aturan MOCK_LOCATION (BR-07) juga pada alur pengembalian
-	const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
-	if (evidence.isMockLocation && blockOnMock) {
-		throw new AppError(
-			'MOCK_LOCATION_BLOCKED',
-			'Bukti pengembalian menggunakan lokasi palsu (mock location) dan diblokir sesuai kebijakan keamanan (BR-07).',
-			{ evidenceId: evidence.id, riskLevel: evidence.riskLevel }
-		);
-	}
+	validateEvidenceOwnershipAndPurpose({
+		evidences: [evidence],
+		actor,
+		expectedPurpose: 'RETURN',
+		actionLabel: 'pengembalian'
+	});
 
 	const nextAssetStatus = input.returnCondition === 'DAMAGED' ? 'DAMAGED' : 'AVAILABLE';
 	if (!isValidAssetStatusTransition(existingItem.asset.status, nextAssetStatus)) {

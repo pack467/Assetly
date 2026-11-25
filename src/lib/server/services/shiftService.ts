@@ -3,7 +3,7 @@ import { prisma } from '$lib/server/db';
 import { runInTx, writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, type PolicyUser } from '$lib/server/policy';
 import { AppError } from '$lib/shared/errors';
-import { assertEvidenceNotUsed } from './loanService';
+import { validateAndAssertEvidenceUnused } from './evidenceService';
 import type { z } from 'zod';
 import type { closeShiftSchema, openShiftSchema } from '$lib/shared/schemas/handoverShift';
 
@@ -228,30 +228,12 @@ export async function closeShift(
 	const closed = await runInTx(outerTx, async (tx) => {
 		// Bila tutup shift melampirkan foto bukti (evidenceId), terapkan aturan Evidence yang sama
 		if (input.evidenceId) {
-			const ev = await tx.evidence.findUnique({ where: { id: input.evidenceId } });
-			if (!ev) {
-				throw new AppError('EVIDENCE_REQUIRED', 'Foto bukti tutup shift tidak ditemukan.');
-			}
-			if (ev.purpose !== 'HANDOVER') {
-				throw new AppError(
-					'VALIDATION_ERROR',
-					`Foto bukti tutup shift wajib ber-purpose HANDOVER (diterima: ${ev.purpose}).`
-				);
-			}
-			if (ev.userId !== officerActor.id) {
-				throw new AppError(
-					'FORBIDDEN',
-					'Foto bukti tutup shift harus diunggah oleh petugas yang sedang menutup shift.'
-				);
-			}
-			const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
-			if (ev.isMockLocation && blockOnMock) {
-				throw new AppError(
-					'MOCK_LOCATION_BLOCKED',
-					'Foto bukti tutup shift menggunakan lokasi palsu (mock location) dan diblokir (BR-07).'
-				);
-			}
-			await assertEvidenceNotUsed(tx, [input.evidenceId]);
+			await validateAndAssertEvidenceUnused(tx, {
+				actor: officerActor,
+				evidenceIds: [input.evidenceId],
+				expectedPurpose: 'HANDOVER',
+				actionLabel: 'tutup shift'
+			});
 		}
 
 		if (outstandingItems.length > 0) {

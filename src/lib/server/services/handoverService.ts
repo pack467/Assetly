@@ -5,7 +5,7 @@ import { runInTx, writeAuditLog, type DbTx } from '$lib/server/audit';
 import { assertCan, type PolicyUser } from '$lib/server/policy';
 import { createEvidenceSignedUrl } from '$lib/server/storage';
 import { AppError } from '$lib/shared/errors';
-import { assertEvidenceNotUsed } from './loanService';
+import { validateAndAssertEvidenceUnused } from './evidenceService';
 import type { z } from 'zod';
 import type {
 	confirmHandoverSchema,
@@ -57,44 +57,12 @@ async function validateHandoverEvidence(
 	actor: PolicyUser,
 	evidenceId: string
 ): Promise<void> {
-	const evidence = await tx.evidence.findUnique({
-		where: { id: evidenceId }
+	await validateAndAssertEvidenceUnused(tx, {
+		actor,
+		evidenceIds: [evidenceId],
+		expectedPurpose: 'HANDOVER',
+		actionLabel: 'serah terima'
 	});
-
-	if (!evidence) {
-		throw new AppError('EVIDENCE_REQUIRED', 'Data foto bukti serah terima tidak ditemukan.');
-	}
-
-	// 1. Purpose wajib HANDOVER
-	if (evidence.purpose !== 'HANDOVER') {
-		throw new AppError(
-			'VALIDATION_ERROR',
-			`Foto bukti untuk serah terima wajib ber-purpose HANDOVER (diterima: ${evidence.purpose}).`,
-			{ evidenceId: evidence.id, expectedPurpose: 'HANDOVER', actualPurpose: evidence.purpose }
-		);
-	}
-
-	// 2. Foto bukti wajib diunggah oleh pelaku yang sedang menjalankan aksi
-	if (evidence.userId !== actor.id) {
-		throw new AppError(
-			'FORBIDDEN',
-			'Foto bukti serah terima harus diunggah oleh pengguna yang sedang melakukan aksi.',
-			{ evidenceId: evidence.id }
-		);
-	}
-
-	// 3. Cek MOCK_LOCATION (BR-07)
-	const blockOnMock = (process.env.RISK_BLOCK_ON_MOCK ?? 'true').toLowerCase() !== 'false';
-	if (evidence.isMockLocation && blockOnMock) {
-		throw new AppError(
-			'MOCK_LOCATION_BLOCKED',
-			'Bukti serah terima menggunakan lokasi palsu (mock location) dan diblokir sesuai kebijakan keamanan (BR-07).',
-			{ evidenceId: evidence.id }
-		);
-	}
-
-	// 4. Satu Evidence hanya boleh dipakai sekali
-	await assertEvidenceNotUsed(tx, [evidenceId]);
 }
 
 function formatHandoverRecord(h: Prisma.HandoverGetPayload<{ include: typeof HANDOVER_INCLUDE }>) {
