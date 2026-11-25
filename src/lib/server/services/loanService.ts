@@ -935,6 +935,8 @@ export async function getDashboardSummary(actor: PolicyUser | null | undefined) 
 		}),
 		prisma.handover.count({
 			where: {
+				documentNo: null,
+				loan: { status: 'ACTIVE' },
 				OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
 			}
 		}),

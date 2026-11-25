@@ -584,6 +584,7 @@ export async function listHandovers(
 		...(params.unconfirmedOnly
 			? {
 					documentNo: null,
+					loan: { status: 'ACTIVE' },
 					OR: [{ giverConfirmedAt: null }, { receiverConfirmedAt: null }]
 				}
 			: {})

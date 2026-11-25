@@ -374,6 +374,8 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 			// KASUS B: Pemegang saat ini (borrower1) membuat DUA serah terima gantung:
 			// Handover #1: borrower1 -> borrower2
 			// Handover #2: borrower1 -> officer1
+			const dashBeforeDup = await getDashboardSummary(adminActor);
+
 			const hoDup1Ev = await createEvidenceForActor(borrower1, 'HANDOVER');
 			const hoDup1 = await createHandover(borrower1, {
 				loanId: edgeLoanId,
@@ -387,6 +389,11 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 				receiverId: officer1.id,
 				evidenceId: hoDup2Ev.id
 			});
+
+			const dashDuringDup = await getDashboardSummary(adminActor);
+			expect(dashDuringDup.loans.unconfirmedHandoversCount).toBe(
+				dashBeforeDup.loans.unconfirmedHandoversCount + 2
+			);
 
 			// Saat borrower2 mengonfirmasi Handover #1, pemegang berpindah ke borrower2
 			// dan Handover #2 otomatis dibatalkan (superseded)
@@ -406,6 +413,18 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 				}
 			});
 			expect(supersededAudit).not.toBeNull();
+
+			// Pastikan handover yang sudah SUPERSEDED tidak dihitung sebagai unconfirmed/pending di dashboard maupun listHandovers
+			const unconfirmedForEdgeLoan = await listHandovers(adminActor, {
+				loanId: edgeLoanId,
+				unconfirmedOnly: true
+			});
+			expect(unconfirmedForEdgeLoan.items).toHaveLength(0);
+
+			const dashAfterSupersede = await getDashboardSummary(adminActor);
+			expect(dashAfterSupersede.loans.unconfirmedHandoversCount).toBe(
+				dashBeforeDup.loans.unconfirmedHandoversCount
+			);
 
 			// Jika officer1 mencoba mengonfirmasi Handover #2 setelah pemegang sudah berpindah ke borrower2 -> DITOLAK (409 INVALID_STATUS_TRANSITION)
 			await expect(confirmHandover(officer1, hoDup2.handover.id)).rejects.toMatchObject({
