@@ -60,6 +60,17 @@
 	let errorMsg = $state('');
 	let successMsg = $state('');
 
+	function formatOfflineQueueDuration(sec: number | null | undefined): string {
+		const s = Math.max(0, Math.round(sec ?? 0));
+		if (s < 60) return `${s} detik`;
+		const hours = Math.floor(s / 3600);
+		const minutes = Math.floor((s % 3600) / 60);
+		if (hours > 0) {
+			return `${hours} jam ${minutes} menit (${s} detik)`;
+		}
+		return `${minutes} menit (${s} detik)`;
+	}
+
 	async function loadLoans() {
 		loading = true;
 		errorMsg = '';
@@ -260,13 +271,18 @@
 													({ev.riskReasons.join(', ')})
 												{/if}
 											</div>
+											{#if ev.riskReasons?.includes('OFFLINE_CAPTURE') || (ev.offlineDelaySec ?? 0) >= 60}
+												<div
+													class="rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-medium text-sky-900"
+												>
+													<strong>OFFLINE_CAPTURE:</strong> Foto diambil saat offline dan mengantre
+													selama
+													<strong>{formatOfflineQueueDuration(ev.offlineDelaySec)}</strong> sebelum terunggah.
+												</div>
+											{/if}
 											<div>
-												Selisih Jam Efektif (Clock Skew): {ev.clockSkewSec ?? 0} detik
-											</div>
-											<div>
-												Selisih Mentah (Ambil vs Terima): {ev.rawClockSkewSec ??
-													ev.clockSkewSec ??
-													0} detik · Lama Offline: {ev.offlineDelaySec ?? 0} detik
+												Selisih Jam Saat Unggah (Clock Skew): {ev.clockSkewSec ?? 0} detik · Selisih Mentah:
+												{ev.rawClockSkewSec ?? ev.clockSkewSec ?? 0} detik
 											</div>
 											<div>
 												Lokasi:
@@ -299,11 +315,21 @@
 										<div class="mt-1 space-y-0.5 text-slate-600">
 											<div>
 												Risiko: <strong>{RiskLevelLabels[rev.riskLevel]}</strong>
+												{#if rev.riskReasons && rev.riskReasons.length > 0}
+													({rev.riskReasons.join(', ')})
+												{/if}
 											</div>
+											{#if rev.riskReasons?.includes('OFFLINE_CAPTURE') || (rev.offlineDelaySec ?? 0) >= 60}
+												<div
+													class="rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-medium text-sky-900"
+												>
+													<strong>OFFLINE_CAPTURE:</strong> Diambil saat offline, mengantre
+													<strong>{formatOfflineQueueDuration(rev.offlineDelaySec)}</strong>.
+												</div>
+											{/if}
 											<div>
-												Selisih Jam Efektif: {rev.clockSkewSec ?? 0} detik · Mentah:
-												{rev.rawClockSkewSec ?? rev.clockSkewSec ?? 0} detik · Offline:
-												{rev.offlineDelaySec ?? 0} detik
+												Selisih Jam Saat Unggah: {rev.clockSkewSec ?? 0} detik · Mentah:
+												{rev.rawClockSkewSec ?? rev.clockSkewSec ?? 0} detik
 											</div>
 											{#if item.returnSignedUrl}
 												<a

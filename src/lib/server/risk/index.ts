@@ -5,6 +5,7 @@ export type RiskReasonCode =
 	| 'MOCK_LOCATION'
 	| 'CLOCK_SKEW'
 	| 'CLOCK_SKEW_LARGE'
+	| 'OFFLINE_CAPTURE'
 	| 'NO_GPS'
 	| 'ZERO_ACCURACY'
 	| 'FAR_FROM_LOCATION'
@@ -17,7 +18,8 @@ export interface RiskConfig {
 	clockSkewWarnSec: number;
 	clockSkewSuspiciousSec: number;
 	futureToleranceSec: number;
-	offlineToleranceSec: number;
+	maxOfflineQueueSec: number;
+	offlineCaptureNoteMinSec: number;
 	maxAccuracyM: number;
 	farLocationMultiplier: number;
 	maxSpeedKmh: number;
@@ -29,7 +31,8 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
 	clockSkewWarnSec: 300,
 	clockSkewSuspiciousSec: 3600,
 	futureToleranceSec: 60,
-	offlineToleranceSec: 15 * 60, // toleransi 15 menit sejak aktivitas online terakhir
+	maxOfflineQueueSec: Number(process.env.RISK_MAX_OFFLINE_SEC) || 24 * 60 * 60, // batas wajar antrean offline (default 24 jam)
+	offlineCaptureNoteMinSec: 60, // tambahkan catatan informatif OFFLINE_CAPTURE bila mengantre >= 60 detik
 	maxAccuracyM: 5000,
 	farLocationMultiplier: 5,
 	maxSpeedKmh: 150,
@@ -64,11 +67,6 @@ export interface PreviousEvidencePoint {
 
 export interface EvidenceRiskContext {
 	recentUserEvidences?: PreviousEvidencePoint[];
-	/**
-	 * Waktu aktivitas online terakhir pengguna yang tercatat di server
-	 * (diambil dari waktu efektif Evidence terakhir pengguna atau Session.createdAt aktif terakhir).
-	 */
-	lastOnlineActivityAt?: Date | null;
 	/**
 	 * Waktu takenAtDevice dari bukti terakhir pengguna yang sama (termasuk bukti non-GPS)
 	 * untuk menegakkan urutan waktu monotonik (takenAtDevice baru tidak boleh lebih tua dari bukti terakhir).
@@ -162,47 +160,42 @@ export function evaluateEvidenceRisk(
 		: null;
 	const latestPrevTakenAt = context.latestPreviousTakenAt ?? latestPrev?.takenAtDevice ?? null;
 
-	// Syarat keabsahan klaim waktu ambil (takenAtDevice):
-	// 1) Tidak boleh di masa depan terhadap receivedAtServer maupun uploadedAtDevice (toleransi 60 detik)
+	// Syarat keabsahan klaim antrean offline (tanpa ketergantungan pada Session.lastSeenAt):
+	// 1) Jam HP saat unggah (uploadedAtDevice) konsisten dengan jam server (selisih <= clockSkewWarnSec)
+	const isUploadClockConsistent = uploadClockSkewSec <= cfg.clockSkewWarnSec;
+
+	// 2) takenAtDevice tidak boleh di masa depan terhadap receivedAtServer maupun uploadedAtDevice (toleransi 60 detik)
 	const isTakenInFutureOfServer =
 		(input.takenAtDevice.getTime() - receivedAt.getTime()) / 1000 > cfg.futureToleranceSec;
 	const isTakenInFutureOfUpload = rawClaimedOfflineSec < -cfg.futureToleranceSec;
 
-	// 2) Tidak boleh lebih tua dari bukti terakhir milik pengguna yang sama
+	// 3) takenAtDevice tidak boleh lebih tua dari bukti terakhir milik pengguna yang sama
 	const isOlderThanPreviousEvidence = Boolean(
 		latestPrevTakenAt && input.takenAtDevice.getTime() < latestPrevTakenAt.getTime()
 	);
 
-	// Tentukan titik aktivitas online terakhir pengguna di server (lastOnlineAnchor)
-	let lastOnlineAnchor: Date | null = context.lastOnlineActivityAt ?? null;
-	if (latestPrevEffectiveAt) {
-		if (!lastOnlineAnchor || latestPrevEffectiveAt.getTime() > lastOnlineAnchor.getTime()) {
-			lastOnlineAnchor = latestPrevEffectiveAt;
-		}
-	}
+	// 4) Lama antrean offline (uploadedAtDevice - takenAtDevice) berada di bawah batas wajar yang dikonfigurasi (default 24 jam)
+	const positiveClaimedOfflineSec = Math.max(0, rawClaimedOfflineSec);
+	const isWithinMaxOfflineLimit = positiveClaimedOfflineSec <= cfg.maxOfflineQueueSec;
 
 	let offlineDelaySec = 0;
 	let clockSkewSec = rawClockSkewSec;
+	let isValidOfflineCapture = false;
 
-	if (isTakenInFutureOfServer || isTakenInFutureOfUpload || isOlderThanPreviousEvidence) {
-		// Klaim waktu ambil melanggar batas masa depan atau urutan monotonik bukti -> tidak ada potongan offline
+	if (
+		isUploadClockConsistent &&
+		!isTakenInFutureOfServer &&
+		!isTakenInFutureOfUpload &&
+		!isOlderThanPreviousEvidence &&
+		isWithinMaxOfflineLimit
+	) {
+		offlineDelaySec = positiveClaimedOfflineSec;
+		clockSkewSec = uploadClockSkewSec;
+		isValidOfflineCapture = offlineDelaySec >= cfg.offlineCaptureNoteMinSec;
+	} else {
+		// Bila jam HP saat unggah tidak konsisten dengan server, atau takenAtDevice di masa depan / lebih tua dari batas -> tandai CLOCK_SKEW
 		offlineDelaySec = 0;
 		clockSkewSec = Math.max(uploadClockSkewSec, rawClockSkewSec);
-	} else {
-		const positiveClaimedOfflineSec = Math.max(0, rawClaimedOfflineSec);
-		let maxAllowedOfflineSec = positiveClaimedOfflineSec;
-		if (lastOnlineAnchor) {
-			const elapsedSinceLastOnlineSec = Math.max(
-				0,
-				Math.round((receivedAt.getTime() - lastOnlineAnchor.getTime()) / 1000)
-			);
-			maxAllowedOfflineSec = elapsedSinceLastOnlineSec + cfg.offlineToleranceSec;
-		}
-
-		offlineDelaySec = Math.min(positiveClaimedOfflineSec, maxAllowedOfflineSec);
-		const unexplainedOfflineSec = Math.max(0, positiveClaimedOfflineSec - maxAllowedOfflineSec);
-		// Total CLOCK_SKEW sesungguhnya = (a) selisih jam HP saat unggah + (b) klaim offline yang melampaui batas aktivitas online terakhir
-		clockSkewSec = uploadClockSkewSec + unexplainedOfflineSec;
 	}
 
 	const effectiveCapturedAt = new Date(receivedAt.getTime() - offlineDelaySec * 1000);
@@ -220,13 +213,16 @@ export function evaluateEvidenceRisk(
 		}
 	}
 
-	// 2. CLOCK_SKEW & CLOCK_SKEW_LARGE
+	// 2. CLOCK_SKEW & CLOCK_SKEW_LARGE vs catatan informatif OFFLINE_CAPTURE
 	if (clockSkewSec > cfg.clockSkewSuspiciousSec) {
 		reasons.push('CLOCK_SKEW_LARGE');
 		riskLevel = elevateLevel(riskLevel, 'SUSPICIOUS');
 	} else if (clockSkewSec > cfg.clockSkewWarnSec) {
 		reasons.push('CLOCK_SKEW');
 		riskLevel = elevateLevel(riskLevel, 'NEEDS_REVIEW');
+	} else if (isValidOfflineCapture) {
+		// Catatan informatif (tidak menaikkan riskLevel; foto tetap NORMAL)
+		reasons.push('OFFLINE_CAPTURE');
 	}
 
 	const hasValidCoords =
@@ -374,62 +370,28 @@ export async function loadRecentUserEvidencesForRisk(
 }
 
 /**
- * Memuat konteks risiko lengkap pengguna dari database:
+ * Memuat konteks risiko pengguna dari database:
  * - recentUserEvidences: 5 bukti ber-GPS terakhir untuk IMPOSSIBLE_JUMP & REPEATED_COORDS
- * - latestPreviousTakenAt: takenAtDevice dari bukti terakhir pengguna (termasuk non-GPS) untuk cek monotonik
- * - lastOnlineActivityAt: diambil dari sumber paling sederhana dan andal di server, yaitu
- *   maksimum antara waktu efektif Evidence terakhir pengguna (receivedAtServer - offlineDelaySec)
- *   dan waktu login sesi aktif terakhir (Session.createdAt).
+ * - latestPreviousTakenAt: takenAtDevice dari bukti terakhir pengguna (termasuk non-GPS) untuk cek urutan waktu monotonik
+ * (Tidak lagi bergantung pada Session.lastSeenAt untuk penilaian risiko agar refresh token saat rekoneksi tidak memicu false positive).
  */
 export async function loadUserEvidenceRiskContext(
 	tx: DbTx,
 	userId: string
 ): Promise<EvidenceRiskContext> {
-	const [recentUserEvidences, latestAnyEvidence, latestActiveSession] = await Promise.all([
+	const [recentUserEvidences, latestAnyEvidence] = await Promise.all([
 		loadRecentUserEvidencesForRisk(tx, userId),
 		tx.evidence.findFirst({
 			where: { userId },
 			orderBy: { receivedAtServer: 'desc' },
 			select: {
-				takenAtDevice: true,
-				receivedAtServer: true,
-				offlineDelaySec: true
-			}
-		}),
-		tx.session.findFirst({
-			where: {
-				userId,
-				revokedAt: null
-			},
-			orderBy: [{ lastSeenAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
-			select: {
-				lastSeenAt: true,
-				createdAt: true
+				takenAtDevice: true
 			}
 		})
 	]);
 
-	const latestEvidenceEffectiveAt = latestAnyEvidence
-		? new Date(
-				latestAnyEvidence.receivedAtServer.getTime() -
-					(latestAnyEvidence.offlineDelaySec ?? 0) * 1000
-			)
-		: null;
-
-	const sessionSeenAt = latestActiveSession?.lastSeenAt ?? latestActiveSession?.createdAt ?? null;
-	let lastOnlineActivityAt: Date | null = null;
-	if (latestEvidenceEffectiveAt && sessionSeenAt) {
-		lastOnlineActivityAt =
-			latestEvidenceEffectiveAt.getTime() >= sessionSeenAt.getTime()
-				? latestEvidenceEffectiveAt
-				: sessionSeenAt;
-	} else {
-		lastOnlineActivityAt = latestEvidenceEffectiveAt ?? sessionSeenAt;
-	}
-
 	return {
 		recentUserEvidences,
-		latestPreviousTakenAt: latestAnyEvidence?.takenAtDevice ?? null,
-		lastOnlineActivityAt
+		latestPreviousTakenAt: latestAnyEvidence?.takenAtDevice ?? null
 	};
 }

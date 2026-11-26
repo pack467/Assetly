@@ -11,6 +11,8 @@ import {
 	savePrivateEvidenceFile,
 	verifyEvidenceSignedUrl
 } from '../src/lib/server/storage';
+import { hashRefreshToken } from '../src/lib/server/auth/tokens';
+import { refreshUserSession } from '../src/lib/server/auth/service';
 import { uploadEvidence, getEvidenceDetail } from '../src/lib/server/services/evidenceService';
 import {
 	createLoan,
@@ -311,31 +313,25 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			expect(flaggedOnly.shouldBlock).toBe(false);
 		});
 
-		it('menilai adil foto offline jujur (2 jam), mencegah IMPOSSIBLE_JUMP palsu pada batch offline 30 menit, serta tetap menangkap pemalsuan jam HP saat online maupun jam HP salah saat unggah (#6)', () => {
-			// 1. Foto offline jujur 2 jam: diambil pukul 01:00 UTC saat offline (aktivitas online terakhir pukul 00:45 UTC),
+		it('menilai foto offline jujur (2 jam) sebagai NORMAL dengan catatan informatif OFFLINE_CAPTURE, mencegah IMPOSSIBLE_JUMP palsu pada batch offline 30 menit, serta menandai CLOCK_SKEW bila jam HP saat unggah melenceng atau takenAtDevice di masa depan/melebihi batas (#6)', () => {
+			// 1. Foto offline jujur 2 jam: diambil pukul 01:00 UTC saat offline,
 			//    diunggah pukul 03:00 UTC saat sinyal kembali (uploadedAtDevice = 03:00 UTC).
 			const takenTwoHoursAgo = new Date(now.getTime() - 2 * 3600 * 1000);
-			const lastOnlineBeforeWarehouse = new Date(now.getTime() - 2.25 * 3600 * 1000);
 
-			const honestOfflineRes = evaluateEvidenceRisk(
-				{
-					takenAtDevice: takenTwoHoursAgo,
-					uploadedAtDevice: now,
-					receivedAtServer: now,
-					gpsAvailable: true,
-					latitude: -6.2001,
-					longitude: 106.8167,
-					accuracyM: 12,
-					isMockLocation: false,
-					location: baseLoc
-				},
-				{
-					lastOnlineActivityAt: lastOnlineBeforeWarehouse
-				}
-			);
+			const honestOfflineRes = evaluateEvidenceRisk({
+				takenAtDevice: takenTwoHoursAgo,
+				uploadedAtDevice: now,
+				receivedAtServer: now,
+				gpsAvailable: true,
+				latitude: -6.2001,
+				longitude: 106.8167,
+				accuracyM: 12,
+				isMockLocation: false,
+				location: baseLoc
+			});
 
 			expect(honestOfflineRes.riskLevel).toBe('NORMAL');
-			expect(honestOfflineRes.riskReasons).toEqual([]);
+			expect(honestOfflineRes.riskReasons).toEqual(['OFFLINE_CAPTURE']);
 			expect(honestOfflineRes.clockSkewSec).toBe(0);
 			expect(honestOfflineRes.rawClockSkewSec).toBe(7200);
 			expect(honestOfflineRes.offlineDelaySec).toBe(7200);
@@ -366,7 +362,6 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 					location: buildingBLoc
 				},
 				{
-					lastOnlineActivityAt: takenTwoHoursAgo,
 					latestPreviousTakenAt: takenTwoHoursAgo,
 					recentUserEvidences: [
 						{
@@ -382,39 +377,13 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			);
 
 			expect(secondOfflineBatchPhoto.riskReasons).not.toContain('IMPOSSIBLE_JUMP');
+			expect(secondOfflineBatchPhoto.riskReasons).toEqual(['OFFLINE_CAPTURE']);
 			expect(secondOfflineBatchPhoto.riskLevel).toBe('NORMAL');
 			expect(secondOfflineBatchPhoto.clockSkewSec).toBe(0);
 			expect(secondOfflineBatchPhoto.offlineDelaySec).toBe(5401);
 
-			// 3. Pengguna memundurkan jam HP saat online (baru saja aktif online 5 menit lalu, memundurkan jam 2 jam saat memotret,
-			//    lalu mengembalikan jam HP ke waktu sekarang saat mengunggah agar berpura-pura offline 2 jam):
-			//    Batas klaim offline maksimum = 5 menit + 15 menit toleransi = 20 menit (1200 detik).
-			//    Sisa 6000 detik tidak terjelaskan -> TETAP TERTANGKAP sebagai CLOCK_SKEW_LARGE (SUSPICIOUS)!
-			const onlineFiveMinAgo = new Date(now.getTime() - 5 * 60 * 1000);
-			const spoofedOfflineClaim = evaluateEvidenceRisk(
-				{
-					takenAtDevice: takenTwoHoursAgo,
-					uploadedAtDevice: now,
-					receivedAtServer: now,
-					gpsAvailable: true,
-					latitude: -6.2001,
-					longitude: 106.8167,
-					accuracyM: 12,
-					isMockLocation: false,
-					location: baseLoc
-				},
-				{
-					lastOnlineActivityAt: onlineFiveMinAgo
-				}
-			);
-
-			expect(spoofedOfflineClaim.offlineDelaySec).toBe(1200);
-			expect(spoofedOfflineClaim.clockSkewSec).toBe(6000);
-			expect(spoofedOfflineClaim.riskReasons).toContain('CLOCK_SKEW_LARGE');
-			expect(spoofedOfflineClaim.riskLevel).toBe('SUSPICIOUS');
-
-			// 4. Jam HP salah saat unggah (uploadedAtDevice melenceng 2 jam dari receivedAtServer):
-			//    Tertangkap langsung oleh pemeriksaan (a) |receivedAtServer - uploadedAtDevice|!
+			// 3. Jam HP salah saat unggah (uploadedAtDevice melenceng 2 jam dari receivedAtServer):
+			//    Tertangkap langsung sebagai CLOCK_SKEW_LARGE (SUSPICIOUS)!
 			const wrongClockAtUpload = evaluateEvidenceRisk({
 				takenAtDevice: takenTwoHoursAgo,
 				uploadedAtDevice: takenTwoHoursAgo,
@@ -427,11 +396,12 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 				location: baseLoc
 			});
 
+			expect(wrongClockAtUpload.offlineDelaySec).toBe(0);
 			expect(wrongClockAtUpload.clockSkewSec).toBe(7200);
 			expect(wrongClockAtUpload.riskReasons).toContain('CLOCK_SKEW_LARGE');
 			expect(wrongClockAtUpload.riskLevel).toBe('SUSPICIOUS');
 
-			// 5. takenAtDevice di masa depan (> 60 detik) atau lebih tua dari bukti terakhir pengguna -> ditolak potongan offline-nya
+			// 4. takenAtDevice di masa depan (> 60 detik), lebih tua dari bukti terakhir pengguna, atau melebihi batas maksimum antrean offline (24 jam) -> ditandai CLOCK_SKEW / CLOCK_SKEW_LARGE
 			const futureTaken = evaluateEvidenceRisk({
 				takenAtDevice: new Date(now.getTime() + 10 * 60 * 1000),
 				uploadedAtDevice: now,
@@ -454,6 +424,16 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			);
 			expect(olderThanPrevious.offlineDelaySec).toBe(0);
 			expect(olderThanPrevious.riskReasons).toContain('CLOCK_SKEW');
+
+			const exceedsMaxOffline24h = evaluateEvidenceRisk({
+				takenAtDevice: new Date(now.getTime() - 30 * 3600 * 1000), // 30 jam (> batas 24 jam)
+				uploadedAtDevice: now,
+				receivedAtServer: now,
+				gpsAvailable: false
+			});
+			expect(exceedsMaxOffline24h.offlineDelaySec).toBe(0);
+			expect(exceedsMaxOffline24h.riskReasons).toContain('CLOCK_SKEW_LARGE');
+			expect(exceedsMaxOffline24h.riskLevel).toBe('SUSPICIOUS');
 		});
 	});
 
@@ -1046,41 +1026,64 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			expect(returnAuditCount).toBe(1);
 		});
 
-		it('menggunakan Session.lastSeenAt (bukan createdAt sesi lama) untuk menangkap pemunduran jam HP pada sesi berumur 3 hari (lastSeenAt 5 menit lalu -> CLOCK_SKEW_LARGE) dan meloloskan foto offline jujur 2 jam pada sesi lama (lastSeenAt 2 jam lalu -> NORMAL) (#6)', async () => {
+		it('menangani urutan nyata (sesi lama -> offline 2 jam -> refreshUserSession -> unggah foto offline) dengan hasil NORMAL + OFFLINE_CAPTURE, serta memastikan LoanItem.returnedAt selalu memakai waktu server (#6)', async () => {
 			const suffix = randomUUID().slice(0, 8);
 			const threeDaysAgo = new Date(Date.now() - 3 * 86400 * 1000);
 			const twoHoursAgo = new Date(Date.now() - 2 * 3600 * 1000);
-			const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+			const oneHourAgo = new Date(Date.now() - 3600 * 1000);
 
-			// A. Skenario 1: Pengguna memundurkan jam HP saat online pada sesi yang sudah berumur 3 hari,
-			//    tetapi baru saja aktif online 5 menit lalu (Session.lastSeenAt = 5 menit lalu).
-			const spoofUserRow = await prisma.user.create({
+			// 1. Buat pengguna dan sesi yang sudah berumur 3 hari (terakhir aktif 2 jam lalu sebelum masuk gudang tanpa sinyal)
+			const rawRefreshToken = `raw-refresh-${randomUUID()}`;
+			const realFlowUser = await prisma.user.create({
 				data: {
-					name: 'Pengguna Sesi Lama Rewind Jam',
-					email: `m2a-spoof-oldsession-${suffix}@example.com`,
+					name: 'Petugas Gudang Urutan Nyata Refresh Dulu',
+					email: `m2a-realflow-${suffix}@example.com`,
 					passwordHash: 'hash',
 					role: 'BORROWER',
 					isActive: true
 				}
 			});
-			const spoofActor: PolicyUser = {
-				id: spoofUserRow.id,
+			const offlineActor: PolicyUser = {
+				id: realFlowUser.id,
 				role: 'BORROWER',
 				isActive: true
 			};
 
-			const spoofSession = await prisma.session.create({
+			const realFlowSession = await prisma.session.create({
 				data: {
-					userId: spoofUserRow.id,
-					refreshTokenHash: `hash-spoof-${randomUUID()}`,
+					userId: realFlowUser.id,
+					refreshTokenHash: hashRefreshToken(rawRefreshToken),
 					createdAt: threeDaysAgo,
-					lastSeenAt: fiveMinutesAgo,
+					lastSeenAt: twoHoursAgo,
 					expiresAt: new Date(Date.now() + 27 * 86400 * 1000)
 				}
 			});
 
-			const spoofUploaded = await uploadEvidence(
-				spoofActor,
+			const offlineAsset = await prisma.asset.create({
+				data: {
+					code: `AST-OFFTIME-${suffix}`,
+					qrToken: `qr-offtime-${randomUUID()}`,
+					name: 'Laptop Uji Urutan Nyata Refresh + Offline Upload',
+					categoryId: standardCategoryId,
+					status: 'AVAILABLE'
+				}
+			});
+
+			// 2. Saat sinyal kembali pukul 03:00 setelah offline 2 jam, access token (TTL 15 menit) sudah kedaluwarsa,
+			//    sehingga mobileApi memanggil refreshUserSession lebih dulu (yang memperbarui Session.lastSeenAt menjadi sekarang)
+			const refreshed = await refreshUserSession({ refreshToken: rawRefreshToken });
+			expect(refreshed.sessionId).toBe(realFlowSession.id);
+
+			const sessionAfterRefresh = await prisma.session.findUniqueOrThrow({
+				where: { id: realFlowSession.id }
+			});
+			expect(sessionAfterRefresh.lastSeenAt!.getTime()).toBeGreaterThan(
+				twoHoursAgo.getTime() + 7000 * 1000
+			);
+
+			// 3. Tepat setelah refresh, klien mengunggah foto pinjam yang diambil 2 jam lalu saat offline
+			const uploadedCheckout = await uploadEvidence(
+				offlineActor,
 				{
 					meta: {
 						purpose: 'CHECKOUT',
@@ -1097,84 +1100,12 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 					fileBuffer: VALID_JPEG_BUFFER
 				},
 				undefined,
-				spoofSession.id
+				realFlowSession.id
 			);
 
-			// Meskipun Session.createdAt berumur 3 hari, Session.lastSeenAt adalah 5 menit lalu,
-			// sehingga klaim offline 2 jam dibatasi maksimal ~20 menit (5m + 15m toleransi) dan sisanya (~6000s) tetap CLOCK_SKEW_LARGE!
-			expect(spoofUploaded.evidence.riskLevel).toBe('SUSPICIOUS');
-			expect(spoofUploaded.evidence.riskReasons).toContain('CLOCK_SKEW_LARGE');
-			expect(spoofUploaded.evidence.offlineDelaySec).toBeLessThanOrEqual(1210);
-			expect(spoofUploaded.evidence.clockSkewSec).toBeGreaterThanOrEqual(5980);
-
-			// Pastikan Session.lastSeenAt diperbarui setelah request /api/v1/evidence berhasil
-			const updatedSpoofSession = await prisma.session.findUniqueOrThrow({
-				where: { id: spoofSession.id }
-			});
-			expect(updatedSpoofSession.lastSeenAt!.getTime()).toBeGreaterThan(
-				fiveMinutesAgo.getTime() + 4 * 60 * 1000
-			);
-
-			// B. Skenario 2: Sesi lama (createdAt 3 hari lalu) + foto offline jujur 2 jam dengan Session.lastSeenAt = 2 jam lalu -> NORMAL
-			const honestUserRow = await prisma.user.create({
-				data: {
-					name: 'Petugas Gudang Offline Sesi Lama',
-					email: `m2a-offline-${suffix}@example.com`,
-					passwordHash: 'hash',
-					role: 'BORROWER',
-					isActive: true
-				}
-			});
-			const offlineActor: PolicyUser = {
-				id: honestUserRow.id,
-				role: 'BORROWER',
-				isActive: true
-			};
-
-			const honestOldSession = await prisma.session.create({
-				data: {
-					userId: honestUserRow.id,
-					refreshTokenHash: `hash-honest-${randomUUID()}`,
-					createdAt: threeDaysAgo,
-					lastSeenAt: twoHoursAgo,
-					expiresAt: new Date(Date.now() + 27 * 86400 * 1000)
-				}
-			});
-
-			const offlineAsset = await prisma.asset.create({
-				data: {
-					code: `AST-OFFTIME-${suffix}`,
-					qrToken: `qr-offtime-${randomUUID()}`,
-					name: 'Laptop Uji Waktu Offline DB',
-					categoryId: standardCategoryId,
-					status: 'AVAILABLE'
-				}
-			});
-
-			const checkoutUploadedAt = new Date();
-			const uploadedCheckout = await uploadEvidence(
-				offlineActor,
-				{
-					meta: {
-						purpose: 'CHECKOUT',
-						captureSource: 'CAMERA',
-						takenAtDevice: twoHoursAgo.toISOString(),
-						uploadedAtDevice: checkoutUploadedAt.toISOString(),
-						gpsAvailable: true,
-						latitude: -6.2,
-						longitude: 106.8166,
-						accuracyM: 10,
-						isMockLocation: false,
-						locationId: location1Id
-					},
-					fileBuffer: VALID_JPEG_BUFFER
-				},
-				undefined,
-				honestOldSession.id
-			);
-
+			// Wajib dinilai NORMAL dengan catatan informatif OFFLINE_CAPTURE (tidak terkena false positive CLOCK_SKEW_LARGE akibat refresh!)
 			expect(uploadedCheckout.evidence.riskLevel).toBe('NORMAL');
-			expect(uploadedCheckout.evidence.riskReasons).toEqual([]);
+			expect(uploadedCheckout.evidence.riskReasons).toEqual(['OFFLINE_CAPTURE']);
 			expect(uploadedCheckout.evidence.clockSkewSec).toBeLessThanOrEqual(5);
 			expect(uploadedCheckout.evidence.rawClockSkewSec).toBeGreaterThanOrEqual(7195);
 			expect(uploadedCheckout.evidence.offlineDelaySec).toBeGreaterThanOrEqual(7195);
@@ -1187,13 +1118,7 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			});
 			const loanItemId = createdLoan.loan.items[0].id;
 
-			// Simulasikan petugas kembali offline selama 1 jam berikutnya (lastSeenAt adalah 1 jam lalu)
-			const oneHourAgo = new Date(Date.now() - 3600 * 1000);
-			await prisma.session.update({
-				where: { id: honestOldSession.id },
-				data: { lastSeenAt: oneHourAgo }
-			});
-
+			// 4. Unggah foto pengembalian yang diambil offline 1 jam lalu (lebih baru dari foto pinjam 2 jam lalu)
 			const beforeReturnServerMs = Date.now();
 			const uploadedReturn = await uploadEvidence(
 				offlineActor,
@@ -1213,10 +1138,11 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 					fileBuffer: VALID_JPEG_BUFFER
 				},
 				undefined,
-				honestOldSession.id
+				realFlowSession.id
 			);
 
 			expect(uploadedReturn.evidence.riskLevel).toBe('NORMAL');
+			expect(uploadedReturn.evidence.riskReasons).toEqual(['OFFLINE_CAPTURE']);
 			expect(uploadedReturn.evidence.rawClockSkewSec).toBeGreaterThanOrEqual(3595);
 			expect(uploadedReturn.evidence.offlineDelaySec).toBeGreaterThanOrEqual(3595);
 
