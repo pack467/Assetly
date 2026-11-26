@@ -3,7 +3,7 @@ import type { RequestHandler } from './$types';
 import { loginSchema } from '$lib/shared/schemas/auth';
 import { loginUser } from '$lib/server/auth/service';
 import { toErrorResponse } from '$lib/shared/errors';
-import { ACCESSTOKEN_COOKIE, REFRESHTOKEN_COOKIE } from '$lib/server/auth/tokens';
+import { setAuthCookies } from '$lib/server/auth/tokens';
 
 export const POST: RequestHandler = async (event) => {
 	try {
@@ -19,23 +19,7 @@ export const POST: RequestHandler = async (event) => {
 			ip: ip ?? undefined
 		});
 
-		const isSecure = process.env.NODE_ENV === 'production';
-
-		event.cookies.set(ACCESSTOKEN_COOKIE, result.accessToken, {
-			path: '/',
-			httpOnly: true,
-			sameSite: 'lax',
-			secure: isSecure,
-			maxAge: 15 * 60
-		});
-
-		event.cookies.set(REFRESHTOKEN_COOKIE, result.refreshToken, {
-			path: '/',
-			httpOnly: true,
-			sameSite: 'lax',
-			secure: isSecure,
-			maxAge: 30 * 24 * 60 * 60
-		});
+		setAuthCookies(event.cookies, result);
 
 		return json({
 			accessToken: result.accessToken,

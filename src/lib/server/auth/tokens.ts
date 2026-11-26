@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import type { Cookies } from '@sveltejs/kit';
 import { SignJWT, jwtVerify } from 'jose';
 import type { Role } from '@prisma/client';
 import { env } from '$env/dynamic/private';
@@ -94,4 +95,32 @@ export function generateRefreshToken(): string {
 
 export function hashRefreshToken(rawToken: string): string {
 	return createHash('sha256').update(rawToken).digest('hex');
+}
+
+export function setAuthCookies(
+	cookies: Pick<Cookies, 'set'>,
+	tokens: { accessToken: string; refreshToken: string }
+): void {
+	const isSecure = process.env.NODE_ENV === 'production';
+
+	cookies.set(ACCESSTOKEN_COOKIE, tokens.accessToken, {
+		path: '/',
+		httpOnly: true,
+		sameSite: 'lax',
+		secure: isSecure,
+		maxAge: ACCESS_TOKEN_TTL_SEC
+	});
+
+	cookies.set(REFRESHTOKEN_COOKIE, tokens.refreshToken, {
+		path: '/',
+		httpOnly: true,
+		sameSite: 'lax',
+		secure: isSecure,
+		maxAge: 30 * 24 * 60 * 60
+	});
+}
+
+export function clearAuthCookies(cookies: Pick<Cookies, 'delete'>): void {
+	cookies.delete(ACCESSTOKEN_COOKIE, { path: '/' });
+	cookies.delete(REFRESHTOKEN_COOKIE, { path: '/' });
 }

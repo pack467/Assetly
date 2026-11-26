@@ -597,7 +597,7 @@ export async function listHandovers(
 			: {})
 	};
 
-	const [total, rows, participants] = await Promise.all([
+	const [total, rows, rawParticipants] = await Promise.all([
 		prisma.handover.count({ where }),
 		prisma.handover.findMany({
 			where,
@@ -606,12 +606,28 @@ export async function listHandovers(
 			take: pageSize,
 			include: HANDOVER_INCLUDE
 		}),
+		// #8: Batasi kandidat penerima serah terima (maks 100, selain diri sendiri) dan jangan sertakan email semua akun untuk BORROWER
 		prisma.user.findMany({
-			where: { isActive: true },
+			where: {
+				isActive: true,
+				id: { not: actor.id }
+			},
 			orderBy: { name: 'asc' },
-			select: { id: true, name: true, email: true, role: true }
+			take: 100,
+			select: {
+				id: true,
+				name: true,
+				role: true,
+				...(actor.role === 'BORROWER' ? {} : { email: true })
+			}
 		})
 	]);
+
+	const participants = rawParticipants.map((p) =>
+		actor.role === 'BORROWER'
+			? { id: p.id, name: p.name, role: p.role }
+			: p
+	);
 
 	return {
 		items: rows.map(formatHandoverRecord),

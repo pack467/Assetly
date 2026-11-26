@@ -4,7 +4,11 @@ import {
 	refreshSessionFromCookie,
 	resolveAuthenticatedSession
 } from '$lib/server/auth/service';
-import { ACCESSTOKEN_COOKIE, REFRESHTOKEN_COOKIE } from '$lib/server/auth/tokens';
+import {
+	ACCESSTOKEN_COOKIE,
+	REFRESHTOKEN_COOKIE,
+	setAuthCookies
+} from '$lib/server/auth/tokens';
 import { getCorsHeadersForOrigin } from '$lib/server/cors';
 import { logger } from '$lib/server/logger';
 import { AppError, toErrorResponse } from '$lib/shared/errors';
@@ -157,23 +161,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 			if (refreshed) {
 				event.locals.user = refreshed.user;
 				event.locals.sessionId = refreshed.sessionId;
-				const isSecure = process.env.NODE_ENV === 'production';
-
-				event.cookies.set(ACCESSTOKEN_COOKIE, refreshed.accessToken, {
-					path: '/',
-					httpOnly: true,
-					sameSite: 'lax',
-					secure: isSecure,
-					maxAge: 15 * 60
-				});
-
-				event.cookies.set(REFRESHTOKEN_COOKIE, refreshed.refreshToken, {
-					path: '/',
-					httpOnly: true,
-					sameSite: 'lax',
-					secure: isSecure,
-					maxAge: 30 * 24 * 60 * 60
-				});
+				setAuthCookies(event.cookies, refreshed);
 			}
 		}
 	}

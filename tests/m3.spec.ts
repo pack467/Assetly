@@ -546,6 +546,26 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 				evidenceId: retEv.id
 			});
 		});
+
+		it('membatasi kandidat penerima serah terima (participants) dan tidak menampilkan email seluruh akun kepada BORROWER (#8)', async () => {
+			const forBorrower = await listHandovers(borrower1);
+			expect(forBorrower.participants.length).toBeLessThanOrEqual(100);
+			expect(forBorrower.participants.some((p) => p.id === borrower1.id)).toBe(false);
+			expect(forBorrower.participants.length).toBeGreaterThan(0);
+
+			for (const p of forBorrower.participants) {
+				expect(p.id).toBeTruthy();
+				expect(p.name).toBeTruthy();
+				expect(p.role).toBeTruthy();
+				expect('email' in p).toBe(false);
+			}
+
+			const forAdmin = await listHandovers(adminActor);
+			expect(forAdmin.participants.some((p) => p.id === adminActor.id)).toBe(false);
+			expect(
+				forAdmin.participants.every((p) => typeof (p as { email?: string }).email === 'string')
+			).toBe(true);
+		});
 	});
 
 	describe('2. Buka & Tutup Shift (Tanpa Barang Tertinggal vs Dengan Barang Tertinggal — Bagian 7.4 & BR-12)', () => {

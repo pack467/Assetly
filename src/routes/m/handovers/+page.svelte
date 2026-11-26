@@ -3,6 +3,7 @@
 	import { mobileApi } from '$lib/client/api';
 	import { getOfflineQueueStorage } from '$lib/client/offlineQueue';
 	import { enqueueOfflineOperation, syncPendingOperations } from '$lib/client/syncManager';
+	import { RoleLabels } from '$lib/shared/enums';
 	import {
 		computeCompressedDimensions,
 		DEFAULT_JPEG_QUALITY,
@@ -16,7 +17,7 @@
 	interface Participant {
 		id: string;
 		name: string;
-		email: string;
+		email?: string;
 		role: string;
 	}
 
@@ -518,7 +519,11 @@
 					class="mt-1.5 w-full rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm"
 				>
 					{#each participants as p (p.id)}
-						<option value={p.id}>{p.name} ({p.email})</option>
+						<option value={p.id}>
+							{p.name} ({RoleLabels[p.role as keyof typeof RoleLabels] ?? p.role}{p.email
+								? ` · ${p.email}`
+								: ''})
+						</option>
 					{/each}
 				</select>
 			</div>
