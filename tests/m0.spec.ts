@@ -19,9 +19,16 @@ import {
 	recordFailedLoginAttempt,
 	sweepExpiredRateLimitBuckets
 } from '../src/lib/server/auth/rateLimit';
-import { signAccessToken, verifyAccessToken, getAccessSecret } from '../src/lib/server/auth/tokens';
+import {
+	 signAccessToken,
+	 verifyAccessToken,
+	 getAccessSecret,
+	 ACCESSTOKEN_COOKIE,
+	 REFRESHTOKEN_COOKIE
+} from '../src/lib/server/auth/tokens';
 import { SignJWT } from 'jose';
 import { GET as healthHandler } from '../src/routes/api/v1/health/+server';
+import { handle } from '../src/hooks.server';
 
 describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 	const adminUser: PolicyUser = { id: 'u-admin', role: 'ADMIN', isActive: true };
@@ -397,6 +404,141 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 				sessionId: nextRefresh.sessionId,
 				actorId: nextRefresh.user.id
 			});
+		});
+
+		it('Auto-refresh sesi cookie di hooks.server.ts merotasi token saat access token kedaluwarsa, menangani request paralel tanpa saling menggagalkan, dan menjaga flag cookie (#5)', async () => {
+			const loginResult = await loginUser({
+				email: borrowerEmail,
+				password: plainPassword,
+				deviceInfo: 'Web Admin Cookie Refresh Test',
+				ip: '127.0.0.1'
+			});
+
+			// Buat access token yang sudah kedaluwarsa untuk sesi tersebut
+			const expiredAccessToken = await signAccessToken(
+				{
+					sub: loginResult.user.id,
+					sid: loginResult.sessionId,
+					role: loginResult.user.role,
+					email: loginResult.user.email,
+					name: loginResult.user.name
+				},
+				{ expiresInSec: -60 }
+			);
+
+			function buildMockHookEvent(cookiesIn: Record<string, string>) {
+				const setCalls: Array<{
+					name: string;
+					value: string;
+					opts: Record<string, unknown>;
+				}> = [];
+				const event = {
+					url: new URL('http://localhost:3000/admin/assets'),
+					request: new Request('http://localhost:3000/admin/assets', {
+						method: 'GET',
+						headers: { 'user-agent': 'Vitest Web Admin Browser' }
+					}),
+					cookies: {
+						get: (name: string) => cookiesIn[name],
+						set: (name: string, value: string, opts: Record<string, unknown>) => {
+							setCalls.push({ name, value, opts });
+						}
+					},
+					locals: {
+						requestId: '',
+						user: null as PolicyUser | null,
+						sessionId: null as string | null
+					},
+					getClientAddress: () => '127.0.0.1'
+				};
+				return { event, setCalls };
+			}
+
+			// 1. Jalankan 5 request paralel di hooks.server.ts dengan access token kedaluwarsa & cookie refresh token yang sama
+			const parallelHooks = await Promise.all(
+				Array.from({ length: 5 }, async () => {
+					const { event, setCalls } = buildMockHookEvent({
+						[ACCESSTOKEN_COOKIE]: expiredAccessToken,
+						[REFRESHTOKEN_COOKIE]: loginResult.refreshToken
+					});
+					const response = await handle({
+						event: event as never,
+						resolve: async () => new Response('ok', { status: 200 })
+					});
+					return { event, setCalls, status: response.status };
+				})
+			);
+
+			// Semua 5 request paralel harus berhasil terautentikasi tanpa saling menggagalkan
+			const rotatedRefreshTokens = new Set<string>();
+			for (const res of parallelHooks) {
+				expect(res.status).toBe(200);
+				expect(res.event.locals.user?.id).toBe(loginResult.user.id);
+				expect(res.event.locals.sessionId).toBe(loginResult.sessionId);
+
+				const accessCookie = res.setCalls.find((c) => c.name === ACCESSTOKEN_COOKIE);
+				const refreshCookie = res.setCalls.find((c) => c.name === REFRESHTOKEN_COOKIE);
+				expect(accessCookie).toBeDefined();
+				expect(refreshCookie).toBeDefined();
+
+				// Pastikan flag keamanan cookie tidak dilemahkan
+				expect(accessCookie?.opts).toMatchObject({
+					path: '/',
+					httpOnly: true,
+					sameSite: 'lax',
+					secure: false,
+					maxAge: 15 * 60
+				});
+				expect(refreshCookie?.opts).toMatchObject({
+					path: '/',
+					httpOnly: true,
+					sameSite: 'lax',
+					secure: false,
+					maxAge: 30 * 24 * 60 * 60
+				});
+
+				if (refreshCookie) {
+					rotatedRefreshTokens.add(refreshCookie.value);
+				}
+			}
+
+			// Single-flight coalescing memastikan ke-5 request paralel menerima refresh token hasil rotasi yang sama
+			expect(rotatedRefreshTokens.size).toBe(1);
+
+			// Hanya 1 baris AuditLog SESSION_REFRESHED yang ditulis ke database
+			const refreshLogs = await prisma.auditLog.count({
+				where: {
+					entityType: 'Session',
+					entityId: loginResult.sessionId,
+					action: 'SESSION_REFRESHED'
+				}
+			});
+			expect(refreshLogs).toBe(1);
+
+			// 2. Request susulan dalam masa toleransi singkat (sebelum browser menerapkan Set-Cookie) tetap berhasil
+			const lateArrival = buildMockHookEvent({
+				[REFRESHTOKEN_COOKIE]: loginResult.refreshToken
+			});
+			await handle({
+				event: lateArrival.event as never,
+				resolve: async () => new Response('ok', { status: 200 })
+			});
+			expect(lateArrival.event.locals.user?.id).toBe(loginResult.user.id);
+
+			// 3. Setelah logout, masa toleransi langsung dihapus dan request dengan cookie lama tidak lagi diautentikasi
+			await logoutUserSession({
+				sessionId: loginResult.sessionId,
+				actorId: loginResult.user.id
+			});
+
+			const afterLogoutHook = buildMockHookEvent({
+				[REFRESHTOKEN_COOKIE]: loginResult.refreshToken
+			});
+			await handle({
+				event: afterLogoutHook.event as never,
+				resolve: async () => new Response('ok', { status: 200 })
+			});
+			expect(afterLogoutHook.event.locals.user).toBeNull();
 		});
 
 		it('Wajib TOTP untuk ADMIN yang memiliki mfaSecret dan mencabut sesi pengguna secara instan (BR-19 & Bagian 12)', async () => {

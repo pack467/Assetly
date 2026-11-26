@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { Handle } from '@sveltejs/kit';
-import { resolveAuthenticatedSession } from '$lib/server/auth/service';
-import { ACCESSTOKEN_COOKIE } from '$lib/server/auth/tokens';
+import {
+	refreshSessionFromCookie,
+	resolveAuthenticatedSession
+} from '$lib/server/auth/service';
+import { ACCESSTOKEN_COOKIE, REFRESHTOKEN_COOKIE } from '$lib/server/auth/tokens';
 import { getCorsHeadersForOrigin } from '$lib/server/cors';
 import { logger } from '$lib/server/logger';
 import { AppError, toErrorResponse } from '$lib/shared/errors';
@@ -68,8 +71,9 @@ export const handle: Handle = async ({ event, resolve }) => {
 	}
 
 	const authHeader = event.request.headers.get('authorization');
+	const hasBearerHeader = Boolean(authHeader && authHeader.toLowerCase().startsWith('bearer '));
 	let token: string | null = null;
-	if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+	if (hasBearerHeader && authHeader) {
 		token = authHeader.slice(7).trim();
 	} else {
 		token = event.cookies.get(ACCESSTOKEN_COOKIE) ?? null;
@@ -80,6 +84,49 @@ export const handle: Handle = async ({ event, resolve }) => {
 		if (auth) {
 			event.locals.user = auth.user;
 			event.locals.sessionId = auth.sessionId;
+		}
+	}
+
+	// #5: Refresh otomatis sesi berbasis cookie (Web Admin) ketika access token kedaluwarsa/tidak ada namun cookie refresh token masih valid
+	const isAuthTokenEndpoint =
+		event.url.pathname === '/api/v1/auth/login' || event.url.pathname === '/api/v1/auth/refresh';
+	if (!event.locals.user && !hasBearerHeader && !isAuthTokenEndpoint) {
+		const rawRefreshToken = event.cookies.get(REFRESHTOKEN_COOKIE) ?? null;
+		if (rawRefreshToken) {
+			let clientIp: string | undefined;
+			try {
+				clientIp = event.getClientAddress?.();
+			} catch {
+				clientIp = undefined;
+			}
+
+			const refreshed = await refreshSessionFromCookie({
+				refreshToken: rawRefreshToken,
+				deviceInfo: event.request.headers.get('user-agent') ?? undefined,
+				ip: clientIp
+			});
+
+			if (refreshed) {
+				event.locals.user = refreshed.user;
+				event.locals.sessionId = refreshed.sessionId;
+				const isSecure = process.env.NODE_ENV === 'production';
+
+				event.cookies.set(ACCESSTOKEN_COOKIE, refreshed.accessToken, {
+					path: '/',
+					httpOnly: true,
+					sameSite: 'lax',
+					secure: isSecure,
+					maxAge: 15 * 60
+				});
+
+				event.cookies.set(REFRESHTOKEN_COOKIE, refreshed.refreshToken, {
+					path: '/',
+					httpOnly: true,
+					sameSite: 'lax',
+					secure: isSecure,
+					maxAge: 30 * 24 * 60 * 60
+				});
+			}
 		}
 	}
 

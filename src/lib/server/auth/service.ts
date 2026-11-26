@@ -193,11 +193,84 @@ export async function refreshUserSession(params: {
 	};
 }
 
+const COOKIE_REFRESH_GRACE_MS = 10_000; // 10 detik toleransi untuk request paralel berbasis cookie
+
+type RefreshSessionResult = Awaited<ReturnType<typeof refreshUserSession>>;
+
+const inFlightCookieRefreshes = new Map<string, Promise<RefreshSessionResult>>();
+const recentCookieRefreshes = new Map<
+	string,
+	{ result: RefreshSessionResult; expiresGraceAtMs: number }
+>();
+
+function sweepExpiredCookieRefreshGrace(nowMs = Date.now()) {
+	for (const [hash, entry] of recentCookieRefreshes.entries()) {
+		if (entry.expiresGraceAtMs <= nowMs) {
+			recentCookieRefreshes.delete(hash);
+		}
+	}
+}
+
+export function clearCookieRefreshGraceForSession(sessionId: string) {
+	for (const [hash, entry] of recentCookieRefreshes.entries()) {
+		if (entry.result.sessionId === sessionId) {
+			recentCookieRefreshes.delete(hash);
+		}
+	}
+}
+
+/**
+ * Merotasi sesi berbasis cookie (Web Admin) dengan single-flight coalescing dan masa toleransi singkat
+ * agar request paralel dari halaman yang sama saat access token kedaluwarsa tidak saling menggagalkan (#5).
+ */
+export async function refreshSessionFromCookie(params: {
+	refreshToken: string;
+	deviceInfo?: string;
+	ip?: string;
+}): Promise<RefreshSessionResult | null> {
+	const currentHash = hashRefreshToken(params.refreshToken);
+	const nowMs = Date.now();
+	sweepExpiredCookieRefreshGrace(nowMs);
+
+	const cachedGrace = recentCookieRefreshes.get(currentHash);
+	if (cachedGrace && cachedGrace.expiresGraceAtMs > nowMs) {
+		const stillValid = await resolveAuthenticatedSession(cachedGrace.result.accessToken);
+		if (stillValid) {
+			return cachedGrace.result;
+		}
+		recentCookieRefreshes.delete(currentHash);
+		return null;
+	}
+
+	let inFlight = inFlightCookieRefreshes.get(currentHash);
+	if (!inFlight) {
+		inFlight = refreshUserSession(params)
+			.then((result) => {
+				recentCookieRefreshes.set(currentHash, {
+					result,
+					expiresGraceAtMs: Date.now() + COOKIE_REFRESH_GRACE_MS
+				});
+				return result;
+			})
+			.finally(() => {
+				inFlightCookieRefreshes.delete(currentHash);
+			});
+		inFlightCookieRefreshes.set(currentHash, inFlight);
+	}
+
+	try {
+		return await inFlight;
+	} catch {
+		return null;
+	}
+}
+
 export async function logoutUserSession(params: {
 	sessionId: string;
 	actorId: string;
 	ip?: string;
 }) {
+	clearCookieRefreshGraceForSession(params.sessionId);
 	const now = new Date();
 	await prisma.$transaction(async (tx) => {
 		const existing = await tx.session.findUnique({
@@ -228,6 +301,7 @@ export async function revokeSessionByAdmin(params: {
 	ip?: string;
 }) {
 	assertCan(params.actor, 'session:revoke');
+	clearCookieRefreshGraceForSession(params.targetSessionId);
 	const actor = params.actor;
 
 	const existing = await prisma.session.findUnique({
