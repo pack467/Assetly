@@ -30,6 +30,7 @@ import {
 } from '../src/lib/server/auth/tokens';
 import { SignJWT } from 'jose';
 import { GET as healthHandler } from '../src/routes/api/v1/health/+server';
+import { POST as logoutHandler } from '../src/routes/api/v1/auth/logout/+server';
 import { handle } from '../src/hooks.server';
 
 describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
@@ -750,6 +751,104 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 			} finally {
 				errorSpy.mockRestore();
 			}
+		});
+
+		it('POST /api/v1/auth/logout dikecualikan dari auto-refresh di hooks.server.ts, mencabut sesi lewat cookie refresh token, dan selalu menghapus kedua cookie bahkan bila sesi sudah dicabut (#7)', async () => {
+			const loginResult = await loginUser({
+				email: borrowerEmail,
+				password: plainPassword,
+				deviceInfo: 'Logout Cookie Cleanup Test',
+				ip: '127.0.0.1'
+			});
+
+			const expiredAccessToken = await signAccessToken(
+				{
+					sub: loginResult.user.id,
+					sid: loginResult.sessionId,
+					role: loginResult.user.role,
+					email: loginResult.user.email,
+					name: loginResult.user.name
+				},
+				{ expiresInSec: -60 }
+			);
+
+			const setCookieCalls: string[] = [];
+			const deletedCookies: string[] = [];
+
+			const mockLogoutEvent = {
+				url: new URL('http://localhost:3000/api/v1/auth/logout'),
+				request: new Request('http://localhost:3000/api/v1/auth/logout', {
+					method: 'POST',
+					headers: {
+						origin: 'http://localhost:3000',
+						'user-agent': 'Vitest Browser'
+					}
+				}),
+				cookies: {
+					get: (name: string) => {
+						if (name === ACCESSTOKEN_COOKIE) return expiredAccessToken;
+						if (name === REFRESHTOKEN_COOKIE) return loginResult.refreshToken;
+						return undefined;
+					},
+					set: (name: string) => {
+						setCookieCalls.push(name);
+					},
+					delete: (name: string) => {
+						deletedCookies.push(name);
+					}
+				},
+				locals: {
+					requestId: '',
+					user: null as PolicyUser | null,
+					sessionId: null as string | null
+				},
+				getClientAddress: () => '127.0.0.1'
+			};
+
+			// 1. Panggil lewat hooks.server.ts -> logoutHandler ketika access token sudah kedaluwarsa:
+			//    TIDAK boleh memicu auto-refresh (setCookieCalls kosong) dan wajib mencabut sesi + menghapus kedua cookie
+			const res1 = await handle({
+				event: mockLogoutEvent as never,
+				resolve: async (ev) => logoutHandler(ev as never)
+			});
+			expect(res1.status).toBe(200);
+			expect(setCookieCalls).toHaveLength(0);
+			expect(deletedCookies).toEqual([ACCESSTOKEN_COOKIE, REFRESHTOKEN_COOKIE]);
+
+			const refreshAuditCount = await prisma.auditLog.count({
+				where: {
+					entityType: 'Session',
+					entityId: loginResult.sessionId,
+					action: 'SESSION_REFRESHED'
+				}
+			});
+			expect(refreshAuditCount).toBe(0);
+
+			const dbSession = await prisma.session.findUniqueOrThrow({
+				where: { id: loginResult.sessionId }
+			});
+			expect(dbSession.revokedAt).not.toBeNull();
+
+			// 2. Panggil ulang logout saat sesi sudah dicabut / user null -> tetap 200 dan tetap menghapus cookie mati
+			const deletedOnStaleLogout: string[] = [];
+			const staleEvent = {
+				...mockLogoutEvent,
+				cookies: {
+					get: () => undefined,
+					set: () => {},
+					delete: (name: string) => {
+						deletedOnStaleLogout.push(name);
+					}
+				},
+				locals: {
+					requestId: 'stale-logout',
+					user: null,
+					sessionId: null
+				}
+			};
+			const res2 = await logoutHandler(staleEvent as never);
+			expect(res2.status).toBe(200);
+			expect(deletedOnStaleLogout).toEqual([ACCESSTOKEN_COOKIE, REFRESHTOKEN_COOKIE]);
 		});
 	});
 });

@@ -266,29 +266,43 @@ export async function refreshSessionFromCookie(params: {
 }
 
 export async function logoutUserSession(params: {
-	sessionId: string;
-	actorId: string;
+	sessionId?: string;
+	actorId?: string;
+	refreshToken?: string;
 	ip?: string;
 }) {
-	clearCookieRefreshGraceForSession(params.sessionId);
+	if (params.sessionId) {
+		clearCookieRefreshGraceForSession(params.sessionId);
+	}
+
 	const now = new Date();
 	await prisma.$transaction(async (tx) => {
-		const existing = await tx.session.findUnique({
-			where: { id: params.sessionId }
-		});
+		const existing = params.sessionId
+			? await tx.session.findUnique({
+					where: { id: params.sessionId }
+				})
+			: params.refreshToken
+				? await tx.session.findUnique({
+						where: { refreshTokenHash: hashRefreshToken(params.refreshToken) }
+					})
+				: null;
+
 		if (!existing) return;
 
+		clearCookieRefreshGraceForSession(existing.id);
+		if (existing.revokedAt !== null) return;
+
 		await tx.session.update({
-			where: { id: params.sessionId },
+			where: { id: existing.id },
 			data: { revokedAt: now }
 		});
 
 		await writeAuditLog(tx, {
-			actorId: params.actorId,
+			actorId: params.actorId ?? existing.userId,
 			action: 'USER_LOGOUT',
 			entityType: 'Session',
-			entityId: params.sessionId,
-			before: { revokedAt: existing.revokedAt?.toISOString() ?? null },
+			entityId: existing.id,
+			before: { revokedAt: existing.revokedAt },
 			after: { revokedAt: now.toISOString() },
 			ip: params.ip ?? null
 		});

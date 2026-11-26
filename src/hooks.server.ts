@@ -127,8 +127,9 @@ export const handle: Handle = async ({ event, resolve }) => {
 		}
 	}
 
-	// #5 & #1: Refresh otomatis sesi berbasis cookie (Web Admin) ketika access token kedaluwarsa, hanya untuk request non-cross-site
-	const isAuthTokenEndpoint = isPublicTokenBootstrapEndpoint;
+	// #5, #1 & #7: Refresh otomatis sesi berbasis cookie ketika access token kedaluwarsa, dikecualikan untuk login/refresh/logout dan request cross-site
+	const isAuthTokenEndpoint =
+		isPublicTokenBootstrapEndpoint || event.url.pathname === '/api/v1/auth/logout';
 	const isCrossSiteFetch = event.request.headers.get('sec-fetch-site') === 'cross-site';
 	const canAutoRefreshCookie =
 		!event.locals.user &&
