@@ -1,25 +1,19 @@
 import { json } from '@sveltejs/kit';
-import type { SyncStatus } from '@prisma/client';
 import type { RequestHandler } from './$types';
 import { listSyncOperations, processSyncBatch } from '$lib/server/services/syncService';
-import { syncBatchRequestSchema } from '$lib/shared/schemas/sync';
-import { paginationQuerySchema } from '$lib/shared/schemas/master';
+import { listSyncQuerySchema, syncBatchRequestSchema } from '$lib/shared/schemas/sync';
 import { toErrorResponse } from '$lib/shared/errors';
 
 export const GET: RequestHandler = async (event) => {
 	try {
 		const url = event.url;
-		const { page, pageSize } = paginationQuerySchema.parse({
+		const parsed = listSyncQuerySchema.parse({
 			page: url.searchParams.get('page') ?? undefined,
-			pageSize: url.searchParams.get('pageSize') ?? undefined
+			pageSize: url.searchParams.get('pageSize') ?? undefined,
+			status: url.searchParams.get('status') || undefined
 		});
-		const status = (url.searchParams.get('status') || undefined) as SyncStatus | undefined;
 
-		const result = await listSyncOperations(event.locals.user, {
-			page,
-			pageSize,
-			status
-		});
+		const result = await listSyncOperations(event.locals.user, parsed);
 		return json(result);
 	} catch (err) {
 		return toErrorResponse(err);

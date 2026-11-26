@@ -100,3 +100,20 @@ export const csvImportSchema = z.object({
 	csvText: z.string().min(1, 'Isi CSV tidak boleh kosong.'),
 	mode: z.enum(['preview', 'commit']).default('preview')
 });
+
+export const assetStatusEnumSchema = z.enum([
+	'AVAILABLE',
+	'PENDING_APPROVAL',
+	'BORROWED',
+	'DAMAGED',
+	'IN_MAINTENANCE',
+	'LOST',
+	'RETIRED'
+]);
+
+export const listAssetsQuerySchema = paginationQuerySchema.extend({
+	status: assetStatusEnumSchema.optional(),
+	categoryId: z.string().uuid('ID kategori tidak valid.').optional(),
+	homeLocationId: z.string().uuid('ID lokasi tidak valid.').optional(),
+	search: z.string().trim().max(200).optional()
+});

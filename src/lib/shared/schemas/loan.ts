@@ -70,3 +70,19 @@ export const returnLoanItemSchema = z.object({
 export const rejectLoanSchema = z.object({
 	reason: z.string().trim().min(3, 'Alasan penolakan wajib diisi minimal 3 karakter.').max(1000)
 });
+
+export const loanStatusEnumSchema = z.enum([
+	'PENDING_APPROVAL',
+	'REJECTED',
+	'ACTIVE',
+	'COMPLETED',
+	'CANCELLED'
+]);
+
+export const listLoansQuerySchema = z.object({
+	page: z.coerce.number().int().min(1).default(1),
+	pageSize: z.coerce.number().int().min(1).max(100).default(20),
+	status: loanStatusEnumSchema.optional(),
+	overdueOnly: z.enum(['true', 'false']).optional(),
+	borrowerId: z.string().uuid('ID peminjam tidak valid.').optional()
+});

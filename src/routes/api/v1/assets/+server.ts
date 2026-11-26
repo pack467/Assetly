@@ -1,31 +1,22 @@
 import { json } from '@sveltejs/kit';
-import type { AssetStatus } from '@prisma/client';
 import type { RequestHandler } from './$types';
 import { createAsset, listAssets } from '$lib/server/services/assetService';
-import { createAssetSchema, paginationQuerySchema } from '$lib/shared/schemas/master';
+import { createAssetSchema, listAssetsQuerySchema } from '$lib/shared/schemas/master';
 import { toErrorResponse } from '$lib/shared/errors';
 
 export const GET: RequestHandler = async (event) => {
 	try {
 		const url = event.url;
-		const { page, pageSize } = paginationQuerySchema.parse({
+		const parsed = listAssetsQuerySchema.parse({
 			page: url.searchParams.get('page') ?? undefined,
-			pageSize: url.searchParams.get('pageSize') ?? undefined
+			pageSize: url.searchParams.get('pageSize') ?? undefined,
+			status: url.searchParams.get('status') || undefined,
+			categoryId: url.searchParams.get('categoryId') || undefined,
+			homeLocationId: url.searchParams.get('homeLocationId') || undefined,
+			search: url.searchParams.get('search') || undefined
 		});
 
-		const status = (url.searchParams.get('status') || undefined) as AssetStatus | undefined;
-		const categoryId = url.searchParams.get('categoryId') || undefined;
-		const homeLocationId = url.searchParams.get('homeLocationId') || undefined;
-		const search = url.searchParams.get('search') || undefined;
-
-		const result = await listAssets(event.locals.user, {
-			page,
-			pageSize,
-			status,
-			categoryId,
-			homeLocationId,
-			search
-		});
+		const result = await listAssets(event.locals.user, parsed);
 		return json(result);
 	} catch (err) {
 		return toErrorResponse(err);

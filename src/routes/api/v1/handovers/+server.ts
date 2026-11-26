@@ -1,25 +1,24 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { createHandover, listHandovers } from '$lib/server/services/handoverService';
-import { createHandoverSchema } from '$lib/shared/schemas/handoverShift';
-import { paginationQuerySchema } from '$lib/shared/schemas/master';
+import { createHandoverSchema, listHandoversQuerySchema } from '$lib/shared/schemas/handoverShift';
 import { toErrorResponse } from '$lib/shared/errors';
 
 export const GET: RequestHandler = async (event) => {
 	try {
 		const url = event.url;
-		const { page, pageSize } = paginationQuerySchema.parse({
+		const parsed = listHandoversQuerySchema.parse({
 			page: url.searchParams.get('page') ?? undefined,
-			pageSize: url.searchParams.get('pageSize') ?? undefined
+			pageSize: url.searchParams.get('pageSize') ?? undefined,
+			loanId: url.searchParams.get('loanId') || undefined,
+			unconfirmedOnly: url.searchParams.get('unconfirmedOnly') || undefined
 		});
-		const loanId = url.searchParams.get('loanId') || undefined;
-		const unconfirmedOnly = url.searchParams.get('unconfirmedOnly') === 'true';
 
 		const result = await listHandovers(event.locals.user, {
-			page,
-			pageSize,
-			loanId,
-			unconfirmedOnly
+			page: parsed.page,
+			pageSize: parsed.pageSize,
+			loanId: parsed.loanId,
+			unconfirmedOnly: parsed.unconfirmedOnly === 'true'
 		});
 		return json(result);
 	} catch (err) {

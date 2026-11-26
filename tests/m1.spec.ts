@@ -30,6 +30,11 @@ import {
 } from '../src/lib/server/services/assetService';
 import { listAuditLogs } from '../src/lib/server/services/auditService';
 import { getActiveOutstandingLoanItems } from '../src/lib/server/services/shiftService';
+import { GET as getAssetsHandler } from '../src/routes/api/v1/assets/+server';
+import { GET as getLoansHandler } from '../src/routes/api/v1/loans/+server';
+import { GET as getShiftsHandler } from '../src/routes/api/v1/shifts/+server';
+import { GET as getSyncHandler } from '../src/routes/api/v1/sync/+server';
+import { GET as getHandoversHandler } from '../src/routes/api/v1/handovers/+server';
 
 describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-19, & Otorisasi', () => {
 	let adminActor: PolicyUser;
@@ -758,6 +763,42 @@ describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-1
 			expect(uniqueCodes.size).toBe(6);
 			for (const code of generatedCodes) {
 				expect(code).toMatch(/^AST-\d{4,}$/);
+			}
+		});
+
+		it('Menolak parameter query status/UUID yang tidak sah pada endpoint GET dengan 400 VALIDATION_ERROR alih-alih 500 (#4)', async () => {
+			function mockGetEvent(fullUrl: string) {
+				return {
+					url: new URL(fullUrl),
+					locals: {
+						requestId: 'req-zod-query-test',
+						user: adminActor,
+						sessionId: 'sess-zod-query-test'
+					}
+				} as never;
+			}
+
+			const badRequests = [
+				getAssetsHandler(mockGetEvent('http://localhost:3000/api/v1/assets?status=SALAH')),
+				getAssetsHandler(
+					mockGetEvent('http://localhost:3000/api/v1/assets?categoryId=bukan-uuid')
+				),
+				getLoansHandler(mockGetEvent('http://localhost:3000/api/v1/loans?status=TIDAK_SAH')),
+				getLoansHandler(
+					mockGetEvent('http://localhost:3000/api/v1/loans?borrowerId=bukan-uuid')
+				),
+				getShiftsHandler(mockGetEvent('http://localhost:3000/api/v1/shifts?status=INVALID')),
+				getSyncHandler(mockGetEvent('http://localhost:3000/api/v1/sync?status=NGACO')),
+				getHandoversHandler(
+					mockGetEvent('http://localhost:3000/api/v1/handovers?loanId=bukan-uuid')
+				)
+			];
+
+			const responses = await Promise.all(badRequests);
+			for (const res of responses) {
+				expect(res.status).toBe(400);
+				const body = await res.json();
+				expect(body.error.code).toBe('VALIDATION_ERROR');
 			}
 		});
 	});
