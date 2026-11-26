@@ -342,13 +342,20 @@ export async function createAsset(
 
 	if (input.homeLocationId) {
 		const loc = await prisma.location.findUnique({ where: { id: input.homeLocationId } });
-		if (!loc) {
-			throw new AppError('VALIDATION_ERROR', 'Lokasi tidak ditemukan.', {
-				field: 'homeLocationId'
-			});
+		if (!loc || !loc.isActive) {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				loc
+					? 'Lokasi sudah dinonaktifkan dan tidak dapat digunakan untuk penempatan barang.'
+					: 'Lokasi tidak ditemukan.',
+				{
+					field: 'homeLocationId'
+				}
+			);
 		}
 	}
 
+	const normalizedSerialNumber = input.serialNumber?.trim() || null;
 	const purchasedAtDate = input.purchasedAt ? new Date(input.purchasedAt) : null;
 	const nextMaintenanceAt = category.maintenanceIntervalDays
 		? new Date(Date.now() + category.maintenanceIntervalDays * 86400_000)
@@ -366,6 +373,22 @@ export async function createAsset(
 			}
 		}
 
+		if (normalizedSerialNumber) {
+			const existingSn = await tx.asset.findFirst({
+				where: {
+					serialNumber: { equals: normalizedSerialNumber, mode: 'insensitive' }
+				},
+				select: { id: true, code: true }
+			});
+			if (existingSn) {
+				throw new AppError(
+					'VALIDATION_ERROR',
+					`Nomor seri "${normalizedSerialNumber}" sudah digunakan pada barang ${existingSn.code}.`,
+					{ field: 'serialNumber', existingAssetCode: existingSn.code }
+				);
+			}
+		}
+
 		const qrToken = generateRandomQrToken();
 
 		const asset = await tx.asset.create({
@@ -374,7 +397,7 @@ export async function createAsset(
 				qrToken,
 				name: input.name.trim(),
 				categoryId: input.categoryId,
-				serialNumber: input.serialNumber?.trim() || null,
+				serialNumber: normalizedSerialNumber,
 				status: 'AVAILABLE',
 				homeLocationId: input.homeLocationId ?? null,
 				photoUrl: input.photoUrl?.trim() || null,
@@ -456,44 +479,85 @@ export async function updateAsset(
 
 	if (input.homeLocationId) {
 		const loc = await prisma.location.findUnique({ where: { id: input.homeLocationId } });
-		if (!loc) {
-			throw new AppError('VALIDATION_ERROR', 'Lokasi tidak ditemukan.', {
-				field: 'homeLocationId'
-			});
+		if (!loc || !loc.isActive) {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				loc
+					? 'Lokasi sudah dinonaktifkan dan tidak dapat digunakan untuk penempatan barang.'
+					: 'Lokasi tidak ditemukan.',
+				{
+					field: 'homeLocationId'
+				}
+			);
 		}
 	}
 
+	const normalizedSerialNumber =
+		input.serialNumber !== undefined ? input.serialNumber?.trim() || null : undefined;
+	const expectedVersion = input.version ?? existing.version;
+
 	const updated = await prisma.$transaction(async (tx) => {
-		if (input.accessories !== undefined) {
-			await tx.accessoryTemplate.deleteMany({ where: { assetId: id } });
+		if (normalizedSerialNumber) {
+			const existingSn = await tx.asset.findFirst({
+				where: {
+					id: { not: id },
+					serialNumber: { equals: normalizedSerialNumber, mode: 'insensitive' }
+				},
+				select: { id: true, code: true }
+			});
+			if (existingSn) {
+				throw new AppError(
+					'VALIDATION_ERROR',
+					`Nomor seri "${normalizedSerialNumber}" sudah digunakan pada barang ${existingSn.code}.`,
+					{ field: 'serialNumber', existingAssetCode: existingSn.code }
+				);
+			}
 		}
 
-		const asset = await tx.asset.update({
-			where: { id },
+		// Klaim atomik optimistic locking berdasarkan id + version di dalam transaksi (#4)
+		const claimed = await tx.asset.updateMany({
+			where: {
+				id,
+				version: expectedVersion
+			},
 			data: {
 				...(input.name !== undefined ? { name: input.name.trim() } : {}),
 				...(input.categoryId !== undefined ? { categoryId: input.categoryId } : {}),
-				...(input.serialNumber !== undefined
-					? { serialNumber: input.serialNumber?.trim() || null }
-					: {}),
+				...(normalizedSerialNumber !== undefined ? { serialNumber: normalizedSerialNumber } : {}),
 				...(input.homeLocationId !== undefined ? { homeLocationId: input.homeLocationId } : {}),
 				...(input.photoUrl !== undefined ? { photoUrl: input.photoUrl?.trim() || null } : {}),
 				...(input.purchasedAt !== undefined
 					? { purchasedAt: input.purchasedAt ? new Date(input.purchasedAt) : null }
 					: {}),
 				...(input.notes !== undefined ? { notes: input.notes?.trim() || null } : {}),
-				version: { increment: 1 },
-				...(input.accessories !== undefined && input.accessories.length > 0
-					? {
-							accessories: {
-								create: input.accessories.map((acc) => ({
-									name: acc.name.trim(),
-									quantity: acc.quantity ?? 1
-								}))
-							}
-						}
-					: {})
-			},
+				version: { increment: 1 }
+			}
+		});
+
+		if (claimed.count === 0) {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				'Data barang telah berubah oleh pengguna lain. Muat ulang halaman dan coba lagi.',
+				{ expectedVersion, receivedVersion: input.version ?? existing.version },
+				409
+			);
+		}
+
+		if (input.accessories !== undefined) {
+			await tx.accessoryTemplate.deleteMany({ where: { assetId: id } });
+			if (input.accessories.length > 0) {
+				await tx.accessoryTemplate.createMany({
+					data: input.accessories.map((acc) => ({
+						assetId: id,
+						name: acc.name.trim(),
+						quantity: acc.quantity ?? 1
+					}))
+				});
+			}
+		}
+
+		const asset = await tx.asset.findUniqueOrThrow({
+			where: { id },
 			include: {
 				category: true,
 				homeLocation: true,
@@ -911,6 +975,8 @@ export async function importAssetsFromCsv(
 			const matchedLocation = locationMap.get(homeLocationName.toLowerCase()) ?? null;
 			if (!matchedLocation) {
 				rowReasons.push(`Lokasi "${homeLocationName}" tidak ditemukan di master lokasi.`);
+			} else if (!matchedLocation.isActive) {
+				rowReasons.push(`Lokasi "${homeLocationName}" sudah dinonaktifkan.`);
 			} else {
 				matchedLocationId = matchedLocation.id;
 			}

@@ -89,6 +89,11 @@
 				<option value="User">User</option>
 				<option value="Session">Session</option>
 				<option value="Loan">Loan</option>
+				<option value="LoanItem">LoanItem</option>
+				<option value="Evidence">Evidence</option>
+				<option value="Handover">Handover</option>
+				<option value="Shift">Shift</option>
+				<option value="SyncOperation">SyncOperation</option>
 			</select>
 		</div>
 		<div>

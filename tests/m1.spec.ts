@@ -508,6 +508,105 @@ describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-1
 				data: { returnedAt: new Date(), returnCondition: 'NORMAL' }
 			});
 		});
+
+		it('Menolak serialNumber ganda dengan 400 VALIDATION_ERROR, menegakkan optimistic locking atomik pada updateAsset paralel (#4), serta menolak lokasi nonaktif pada createAsset, updateAsset, dan importAssetsFromCsv (#6)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const duplicateSn = `SN-UNIK-${suffix}`;
+
+			const assetA = await createAsset(adminActor, {
+				name: 'Barang Pertama SN Unik',
+				categoryId,
+				homeLocationId: locationId,
+				serialNumber: duplicateSn
+			});
+
+			// 1. createAsset dengan serialNumber yang sudah dipakai barang lain -> 400 VALIDATION_ERROR
+			await expect(
+				createAsset(adminActor, {
+					name: 'Barang Duplikat SN',
+					categoryId,
+					homeLocationId: locationId,
+					serialNumber: duplicateSn.toLowerCase()
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			const assetB = await createAsset(adminActor, {
+				name: 'Barang Kedua SN Berbeda',
+				categoryId,
+				homeLocationId: locationId,
+				serialNumber: `SN-B-${suffix}`
+			});
+
+			// 2. updateAsset mengubah serialNumber menjadi milik barang lain -> 400 VALIDATION_ERROR
+			await expect(
+				updateAsset(adminActor, assetB.asset.id, {
+					serialNumber: duplicateSn
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			// 3. Optimistic locking atomik di dalam transaksi updateAsset: 2 update paralel dengan version=0 hanya 1 yang menang, 1 gagal 409
+			const parallelUpdates = await Promise.allSettled([
+				updateAsset(adminActor, assetA.asset.id, {
+					name: 'Update Paralel 1',
+					version: 0
+				}),
+				updateAsset(adminActor, assetA.asset.id, {
+					name: 'Update Paralel 2',
+					version: 0
+				})
+			]);
+			expect(parallelUpdates.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+			const rejectedUpdate = parallelUpdates.find(
+				(r): r is PromiseRejectedResult => r.status === 'rejected'
+			);
+			expect(rejectedUpdate?.reason).toMatchObject({ status: 409 });
+
+			// 4. Buat lokasi nonaktif -> ditolak di createAsset, updateAsset, dan importAssetsFromCsv (#6)
+			const inactiveLocName = `Gudang Lama Nonaktif ${suffix}`;
+			const inactiveLoc = await createLocation(adminActor, {
+				name: inactiveLocName,
+				radiusM: 100,
+				isActive: false
+			});
+
+			await expect(
+				createAsset(adminActor, {
+					name: 'Barang di Lokasi Nonaktif',
+					categoryId,
+					homeLocationId: inactiveLoc.location.id
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			await expect(
+				updateAsset(adminActor, assetB.asset.id, {
+					homeLocationId: inactiveLoc.location.id
+				})
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			const csvWithInactiveLoc = [
+				'name,category,serialNumber,homeLocation',
+				`Monitor Lokasi Nonaktif,${categoryName},SN-INACT-${suffix},${inactiveLocName}`
+			].join('\n');
+			const previewInactive = await importAssetsFromCsv(adminActor, {
+				csvText: csvWithInactiveLoc,
+				mode: 'preview'
+			});
+			expect(previewInactive.validCount).toBe(0);
+			expect(previewInactive.failedCount).toBe(1);
+			expect(previewInactive.errors[0].reason).toContain('dinonaktifkan');
+		});
 	});
 
 	describe('5. Impor CSV dengan Pratinjau, Laporan Baris Gagal, & Idempotensi Nomor Seri (Bagian 18)', () => {
