@@ -134,9 +134,14 @@ export async function refreshUserSession(params: {
 	const now = new Date();
 	const newExpiresAt = new Date(now.getTime() + REFRESH_TOKEN_TTL_MS);
 
-	const updatedSession = await prisma.$transaction(async (tx) => {
-		const updated = await tx.session.update({
-			where: { id: existingSession.id },
+	await prisma.$transaction(async (tx) => {
+		const claimed = await tx.session.updateMany({
+			where: {
+				id: existingSession.id,
+				refreshTokenHash: currentHash,
+				revokedAt: null,
+				expiresAt: { gt: now }
+			},
 			data: {
 				refreshTokenHash: newRefreshTokenHash,
 				lastSeenAt: now,
@@ -144,6 +149,13 @@ export async function refreshUserSession(params: {
 				...(params.deviceInfo ? { deviceInfo: params.deviceInfo } : {})
 			}
 		});
+
+		if (claimed.count === 0) {
+			throw new AppError(
+				'UNAUTHENTICATED',
+				'Sesi tidak valid atau refresh token sudah digunakan.'
+			);
+		}
 
 		await writeAuditLog(tx, {
 			actorId: existingSession.userId,
@@ -155,14 +167,12 @@ export async function refreshUserSession(params: {
 			},
 			ip: params.ip ?? null
 		});
-
-		return updated;
 	});
 
 	const user = existingSession.user;
 	const accessToken = await signAccessToken({
 		sub: user.id,
-		sid: updatedSession.id,
+		sid: existingSession.id,
 		role: user.role,
 		email: user.email,
 		name: user.name
@@ -171,7 +181,7 @@ export async function refreshUserSession(params: {
 	return {
 		accessToken,
 		refreshToken: newRawRefreshToken,
-		sessionId: updatedSession.id,
+		sessionId: existingSession.id,
 		expiresAt: newExpiresAt,
 		user: {
 			id: user.id,

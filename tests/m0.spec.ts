@@ -350,6 +350,55 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 			expect(afterLogout).toBeNull();
 		});
 
+		it('Klaim atomik refreshUserSession mencegah balapan rotasi token paralel menimpa token pemenang (#3)', async () => {
+			const loginResult = await loginUser({
+				email: borrowerEmail,
+				password: plainPassword,
+				deviceInfo: 'Parallel Refresh Race Test',
+				ip: '127.0.0.1'
+			});
+
+			// Jalankan 5 panggilan refreshUserSession paralel dengan refreshToken yang sama
+			const parallelResults = await Promise.allSettled(
+				Array.from({ length: 5 }, (_, idx) =>
+					refreshUserSession({
+						refreshToken: loginResult.refreshToken,
+						deviceInfo: `Parallel Caller #${idx + 1}`,
+						ip: '127.0.0.1'
+					})
+				)
+			);
+
+			const fulfilled = parallelResults.filter(
+				(r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof refreshUserSession>>> =>
+					r.status === 'fulfilled'
+			);
+			const rejected = parallelResults.filter(
+				(r): r is PromiseRejectedResult => r.status === 'rejected'
+			);
+
+			// Tepat 1 panggilan berhasil mengklaim rotasi token; 4 lainnya ditolak UNAUTHENTICATED
+			expect(fulfilled).toHaveLength(1);
+			expect(rejected).toHaveLength(4);
+			for (const rej of rejected) {
+				expect(rej.reason).toMatchObject({ code: 'UNAUTHENTICATED', status: 401 });
+			}
+
+			// Refresh token milik pemenang tidak tertimpa dan masih valid untuk rotasi berikutnya
+			const winnerToken = fulfilled[0].value.refreshToken;
+			const nextRefresh = await refreshUserSession({
+				refreshToken: winnerToken,
+				ip: '127.0.0.1'
+			});
+			expect(nextRefresh.sessionId).toBe(loginResult.sessionId);
+			expect(nextRefresh.refreshToken).not.toBe(winnerToken);
+
+			await logoutUserSession({
+				sessionId: nextRefresh.sessionId,
+				actorId: nextRefresh.user.id
+			});
+		});
+
 		it('Wajib TOTP untuk ADMIN yang memiliki mfaSecret dan mencabut sesi pengguna secara instan (BR-19 & Bagian 12)', async () => {
 			// Login admin tanpa TOTP harus ditolak
 			await expect(
