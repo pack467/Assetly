@@ -26,16 +26,19 @@ function applyHeaders(response: Response, headersToApply: Record<string, string>
 	return response;
 }
 
+const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
 export const handle: Handle = async ({ event, resolve }) => {
 	event.locals.requestId = randomUUID();
 	event.locals.user = null;
 	event.locals.sessionId = null;
 
-	const requestOrigin = event.request.headers.get('origin');
+	const requestOrigin = event.request.headers.get('origin')?.trim() || null;
 	const corsHeaders = getCorsHeadersForOrigin(requestOrigin);
+	const method = event.request.method.toUpperCase();
 
 	// Tangani preflight OPTIONS untuk endpoint API (termasuk origin Capacitor)
-	if (event.request.method === 'OPTIONS' && event.url.pathname.startsWith('/api/')) {
+	if (method === 'OPTIONS' && event.url.pathname.startsWith('/api/')) {
 		if (!corsHeaders) {
 			return new Response(null, {
 				status: 403,
@@ -72,6 +75,43 @@ export const handle: Handle = async ({ event, resolve }) => {
 
 	const authHeader = event.request.headers.get('authorization');
 	const hasBearerHeader = Boolean(authHeader && authHeader.toLowerCase().startsWith('bearer '));
+	const isSameOrigin = Boolean(requestOrigin && requestOrigin === event.url.origin);
+	const isPublicTokenBootstrapEndpoint =
+		event.url.pathname === '/api/v1/auth/login' || event.url.pathname === '/api/v1/auth/refresh';
+
+	// Bagian 12 (#1): Pengecekan Origin / CSRF eksplisit untuk seluruh metode tulis (POST, PUT, PATCH, DELETE)
+	if (STATE_CHANGING_METHODS.has(method)) {
+		if (hasBearerHeader) {
+			// Request dengan Bearer (APK Capacitor / klien API): bila mengirim header Origin lintas-origin, wajib terdaftar di CORS_ALLOWED_ORIGINS
+			if (requestOrigin && !isSameOrigin && !corsHeaders) {
+				const forbiddenBearer = toErrorResponse(
+					new AppError('FORBIDDEN', 'Origin permintaan tidak diizinkan oleh kebijakan CORS.')
+				);
+				forbiddenBearer.headers.set('x-request-id', event.locals.requestId);
+				forbiddenBearer.headers.set('vary', 'Origin');
+				return forbiddenBearer;
+			}
+		} else {
+			// Request tanpa Bearer (berbasis cookie di Web Admin): WAJIB same-origin (Origin === event.url.origin).
+			// Pengecualian terbatas hanya untuk /auth/login dan /auth/refresh dari origin Capacitor yang diizinkan di CORS_ALLOWED_ORIGINS
+			// (di mana /auth/refresh lintas-origin hanya menerima refreshToken dari body JSON, tidak pernah dari cookie).
+			const allowedCapacitorBootstrap = isPublicTokenBootstrapEndpoint && corsHeaders !== null;
+			if (!isSameOrigin && !allowedCapacitorBootstrap) {
+				const csrfResp = toErrorResponse(
+					new AppError(
+						'FORBIDDEN',
+						'Permintaan ditolak: Origin tidak sah untuk sesi berbasis cookie (proteksi CSRF).'
+					)
+				);
+				csrfResp.headers.set('x-request-id', event.locals.requestId);
+				if (requestOrigin) {
+					csrfResp.headers.set('vary', 'Origin');
+				}
+				return csrfResp;
+			}
+		}
+	}
+
 	let token: string | null = null;
 	if (hasBearerHeader && authHeader) {
 		token = authHeader.slice(7).trim();
@@ -87,10 +127,17 @@ export const handle: Handle = async ({ event, resolve }) => {
 		}
 	}
 
-	// #5: Refresh otomatis sesi berbasis cookie (Web Admin) ketika access token kedaluwarsa/tidak ada namun cookie refresh token masih valid
-	const isAuthTokenEndpoint =
-		event.url.pathname === '/api/v1/auth/login' || event.url.pathname === '/api/v1/auth/refresh';
-	if (!event.locals.user && !hasBearerHeader && !isAuthTokenEndpoint) {
+	// #5 & #1: Refresh otomatis sesi berbasis cookie (Web Admin) ketika access token kedaluwarsa, hanya untuk request non-cross-site
+	const isAuthTokenEndpoint = isPublicTokenBootstrapEndpoint;
+	const isCrossSiteFetch = event.request.headers.get('sec-fetch-site') === 'cross-site';
+	const canAutoRefreshCookie =
+		!event.locals.user &&
+		!hasBearerHeader &&
+		!isAuthTokenEndpoint &&
+		!isCrossSiteFetch &&
+		(!requestOrigin || isSameOrigin);
+
+	if (canAutoRefreshCookie) {
 		const rawRefreshToken = event.cookies.get(REFRESHTOKEN_COOKIE) ?? null;
 		if (rawRefreshToken) {
 			let clientIp: string | undefined;

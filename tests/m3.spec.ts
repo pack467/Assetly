@@ -1013,5 +1013,131 @@ describe('M3: Serah Terima Dua Pihak (Handover), Buka/Tutup Shift (BR-12), Atura
 				process.env.CORS_ALLOWED_ORIGINS = prevCors;
 			}
 		});
+
+		it('menegakkan pengecekan Origin CSRF eksplisit untuk metode tulis berbasis cookie (tanpa Bearer) dan memvalidasi CORS_ALLOWED_ORIGINS untuk Bearer (#1)', async () => {
+			const prevCors = process.env.CORS_ALLOWED_ORIGINS;
+			try {
+				process.env.CORS_ALLOWED_ORIGINS = 'https://localhost,capacitor://localhost';
+
+				// 1. Metode tulis berbasis cookie dengan Origin asing -> 403 FORBIDDEN
+				const crossSiteCookiePost = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/assets', {
+							method: 'POST',
+							headers: {
+								origin: 'https://evil.example.com',
+								'content-type': 'application/json'
+							},
+							body: '{}'
+						}),
+						url: new URL('http://localhost:5173/api/v1/assets'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Should be blocked by CSRF', { status: 200 })
+				});
+				expect(crossSiteCookiePost.status).toBe(403);
+
+				// 2. Metode tulis berbasis cookie tanpa header Origin -> 403 FORBIDDEN
+				const missingOriginCookiePost = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/assets', {
+							method: 'PATCH',
+							headers: { 'content-type': 'application/json' },
+							body: '{}'
+						}),
+						url: new URL('http://localhost:5173/api/v1/assets'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Should be blocked by CSRF', { status: 200 })
+				});
+				expect(missingOriginCookiePost.status).toBe(403);
+
+				// 3. Metode tulis berbasis cookie (tanpa Bearer) dari origin Capacitor https://localhost -> TETAP DITOLAK 403
+				//    (membuktikan CORS_ALLOWED_ORIGINS tidak melonggarkan keamanan endpoint berbasis cookie!)
+				const capacitorOriginWithoutBearer = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/assets', {
+							method: 'POST',
+							headers: {
+								origin: 'https://localhost',
+								'content-type': 'application/json'
+							},
+							body: '{}'
+						}),
+						url: new URL('http://localhost:5173/api/v1/assets'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Should be blocked without Bearer', { status: 200 })
+				});
+				expect(capacitorOriginWithoutBearer.status).toBe(403);
+
+				// 4. Metode tulis berbasis cookie dengan Origin same-origin -> diizinkan masuk ke handler (200)
+				const sameOriginCookiePost = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/assets', {
+							method: 'POST',
+							headers: {
+								origin: 'http://localhost:5173',
+								'content-type': 'application/json'
+							},
+							body: '{}'
+						}),
+						url: new URL('http://localhost:5173/api/v1/assets'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Same-origin allowed', { status: 200 })
+				});
+				expect(sameOriginCookiePost.status).toBe(200);
+
+				// 5. Metode tulis dengan Bearer dari origin Capacitor yang terdaftar di CORS_ALLOWED_ORIGINS -> diizinkan (200) + header CORS
+				const validBearerCapacitorPost = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/sync', {
+							method: 'POST',
+							headers: {
+								origin: 'https://localhost',
+								authorization: 'Bearer invalid-or-test-jwt',
+								'content-type': 'application/json'
+							},
+							body: '{}'
+						}),
+						url: new URL('http://localhost:5173/api/v1/sync'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Bearer Capacitor allowed', { status: 200 })
+				});
+				expect(validBearerCapacitorPost.status).toBe(200);
+				expect(validBearerCapacitorPost.headers.get('access-control-allow-origin')).toBe(
+					'https://localhost'
+				);
+
+				// 6. Metode tulis dengan Bearer tetapi dari Origin asing di luar CORS_ALLOWED_ORIGINS -> 403 FORBIDDEN
+				const evilBearerPost = await handle({
+					event: {
+						request: new Request('http://localhost:5173/api/v1/sync', {
+							method: 'POST',
+							headers: {
+								origin: 'https://attacker.invalid',
+								authorization: 'Bearer some-token',
+								'content-type': 'application/json'
+							},
+							body: '{}'
+						}),
+						url: new URL('http://localhost:5173/api/v1/sync'),
+						locals: {} as App.Locals,
+						cookies: { get: () => undefined } as never
+					} as never,
+					resolve: async () => new Response('Should be blocked', { status: 200 })
+				});
+				expect(evilBearerPost.status).toBe(403);
+			} finally {
+				process.env.CORS_ALLOWED_ORIGINS = prevCors;
+			}
+		});
 	});
 });

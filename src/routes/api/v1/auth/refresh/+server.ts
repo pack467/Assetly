@@ -15,7 +15,11 @@ export const POST: RequestHandler = async (event) => {
 		}
 
 		const parsed = refreshSchema.parse(body);
-		const rawRefreshToken = parsed.refreshToken ?? event.cookies.get(REFRESHTOKEN_COOKIE);
+		const requestOrigin = event.request.headers.get('origin')?.trim() || null;
+		const isSameOrigin = Boolean(requestOrigin && requestOrigin === event.url.origin);
+		// Keamanan cookie (#1): Pembacaan refresh token dari cookie httpOnly HANYA diizinkan untuk request same-origin
+		const rawRefreshToken =
+			parsed.refreshToken ?? (isSameOrigin ? event.cookies.get(REFRESHTOKEN_COOKIE) : undefined);
 
 		if (!rawRefreshToken) {
 			throw new AppError('UNAUTHENTICATED', 'Refresh token tidak ditemukan.');
