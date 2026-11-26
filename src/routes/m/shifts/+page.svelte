@@ -3,6 +3,7 @@
 	import { mobileApi } from '$lib/client/api';
 	import {
 		getOfflineQueueStorage,
+		listQueueItemsForUser,
 		subscribeOfflineQueue,
 		type OfflineQueueItem
 	} from '$lib/client/offlineQueue';
@@ -155,7 +156,7 @@
 	});
 
 	async function syncQueueSnapshot() {
-		const all = await getOfflineQueueStorage().listAll();
+		const all = await listQueueItemsForUser(getOfflineQueueStorage());
 		pendingQueueOps = all.filter((op) => op.syncState === 'PENDING' || op.syncState === 'SYNCING');
 	}
 

@@ -1,7 +1,9 @@
 import { env } from '$env/dynamic/public';
 import {
+	clearMobileSessionStorageCaches,
 	decodeJwtDisplayProfile,
 	getTokenStorage,
+	resolveCurrentOfflineUserId,
 	type MobileDisplayProfile,
 	type TokenPair,
 	type TokenStorageAdapter
@@ -33,6 +35,7 @@ export interface MobileApiClient {
 	logout(): Promise<void>;
 	refreshSession(): Promise<TokenPair | null>;
 	resolveSessionUser(): Promise<ResolvedMobileSession>;
+	getResolvedUserId?(): Promise<string | null>;
 }
 
 type UnauthorizedListener = () => void;
@@ -313,11 +316,16 @@ export function createMobileApiClient(options: MobileApiClientOptions = {}): Mob
 				if (storage.clearCachedProfile) {
 					await storage.clearCachedProfile();
 				}
+				clearMobileSessionStorageCaches();
 			}
 		},
 
 		refreshSession() {
 			return executeSingleFlightRefresh();
+		},
+
+		getResolvedUserId() {
+			return resolveCurrentOfflineUserId(getStorage());
 		},
 
 		async resolveSessionUser(): Promise<ResolvedMobileSession> {

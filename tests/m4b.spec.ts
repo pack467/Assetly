@@ -2,13 +2,14 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createMobileApiClient } from '../src/lib/client/api';
-import { createMemoryTokenStorage } from '../src/lib/client/tokenStorage';
+import { createMemoryTokenStorage, setTokenStorage } from '../src/lib/client/tokenStorage';
 import {
 	clearCachedAssets,
 	computeOfflineQueueSummary,
 	createMemoryOfflineQueueStorage,
 	findCachedAssetByCodeOrQr,
 	getCachedAssetsList,
+	listQueueItemsForUser,
 	saveCachedAssetScanPayload,
 	saveCachedAssetsList,
 	setOfflineQueueStorage,
@@ -16,6 +17,7 @@ import {
 	type OfflineQueueStorage
 } from '../src/lib/client/offlineQueue';
 import {
+	attemptMobileLogout,
 	computeBackoffDelayMs,
 	enqueueOfflineOperation,
 	extractMissingShiftCloseAssets,
@@ -896,5 +898,275 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 		const updatedFromScanCache = findCachedAssetByCodeOrQr('AST-0100');
 		expect(updatedFromScanCache?.asset.status).toBe('BORROWED');
 		expect(updatedFromScanCache?.activeLoanItem?.id).toBe('li-100');
+	});
+
+	it('10. mengisolasi antrean offline per userId di perangkat bersama, melindungi operasi pengguna lain, mewajibkan konfirmasi tegas saat logout dengan operasi PENDING, dan membersihkan semua cache sessionStorage saat logout atau sesi ditolak server (#1)', async () => {
+		// Siapkan mock window.sessionStorage untuk memverifikasi pembersihan seluruh cache sesi
+		const mockSessionMap = new Map<string, string>();
+		const mockSessionStorage = {
+			get length() {
+				return mockSessionMap.size;
+			},
+			key(index: number) {
+				return Array.from(mockSessionMap.keys())[index] ?? null;
+			},
+			getItem(k: string) {
+				return mockSessionMap.get(k) ?? null;
+			},
+			setItem(k: string, v: string) {
+				mockSessionMap.set(k, String(v));
+			},
+			removeItem(k: string) {
+				mockSessionMap.delete(k);
+			},
+			clear() {
+				mockSessionMap.clear();
+			}
+		};
+		const prevWindow = (globalThis as unknown as { window?: unknown }).window;
+		(globalThis as unknown as { window: unknown }).window = {
+			sessionStorage: mockSessionStorage
+		};
+
+		try {
+			// 1. Pengguna A login dan membuat operasi offline + mengisi berbagai cache sessionStorage
+			const tokenStorageUserA = createMemoryTokenStorage(
+				{ accessToken: 'token-user-a', refreshToken: 'refresh-user-a' },
+				{
+					id: 'user-a-id',
+					name: 'Petugas A',
+					email: 'a@itam.local',
+					role: 'OFFICER',
+					isActive: true
+				}
+			);
+			setTokenStorage(tokenStorageUserA);
+
+			mockSessionStorage.setItem('itam_my_loans_cache', '[{"id":"loan-a"}]');
+			mockSessionStorage.setItem('itam_handovers_cache', '{"currentUserId":"user-a-id"}');
+			mockSessionStorage.setItem('itam_shift_state_cache', '{"currentShift":{"id":"shift-a"}}');
+			mockSessionStorage.setItem('itam_user_name_cache', 'Petugas A');
+			mockSessionStorage.setItem('itam_locations_cache', '[{"id":"loc-1"}]');
+			mockSessionStorage.setItem('itam_asset_cache_AST-0001', '{"asset":{"code":"AST-0001"}}');
+			saveCachedAssetsList([
+				{
+					id: 'a-1',
+					code: 'AST-0001',
+					name: 'Laptop A',
+					status: 'AVAILABLE',
+					serialNumber: null
+				}
+			]);
+
+			const opUserA = await enqueueOfflineOperation(
+				{
+					type: 'LOAN_CREATE',
+					label: 'Pinjam AST-0001 oleh Petugas A',
+					assetCode: 'AST-0001',
+					clientCreatedAt: '2026-11-26T05:00:00.000Z',
+					payload: {
+						purpose: 'Tugas A',
+						expectedReturnAt: '2026-11-27T05:00:00.000Z',
+						items: [
+							{
+								assetId: '00000000-0000-4000-8000-000000000001',
+								checkoutEvidenceId: '11111111-1111-4111-8111-111111111111'
+							}
+						]
+					}
+				},
+				queueStorage
+			);
+			expect(opUserA.userId).toBe('user-a-id');
+
+			const syncedOpIds: Array<{ clientOpId: string; authHeader: string | null }> = [];
+			const mockFetch: typeof fetch = async (input, init) => {
+				const url = String(input);
+				const headers = new Headers(init?.headers ?? {});
+				const authHeader = headers.get('authorization');
+
+				if (url.endsWith('/api/v1/auth/logout')) {
+					return new Response(JSON.stringify({ ok: true }), { status: 200 });
+				}
+
+				if (url.endsWith('/api/v1/sync')) {
+					const parsed = JSON.parse(String(init?.body)) as {
+						operations: Array<{ clientOpId: string }>;
+					};
+					const op = parsed.operations[0];
+					syncedOpIds.push({ clientOpId: op.clientOpId, authHeader });
+					return new Response(
+						JSON.stringify({
+							results: [
+								{
+									clientOpId: op.clientOpId,
+									status: 'ACCEPTED',
+									idempotentReplay: false,
+									conflictReason: null
+								}
+							]
+						}),
+						{ status: 200, headers: { 'Content-Type': 'application/json' } }
+					);
+				}
+
+				return new Response('{}', { status: 404 });
+			};
+
+			const apiUserA = createMobileApiClient({
+				baseUrl: 'http://localhost:5173',
+				storage: tokenStorageUserA,
+				fetchFn: mockFetch
+			});
+
+			// 2. Percobaan logout Pengguna A tanpa konfirmasi tegas saat masih ada operasi PENDING wajib ditahan
+			const firstLogoutAttempt = await attemptMobileLogout({
+				confirmWithPending: false,
+				apiClient: apiUserA,
+				storage: queueStorage
+			});
+			expect(firstLogoutAttempt.loggedOut).toBe(false);
+			expect(firstLogoutAttempt.requiresConfirmation).toBe(true);
+			expect(firstLogoutAttempt.pendingCount).toBe(1);
+			// Token Pengguna A belum dihapus karena logout ditahan
+			expect(await tokenStorageUserA.getTokens()).not.toBeNull();
+
+			// 3. Pengguna A memberikan konfirmasi tegas untuk tetap keluar
+			const confirmedLogout = await attemptMobileLogout({
+				confirmWithPending: true,
+				apiClient: apiUserA,
+				storage: queueStorage
+			});
+			expect(confirmedLogout.loggedOut).toBe(true);
+			expect(await tokenStorageUserA.getTokens()).toBeNull();
+
+			// Seluruh cache sessionStorage sesi Pengguna A wajib sudah bersih
+			expect(mockSessionStorage.getItem('itam_my_loans_cache')).toBeNull();
+			expect(mockSessionStorage.getItem('itam_handovers_cache')).toBeNull();
+			expect(mockSessionStorage.getItem('itam_shift_state_cache')).toBeNull();
+			expect(mockSessionStorage.getItem('itam_user_name_cache')).toBeNull();
+			expect(mockSessionStorage.getItem('itam_locations_cache')).toBeNull();
+			expect(mockSessionStorage.getItem('itam_asset_cache_AST-0001')).toBeNull();
+			expect(getCachedAssetsList()).toHaveLength(0);
+
+			// Namun operasi PENDING milik Pengguna A tetap tersimpan utuh di storage antrean!
+			expect(await queueStorage.getById(opUserA.clientOpId)).not.toBeNull();
+
+			// 4. Pengguna B login di HP yang sama
+			const tokenStorageUserB = createMemoryTokenStorage(
+				{ accessToken: 'token-user-b', refreshToken: 'refresh-user-b' },
+				{
+					id: 'user-b-id',
+					name: 'Peminjam B',
+					email: 'b@itam.local',
+					role: 'BORROWER',
+					isActive: true
+				}
+			);
+			setTokenStorage(tokenStorageUserB);
+			const apiUserB = createMobileApiClient({
+				baseUrl: 'http://localhost:5173',
+				storage: tokenStorageUserB,
+				fetchFn: mockFetch
+			});
+
+			// Pengguna B TIDAK boleh melihat operasi milik Pengguna A
+			const listForBBefore = await listQueueItemsForUser(queueStorage);
+			expect(listForBBefore).toHaveLength(0);
+			const summaryForBBefore = await computeOfflineQueueSummary(queueStorage);
+			expect(summaryForBBefore.totalCount).toBe(0);
+			expect(summaryForBBefore.pendingCount).toBe(0);
+
+			// Pengguna B membuat operasinya sendiri lalu menjalankan sinkronisasi
+			const opUserB = await enqueueOfflineOperation(
+				{
+					type: 'LOAN_CREATE',
+					label: 'Pinjam AST-0002 oleh Peminjam B',
+					assetCode: 'AST-0002',
+					clientCreatedAt: '2026-11-26T05:10:00.000Z',
+					payload: {
+						purpose: 'Tugas B',
+						expectedReturnAt: '2026-11-27T05:10:00.000Z',
+						items: [
+							{
+								assetId: '00000000-0000-4000-8000-000000000002',
+								checkoutEvidenceId: '22222222-2222-4222-8222-222222222222'
+							}
+						]
+					}
+				},
+				queueStorage
+			);
+			expect(opUserB.userId).toBe('user-b-id');
+
+			const outcomeB = await syncPendingOperations({
+				apiClient: apiUserB,
+				storage: queueStorage,
+				force: true
+			});
+			// Hanya operasi Pengguna B yang dikirim dengan token Pengguna B!
+			expect(outcomeB.processed).toBe(1);
+			expect(outcomeB.accepted).toBe(1);
+			expect(syncedOpIds).toEqual([
+				{ clientOpId: opUserB.clientOpId, authHeader: 'Bearer token-user-b' }
+			]);
+
+			// Pengguna B membersihkan riwayat ACCEPTED miliknya -> operasi Pengguna A tetap utuh
+			await queueStorage.clearByStates(['ACCEPTED']);
+			expect(await queueStorage.getById(opUserB.clientOpId)).toBeNull();
+			const untouchedOpA = await queueStorage.getById(opUserA.clientOpId);
+			expect(untouchedOpA?.syncState).toBe('PENDING');
+
+			// 5. Pengguna A login kembali di HP tersebut -> operasinya kembali tampil dan berhasil disinkronkan
+			await tokenStorageUserA.setTokens({
+				accessToken: 'token-user-a-relogin',
+				refreshToken: 'refresh-user-a-relogin'
+			});
+			await tokenStorageUserA.setCachedProfile?.({
+				id: 'user-a-id',
+				name: 'Petugas A',
+				email: 'a@itam.local',
+				role: 'OFFICER',
+				isActive: true
+			});
+			setTokenStorage(tokenStorageUserA);
+
+			const listForARelogin = await listQueueItemsForUser(queueStorage);
+			expect(listForARelogin).toHaveLength(1);
+			expect(listForARelogin[0].clientOpId).toBe(opUserA.clientOpId);
+
+			const outcomeA = await syncPendingOperations({
+				apiClient: apiUserA,
+				storage: queueStorage,
+				force: true
+			});
+			expect(outcomeA.accepted).toBe(1);
+			expect(syncedOpIds[1]).toEqual({
+				clientOpId: opUserA.clientOpId,
+				authHeader: 'Bearer token-user-a-relogin'
+			});
+
+			// 6. Verifikasi penolakan sesi oleh server (401 pada refresh) juga membersihkan seluruh cache sessionStorage
+			mockSessionStorage.setItem('itam_my_loans_cache', '[{"id":"loan-stale"}]');
+			mockSessionStorage.setItem('itam_shift_state_cache', '{"currentShift":{"id":"shift-stale"}}');
+
+			const rejectedFetch: typeof fetch = async () =>
+				new Response(JSON.stringify({ error: { code: 'UNAUTHENTICATED', message: 'Revoked' } }), {
+					status: 401,
+					headers: { 'Content-Type': 'application/json' }
+				});
+			const apiRejected = createMobileApiClient({
+				baseUrl: 'http://localhost:5173',
+				storage: tokenStorageUserA,
+				fetchFn: rejectedFetch
+			});
+
+			const resolvedAfterRevoke = await apiRejected.resolveSessionUser();
+			expect(resolvedAfterRevoke.user).toBeNull();
+			expect(mockSessionStorage.getItem('itam_my_loans_cache')).toBeNull();
+			expect(mockSessionStorage.getItem('itam_shift_state_cache')).toBeNull();
+		} finally {
+			(globalThis as unknown as { window?: unknown }).window = prevWindow;
+		}
 	});
 });

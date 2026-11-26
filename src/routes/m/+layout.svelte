@@ -4,11 +4,12 @@
 	import { page } from '$app/state';
 	import { mobileApi, onMobileUnauthorized } from '$lib/client/api';
 	import {
+		clearAllMobileSessionCaches,
 		computeOfflineQueueSummary,
 		subscribeOfflineQueue,
 		type OfflineQueueSummary
 	} from '$lib/client/offlineQueue';
-	import { syncPendingOperations } from '$lib/client/syncManager';
+	import { attemptMobileLogout, syncPendingOperations } from '$lib/client/syncManager';
 	import { getTokenStorage } from '$lib/client/tokenStorage';
 	import { RoleLabels } from '$lib/shared/enums';
 	import { formatFriendlyErrorMessage } from '$lib/shared/mobile/watermark';
@@ -32,6 +33,8 @@
 	let loginError = $state('');
 	let submitting = $state(false);
 	let isOnline = $state(true);
+	let showLogoutPendingConfirm = $state(false);
+	let pendingLogoutCount = $state(0);
 	let queueSummary = $state<OfflineQueueSummary>({
 		pendingCount: 0,
 		syncingCount: 0,
@@ -47,7 +50,7 @@
 	let backgroundSyncInterval: ReturnType<typeof setInterval> | null = null;
 
 	async function refreshQueueSummary() {
-		queueSummary = await computeOfflineQueueSummary();
+		queueSummary = await computeOfflineQueueSummary(undefined, currentUser?.id);
 	}
 
 	async function checkSession() {
@@ -55,6 +58,7 @@
 		try {
 			const resolved = await mobileApi.resolveSessionUser();
 			currentUser = resolved.user;
+			await refreshQueueSummary();
 		} catch {
 			currentUser = null;
 		} finally {
@@ -87,6 +91,7 @@
 			currentUser = data.user;
 			password = '';
 			totpCode = '';
+			await refreshQueueSummary();
 		} catch {
 			loginError = 'Tidak dapat terhubung ke server. Periksa koneksi HP Anda.';
 		} finally {
@@ -95,8 +100,28 @@
 	}
 
 	async function handleLogout() {
-		await mobileApi.logout();
+		const res = await attemptMobileLogout({
+			confirmWithPending: false,
+			userId: currentUser?.id
+		});
+		if (res.requiresConfirmation) {
+			pendingLogoutCount = res.pendingCount;
+			showLogoutPendingConfirm = true;
+			return;
+		}
+		showLogoutPendingConfirm = false;
 		currentUser = null;
+		await refreshQueueSummary();
+	}
+
+	async function confirmForceLogout() {
+		await attemptMobileLogout({
+			confirmWithPending: true,
+			userId: currentUser?.id
+		});
+		showLogoutPendingConfirm = false;
+		currentUser = null;
+		await refreshQueueSummary();
 	}
 
 	onMount(() => {
@@ -127,6 +152,8 @@
 			getTokenStorage()
 				.clearCachedProfile?.()
 				.catch(() => {});
+			clearAllMobileSessionCaches();
+			showLogoutPendingConfirm = false;
 			currentUser = null;
 			loginError = 'Sesi Anda telah berakhir. Silakan masuk kembali.';
 			if (page.url.pathname !== '/m') {
@@ -317,6 +344,47 @@
 					Keluar
 				</button>
 			</div>
+
+			{#if showLogoutPendingConfirm}
+				<div
+					class="mt-3 space-y-2.5 rounded-xl border-2 border-amber-400 bg-amber-50 p-3.5 text-xs text-amber-950"
+				>
+					<div class="font-extrabold uppercase tracking-wider text-amber-900">
+						⚠ Konfirmasi Keluar — Ada {pendingLogoutCount} Operasi Belum Tersinkron
+					</div>
+					<p class="leading-relaxed text-amber-900">
+						Anda masih memiliki <strong>{pendingLogoutCount} operasi offline (PENDING)</strong> yang
+						belum terkirim ke server. Operasi Anda tetap tersimpan aman di HP dan
+						<strong>tidak akan dikirim oleh akun lain</strong>, namun baru dapat disinkronkan saat
+						Anda masuk kembali ke akun ini.
+					</p>
+					<div class="flex flex-col gap-2 pt-1">
+						<a
+							href="/m/sync"
+							onclick={() => (showLogoutPendingConfirm = false)}
+							class="w-full rounded-xl bg-slate-900 px-3 py-2.5 text-center text-xs font-bold text-white"
+						>
+							Batal & Buka Layar Sinkronisasi (/m/sync)
+						</a>
+						<div class="flex gap-2">
+							<button
+								type="button"
+								onclick={confirmForceLogout}
+								class="flex-1 rounded-xl bg-red-700 px-3 py-2.5 text-xs font-bold text-white active:bg-red-800"
+							>
+								Ya, Tetap Keluar Sekarang
+							</button>
+							<button
+								type="button"
+								onclick={() => (showLogoutPendingConfirm = false)}
+								class="rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-xs font-bold text-slate-700 active:bg-slate-100"
+							>
+								Tutup
+							</button>
+						</div>
+					</div>
+				</div>
+			{/if}
 		</header>
 
 		<!-- KONTEN UTAMA -->

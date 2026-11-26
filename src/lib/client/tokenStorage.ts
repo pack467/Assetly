@@ -27,6 +27,41 @@ export interface TokenStorageAdapter {
 const STORAGE_KEY = 'itam_mobile_tokens_v1';
 const PROFILE_STORAGE_KEY = 'itam_mobile_display_profile_v1';
 
+const SESSION_CACHE_KEYS = [
+	PROFILE_STORAGE_KEY,
+	'itam_user_name_cache',
+	'itam_locations_cache',
+	'itam_my_loans_cache',
+	'itam_handovers_cache',
+	'itam_shift_state_cache',
+	'itam_offline_asset_list_v1',
+	'itam_offline_asset_scan_map_v1'
+] as const;
+
+/**
+ * Membersihkan seluruh cache sessionStorage milik sesi (/m/*) saat logout atau saat sesi ditolak server (#1).
+ */
+export function clearMobileSessionStorageCaches(): void {
+	if (typeof window === 'undefined' || !window.sessionStorage) return;
+	try {
+		for (const key of SESSION_CACHE_KEYS) {
+			window.sessionStorage.removeItem(key);
+		}
+		const dynamicKeysToRemove: string[] = [];
+		for (let i = 0; i < window.sessionStorage.length; i++) {
+			const k = window.sessionStorage.key(i);
+			if (k && k.startsWith('itam_asset_cache_')) {
+				dynamicKeysToRemove.push(k);
+			}
+		}
+		for (const k of dynamicKeysToRemove) {
+			window.sessionStorage.removeItem(k);
+		}
+	} catch {
+		// Abaikan jika sessionStorage tidak dapat diakses
+	}
+}
+
 interface CapacitorPreferencesLike {
 	get(options: { key: string }): Promise<{ value: string | null }>;
 	set(options: { key: string; value: string }): Promise<void>;
@@ -153,6 +188,7 @@ export function createMemoryTokenStorage(
 		async clearTokens() {
 			current = null;
 			currentProfile = null;
+			clearMobileSessionStorageCaches();
 		},
 		async getCachedProfile() {
 			return currentProfile ? { ...currentProfile } : null;
@@ -162,6 +198,7 @@ export function createMemoryTokenStorage(
 		},
 		async clearCachedProfile() {
 			currentProfile = null;
+			clearMobileSessionStorageCaches();
 		}
 	};
 }
@@ -323,14 +360,7 @@ class DefaultTokenStorage implements TokenStorageAdapter {
 			}
 		}
 
-		if (typeof window !== 'undefined' && window.sessionStorage) {
-			try {
-				window.sessionStorage.removeItem(PROFILE_STORAGE_KEY);
-				window.sessionStorage.removeItem('itam_user_name_cache');
-			} catch {
-				// ignore
-			}
-		}
+		clearMobileSessionStorageCaches();
 	}
 }
 
@@ -342,4 +372,17 @@ export function getTokenStorage(): TokenStorageAdapter {
 
 export function setTokenStorage(adapter: TokenStorageAdapter): void {
 	activeStorageAdapter = adapter;
+}
+
+/**
+ * Mengambil userId pengguna yang sedang login di perangkat dari profil tampilan atau klaim sub JWT.
+ */
+export async function resolveCurrentOfflineUserId(
+	storage: TokenStorageAdapter = activeStorageAdapter
+): Promise<string | null> {
+	const cached = await storage.getCachedProfile?.();
+	if (cached?.id) return cached.id;
+	const tokens = await storage.getTokens();
+	const decoded = decodeJwtDisplayProfile(tokens?.accessToken);
+	return decoded?.id ?? null;
 }

@@ -14,16 +14,21 @@
 
 import { mobileApi, type MobileApiClient } from '$lib/client/api';
 import {
+	clearAllMobileSessionCaches,
+	computeOfflineQueueSummary,
 	getOfflineQueueStorage,
+	isQueueItemOwnedByUser,
 	type OfflineOpType,
 	type OfflineQueueItem,
 	type OfflineQueueStorage,
 	type PendingEvidencePayload
 } from '$lib/client/offlineQueue';
+import { resolveCurrentOfflineUserId } from '$lib/client/tokenStorage';
 import { formatFriendlyErrorMessage, type ApiErrorShape } from '$lib/shared/mobile/watermark';
 
 export interface EnqueueOperationInput {
 	clientOpId?: string;
+	userId?: string | null;
 	type: OfflineOpType;
 	label: string;
 	assetCode?: string | null;
@@ -51,6 +56,8 @@ export interface SyncPendingOptions {
 	storage?: OfflineQueueStorage;
 	/** Waktu saat ini dalam epoch ms (untuk pengujian backoff deterministik) */
 	nowMs?: number;
+	/** Filter eksplisit berdasarkan userId yang sedang login (#1) */
+	userId?: string | null;
 }
 
 const BASE_BACKOFF_MS = 2_000;
@@ -121,9 +128,12 @@ export async function enqueueOfflineOperation(
 ): Promise<OfflineQueueItem> {
 	const clientOpId = input.clientOpId ?? crypto.randomUUID();
 	const clientCreatedAt = input.clientCreatedAt ?? new Date().toISOString();
+	const resolvedUserId =
+		input.userId !== undefined ? input.userId : await resolveCurrentOfflineUserId();
 
 	const newItem: OfflineQueueItem = {
 		clientOpId,
+		userId: resolvedUserId ?? null,
 		type: input.type,
 		label: input.label,
 		assetCode: input.assetCode ?? null,
@@ -202,8 +212,16 @@ async function executeSyncPendingOperations(
 	const storage = options.storage ?? getOfflineQueueStorage();
 	const nowMs = options.nowMs ?? Date.now();
 	const force = options.force ?? false;
+	const activeUserId =
+		options.userId !== undefined
+			? options.userId
+			: api.getResolvedUserId
+				? await api.getResolvedUserId()
+				: await resolveCurrentOfflineUserId();
 
 	const allItems = await storage.listAll();
+	// #1: Hanya proses item antrean milik pengguna yang sedang login; item pengguna lain tetap utuh dan terlindungi
+	const userItems = allItems.filter((item) => isQueueItemOwnedByUser(item, activeUserId));
 	let processed = 0;
 	let accepted = 0;
 	let conflicts = 0;
@@ -211,18 +229,18 @@ async function executeSyncPendingOperations(
 
 	// Jika browser jelas melapor offline dan bukan mode force pada test, lewati pengiriman jaringan
 	if (typeof navigator !== 'undefined' && navigator.onLine === false && !options.apiClient) {
-		const pendingItems = allItems.filter((i) => i.syncState === 'PENDING').length;
+		const pendingItems = userItems.filter((i) => i.syncState === 'PENDING').length;
 		return {
 			processed: 0,
 			accepted: 0,
 			conflicts: 0,
 			rejected: 0,
 			stillPending: pendingItems,
-			items: allItems
+			items: userItems
 		};
 	}
 
-	for (const rawItem of allItems) {
+	for (const rawItem of userItems) {
 		if (rawItem.syncState !== 'PENDING' && rawItem.syncState !== 'SYNCING') {
 			continue;
 		}
@@ -453,7 +471,8 @@ async function executeSyncPendingOperations(
 		}
 	}
 
-	const updatedItems = await storage.listAll();
+	const updatedAllItems = await storage.listAll();
+	const updatedItems = updatedAllItems.filter((i) => isQueueItemOwnedByUser(i, activeUserId));
 	const stillPending = updatedItems.filter(
 		(i) => i.syncState === 'PENDING' || i.syncState === 'SYNCING'
 	).length;
@@ -594,6 +613,7 @@ export async function retryRejectedShiftCloseWithReasons(
 
 	const newItem = await enqueueOfflineOperation(
 		{
+			userId: existing.userId ?? null,
 			type: 'SHIFT_CLOSE',
 			label: existing.label,
 			clientCreatedAt: existing.clientCreatedAt,
@@ -608,6 +628,7 @@ export async function retryRejectedShiftCloseWithReasons(
 
 	const outcome = await syncPendingOperations({
 		...options,
+		userId: options.userId !== undefined ? options.userId : existing.userId,
 		storage,
 		force: true
 	});
@@ -616,5 +637,59 @@ export async function retryRejectedShiftCloseWithReasons(
 	return {
 		newItem: updatedNewItem,
 		outcome
+	};
+}
+
+export interface AttemptLogoutOptions {
+	/** Set true bila pengguna sudah menyetujui konfirmasi tegas untuk keluar meskipun masih ada operasi PENDING */
+	confirmWithPending?: boolean;
+	apiClient?: MobileApiClient;
+	storage?: OfflineQueueStorage;
+	userId?: string | null;
+}
+
+export interface AttemptLogoutResult {
+	loggedOut: boolean;
+	requiresConfirmation: boolean;
+	pendingCount: number;
+}
+
+/**
+ * Mengelola proses logout aplikasi lapangan (/m/*) dengan pengaman operasi PENDING (#1):
+ * - Jika pengguna yang sedang login masih memiliki operasi PENDING/SYNCING dan `confirmWithPending` belum true,
+ *   logout ditahan dan mengembalikan `requiresConfirmation: true`.
+ * - Jika tidak ada operasi PENDING (atau pengguna sudah mengonfirmasi tegas), sesi dikeluarkan,
+ *   seluruh cache sessionStorage sesi dibersihkan, sementara antrean offline di IndexedDB tetap utuh dan terlindungi.
+ */
+export async function attemptMobileLogout(
+	options: AttemptLogoutOptions = {}
+): Promise<AttemptLogoutResult> {
+	const api = options.apiClient ?? mobileApi;
+	const storage = options.storage ?? getOfflineQueueStorage();
+	const activeUserId =
+		options.userId !== undefined
+			? options.userId
+			: api.getResolvedUserId
+				? await api.getResolvedUserId()
+				: await resolveCurrentOfflineUserId();
+
+	const summary = await computeOfflineQueueSummary(storage, activeUserId);
+	const pendingCount = summary.pendingCount + summary.syncingCount;
+
+	if (pendingCount > 0 && !options.confirmWithPending) {
+		return {
+			loggedOut: false,
+			requiresConfirmation: true,
+			pendingCount
+		};
+	}
+
+	await api.logout();
+	clearAllMobileSessionCaches();
+
+	return {
+		loggedOut: true,
+		requiresConfirmation: false,
+		pendingCount
 	};
 }

@@ -4,6 +4,7 @@
 	import {
 		computeOfflineQueueSummary,
 		getOfflineQueueStorage,
+		listQueueItemsForUser,
 		subscribeOfflineQueue,
 		type OfflineOpType,
 		type OfflineQueueItem,
@@ -72,7 +73,7 @@
 
 	async function refreshQueueList() {
 		const storage = getOfflineQueueStorage();
-		const all = await storage.listAll();
+		const all = await listQueueItemsForUser(storage);
 		// Urutkan yang terbaru di atas untuk tampilan UI
 		items = [...all].sort((a, b) => b.clientCreatedAt.localeCompare(a.clientCreatedAt));
 		summary = await computeOfflineQueueSummary(storage);

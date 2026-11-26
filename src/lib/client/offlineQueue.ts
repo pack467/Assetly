@@ -13,6 +13,11 @@
  *   `@capacitor-community/sqlite` saat membungkus APK Capacitor nanti.
  */
 
+import {
+	clearMobileSessionStorageCaches,
+	resolveCurrentOfflineUserId
+} from '$lib/client/tokenStorage';
+
 export type OfflineOpType =
 	| 'LOAN_CREATE'
 	| 'LOAN_RETURN'
@@ -41,6 +46,8 @@ export interface PendingEvidencePayload {
 
 export interface OfflineQueueItem {
 	clientOpId: string;
+	/** ID pengguna pemilik operasi untuk isolasi multi-akun di HP bersama (#1) */
+	userId?: string | null;
 	type: OfflineOpType;
 	/** Label ramah pengguna dalam bahasa Indonesia (mis. "Pinjam AST-0001 - Laptop Dell") */
 	label: string;
@@ -73,8 +80,23 @@ export interface OfflineQueueStorage {
 	getById(clientOpId: string): Promise<OfflineQueueItem | null>;
 	listAll(): Promise<OfflineQueueItem[]>;
 	remove(clientOpId: string): Promise<void>;
-	clearByStates(states: OfflineSyncState[]): Promise<number>;
+	clearByStates(states: OfflineSyncState[], userId?: string | null): Promise<number>;
 	clearAll(): Promise<void>;
+}
+
+/**
+ * Memeriksa apakah sebuah item antrean offline milik pengguna yang sedang aktif (#1).
+ * - Bila item memiliki `userId`, item tersebut HANYA milik pengguna dengan `activeUserId` yang sama.
+ * - Item milik pengguna lain tetap tersimpan utuh di storage dan tidak boleh ditampilkan/disinkronkan/dihapus oleh akun lain.
+ */
+export function isQueueItemOwnedByUser(
+	item: OfflineQueueItem,
+	activeUserId?: string | null
+): boolean {
+	if (item.userId) {
+		return Boolean(activeUserId && item.userId === activeUserId);
+	}
+	return true;
 }
 
 const DB_NAME = 'itam_offline_queue_db';
@@ -132,11 +154,16 @@ export function createMemoryOfflineQueueStorage(): OfflineQueueStorage {
 			map.delete(clientOpId);
 			notifyOfflineQueueChanged();
 		},
-		async clearByStates(states: OfflineSyncState[]): Promise<number> {
+		async clearByStates(
+			states: OfflineSyncState[],
+			userId?: string | null
+		): Promise<number> {
+			const activeUserId =
+				userId !== undefined ? userId : await resolveCurrentOfflineUserId();
 			const stateSet = new Set(states);
 			let removed = 0;
 			for (const [key, item] of map.entries()) {
-				if (stateSet.has(item.syncState)) {
+				if (stateSet.has(item.syncState) && isQueueItemOwnedByUser(item, activeUserId)) {
 					map.delete(key);
 					removed++;
 				}
@@ -290,13 +317,20 @@ export function createIndexedDbOfflineQueueStorage(): OfflineQueueStorage {
 			}
 		},
 
-		async clearByStates(states: OfflineSyncState[]): Promise<number> {
+		async clearByStates(
+			states: OfflineSyncState[],
+			userId?: string | null
+		): Promise<number> {
 			if (!isIndexedDbSupported()) {
-				return fallback.clearByStates(states);
+				return fallback.clearByStates(states, userId);
 			}
+			const activeUserId =
+				userId !== undefined ? userId : await resolveCurrentOfflineUserId();
 			const all = await this.listAll();
 			const stateSet = new Set(states);
-			const targets = all.filter((item) => stateSet.has(item.syncState));
+			const targets = all.filter(
+				(item) => stateSet.has(item.syncState) && isQueueItemOwnedByUser(item, activeUserId)
+			);
 			for (const target of targets) {
 				await this.remove(target.clientOpId);
 			}
@@ -345,10 +379,24 @@ export function setOfflineQueueStorage(adapter: OfflineQueueStorage): void {
 	notifyOfflineQueueChanged();
 }
 
+/**
+ * Mengambil daftar item antrean offline yang hanya dimiliki oleh pengguna yang sedang login (#1).
+ * Item milik pengguna lain di perangkat yang sama tetap tersimpan dan tidak disertakan.
+ */
+export async function listQueueItemsForUser(
+	storage: OfflineQueueStorage = activeQueueStorage,
+	userId?: string | null
+): Promise<OfflineQueueItem[]> {
+	const activeUserId = userId !== undefined ? userId : await resolveCurrentOfflineUserId();
+	const all = await storage.listAll();
+	return all.filter((item) => isQueueItemOwnedByUser(item, activeUserId));
+}
+
 export async function computeOfflineQueueSummary(
-	storage: OfflineQueueStorage = activeQueueStorage
+	storage: OfflineQueueStorage = activeQueueStorage,
+	userId?: string | null
 ): Promise<OfflineQueueSummary> {
-	const items = await storage.listAll();
+	const items = await listQueueItemsForUser(storage, userId);
 	let pendingCount = 0;
 	let syncingCount = 0;
 	let conflictCount = 0;
@@ -589,4 +637,12 @@ export function clearCachedAssets(): void {
 			// ignore
 		}
 	}
+}
+
+/**
+ * Membersihkan seluruh cache sessionStorage milik sesi (/m/*) serta cache aset di memori (#1).
+ */
+export function clearAllMobileSessionCaches(): void {
+	clearCachedAssets();
+	clearMobileSessionStorageCaches();
 }
