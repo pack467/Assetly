@@ -19,6 +19,8 @@ import {
 	returnLoanItem,
 	approveLoan,
 	rejectLoan,
+	listLoans,
+	getLoanDetail,
 	getDashboardSummary
 } from '../src/lib/server/services/loanService';
 import { GET as evidenceFileHandler } from '../src/routes/api/v1/evidence/[id]/file/+server';
@@ -1159,6 +1161,103 @@ describe('M2 Tahap 2A: Bukti Foto, Penilaian Risiko, Peminjaman, Konkurensi Para
 			expect(returned.loanItem.returnedAt!.getTime()).toBeGreaterThan(
 				oneHourAgo.getTime() + 3500 * 1000
 			);
+		});
+
+		it('tidak menandai peminjaman PENDING_APPROVAL sebagai TERLAMBAT (isOverdue) sebelum disetujui, serta menegakkan klaim atomik status barang pada rejectLoan (#5)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const [pendingAsset, rejectGuardAsset] = await Promise.all([
+				prisma.asset.create({
+					data: {
+						code: `AST-OVDP-${suffix}`,
+						qrToken: `qr-ovdp-${randomUUID()}`,
+						name: 'Kamera Menunggu Approval Lewat Jadwal',
+						categoryId: approvalCategoryId,
+						status: 'AVAILABLE'
+					}
+				}),
+				prisma.asset.create({
+					data: {
+						code: `AST-REJG-${suffix}`,
+						qrToken: `qr-rejg-${randomUUID()}`,
+						name: 'Kamera Uji Klaim Atomik RejectLoan',
+						categoryId: approvalCategoryId,
+						status: 'AVAILABLE'
+					}
+				})
+			]);
+
+			const [ev1, ev2] = await Promise.all([
+				createTestEvidence(borrower1, 'CHECKOUT'),
+				createTestEvidence(borrower1, 'CHECKOUT')
+			]);
+
+			// Buat permintaan pinjam PENDING_APPROVAL yang expectedReturnAt-nya sudah lewat 1 jam lalu
+			const pastReturnAt = new Date(Date.now() - 3600 * 1000).toISOString();
+			const pendingLoanRes = await createLoan(borrower1, {
+				assetId: pendingAsset.id,
+				evidenceId: ev1.id,
+				purpose: 'Permintaan Belum Disetujui Admin',
+				expectedReturnAt: pastReturnAt
+			});
+			expect(pendingLoanRes.loan.status).toBe('PENDING_APPROVAL');
+
+			// 1. Selama masih PENDING_APPROVAL, isOverdue wajib false di listLoans, getLoanDetail, dan getDashboardSummary
+			const listedBefore = await listLoans(borrower1, { pageSize: 20 });
+			const foundInList = listedBefore.items.find((l) => l.id === pendingLoanRes.loan.id);
+			expect(foundInList?.isOverdue).toBe(false);
+			expect(foundInList?.items[0].isOverdue).toBe(false);
+
+			const detailBefore = await getLoanDetail(borrower1, pendingLoanRes.loan.id);
+			expect(detailBefore.loan.isOverdue).toBe(false);
+			expect(detailBefore.loan.items[0].isOverdue).toBe(false);
+
+			const dashBefore = await getDashboardSummary(adminActor);
+			const foundInDash = dashBefore.recentLoans.find((l) => l.id === pendingLoanRes.loan.id);
+			expect(foundInDash?.isOverdue).toBe(false);
+
+			// Begitu disetujui menjadi ACTIVE dan expectedReturnAt sudah lewat, barulah isOverdue menjadi true
+			await approveLoan(adminActor, pendingLoanRes.loan.id);
+			const detailAfterApprove = await getLoanDetail(borrower1, pendingLoanRes.loan.id);
+			expect(detailAfterApprove.loan.status).toBe('ACTIVE');
+			expect(detailAfterApprove.loan.isOverdue).toBe(true);
+
+			// Bersihkan pinjaman uji
+			const retEv = await createTestEvidence(borrower1, 'RETURN');
+			await returnLoanItem(borrower1, detailAfterApprove.loan.items[0].id, {
+				returnCondition: 'NORMAL',
+				evidenceId: retEv.id
+			});
+
+			// 2. Uji klaim atomik status barang PENDING_APPROVAL di rejectLoan:
+			//    Bila status barang sudah berubah (mis. ditetapkan LOST oleh Admin), rejectLoan menolak dan me-rollback transaksi
+			const rejectGuardLoan = await createLoan(borrower1, {
+				assetId: rejectGuardAsset.id,
+				evidenceId: ev2.id,
+				purpose: 'Uji Guard Status Barang RejectLoan',
+				expectedReturnAt: new Date(Date.now() + 86400_000).toISOString()
+			});
+			await prisma.asset.update({
+				where: { id: rejectGuardAsset.id },
+				data: { status: 'LOST' }
+			});
+
+			await expect(
+				rejectLoan(adminActor, rejectGuardLoan.loan.id, 'Coba tolak saat barang sudah LOST')
+			).rejects.toMatchObject({
+				code: 'INVALID_STATUS_TRANSITION'
+			});
+
+			// Pastikan status barang LOST tidak tertimpa kembali menjadi AVAILABLE!
+			const verifyAsset = await prisma.asset.findUniqueOrThrow({
+				where: { id: rejectGuardAsset.id }
+			});
+			expect(verifyAsset.status).toBe('LOST');
+
+			// Bersihkan baris uji
+			await prisma.loanItem.updateMany({
+				where: { loanId: rejectGuardLoan.loan.id },
+				data: { returnedAt: new Date() }
+			});
 		});
 	});
 });

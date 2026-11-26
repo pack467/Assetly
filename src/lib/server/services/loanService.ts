@@ -699,10 +699,25 @@ export async function rejectLoan(
 		}
 
 		for (const item of existing.items) {
-			await tx.asset.update({
-				where: { id: item.assetId },
+			if (!isValidAssetStatusTransition(item.asset.status, 'AVAILABLE')) {
+				throw new AppError(
+					'INVALID_STATUS_TRANSITION',
+					`Barang ${item.asset.code} tidak dalam status PENDING_APPROVAL.`
+				);
+			}
+			const claimedAsset = await tx.asset.updateMany({
+				where: {
+					id: item.assetId,
+					status: 'PENDING_APPROVAL'
+				},
 				data: { status: 'AVAILABLE', version: { increment: 1 } }
 			});
+			if (claimedAsset.count === 0) {
+				throw new AppError(
+					'INVALID_STATUS_TRANSITION',
+					`Barang ${item.asset.code} tidak dalam status PENDING_APPROVAL.`
+				);
+			}
 			await writeAuditLog(tx, {
 				actorId: adminActor.id,
 				action: 'ASSET_STATUS_CHANGED',
@@ -794,16 +809,17 @@ export async function listLoans(
 		})
 	]);
 
-	// Bagian 5.2: "Terlambat" bukan status tersimpan; dihitung saat query
+	// Bagian 5.2 (#5): "Terlambat" hanya berlaku untuk peminjaman yang sudah ACTIVE (barang benar-benar sudah keluar gudang)
 	const items = loans.map((l) => {
+		const isLoanActive = l.status === 'ACTIVE';
 		const hasActiveItems = l.items.some((i) => i.returnedAt === null);
-		const isOverdue = hasActiveItems && l.expectedReturnAt < now;
+		const isOverdue = isLoanActive && hasActiveItems && l.expectedReturnAt < now;
 		return {
 			...l,
 			isOverdue,
 			items: l.items.map((item) => ({
 				...item,
-				isOverdue: item.returnedAt === null && l.expectedReturnAt < now,
+				isOverdue: isLoanActive && item.returnedAt === null && l.expectedReturnAt < now,
 				checkoutSignedUrl: item.checkoutEvidence
 					? createEvidenceSignedUrl(item.checkoutEvidence.id, item.checkoutEvidence.imageKey).url
 					: null,
@@ -849,15 +865,16 @@ export async function getLoanDetail(actor: PolicyUser | null | undefined, loanId
 	}
 
 	const now = new Date();
+	const isLoanActive = loan.status === 'ACTIVE';
 	const hasActiveItems = loan.items.some((i) => i.returnedAt === null);
 
 	return {
 		loan: {
 			...loan,
-			isOverdue: hasActiveItems && loan.expectedReturnAt < now,
+			isOverdue: isLoanActive && hasActiveItems && loan.expectedReturnAt < now,
 			items: loan.items.map((item) => ({
 				...item,
-				isOverdue: item.returnedAt === null && loan.expectedReturnAt < now,
+				isOverdue: isLoanActive && item.returnedAt === null && loan.expectedReturnAt < now,
 				checkoutSignedUrl: item.checkoutEvidence
 					? createEvidenceSignedUrl(item.checkoutEvidence.id, item.checkoutEvidence.imageKey).url
 					: null,
@@ -962,7 +979,7 @@ export async function getDashboardSummary(actor: PolicyUser | null | undefined) 
 				purpose: l.purpose,
 				expectedReturnAt: l.expectedReturnAt,
 				createdAt: l.createdAt,
-				isOverdue: hasActive && l.expectedReturnAt < now,
+				isOverdue: l.status === 'ACTIVE' && hasActive && l.expectedReturnAt < now,
 				borrower: l.borrower,
 				items: l.items.map((item) => ({
 					id: item.id,
