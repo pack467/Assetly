@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { ZodError } from 'zod';
+import { logger } from '$lib/server/logger';
 
 export type ErrorCode =
 	| 'UNAUTHENTICATED'
@@ -86,6 +87,8 @@ export function toErrorResponse(err: unknown): Response {
 			{ status: 400 }
 		);
 	}
+
+	logger.error({ err }, 'Unhandled internal error in API handler');
 
 	return json(
 		{

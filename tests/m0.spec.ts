@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import * as OTPAuth from 'otpauth';
 import { prisma } from '../src/lib/server/db';
+import { logger } from '../src/lib/server/logger';
+import { AppError, toErrorResponse } from '../src/lib/shared/errors';
 import { can, assertCan, type PolicyUser } from '../src/lib/server/policy';
 import { isValidAssetStatusTransition } from '../src/lib/shared/enums';
 import { hashPassword } from '../src/lib/server/auth/password';
@@ -722,6 +724,32 @@ describe('M0: Fondasi — Unit & Integrasi Database + Auth + Policy', () => {
 				.setExpirationTime('15m')
 				.sign(getAccessSecret());
 			expect(await verifyAccessToken(forgedInvalidRoleToken)).toBeNull();
+		});
+
+		it('Mencatat logger.error saat toErrorResponse menangani error 500 tak terduga tanpa membocorkan detail internal ke respons HTTP (#6)', async () => {
+			const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => undefined as never);
+			try {
+				// 1. AppError (4xx) tidak memicu logger.error
+				const appErrRes = toErrorResponse(new AppError('NOT_FOUND', 'Barang tidak ada.'));
+				expect(appErrRes.status).toBe(404);
+				expect(errorSpy).not.toHaveBeenCalled();
+
+				// 2. Error tak terduga (500) wajib dicatat melalui logger.error namun respons klien tetap aman
+				const internalBoom = new Error('DETAIL_RAHASIA_KONEKSI_DB_PUTUS');
+				const internalRes = toErrorResponse(internalBoom);
+				expect(internalRes.status).toBe(500);
+				expect(errorSpy).toHaveBeenCalledTimes(1);
+				expect(errorSpy).toHaveBeenCalledWith(
+					expect.objectContaining({ err: internalBoom }),
+					expect.stringContaining('Unhandled internal error')
+				);
+
+				const body = await internalRes.json();
+				expect(body.error.code).toBe('INTERNAL_ERROR');
+				expect(JSON.stringify(body)).not.toContain('DETAIL_RAHASIA_KONEKSI_DB_PUTUS');
+			} finally {
+				errorSpy.mockRestore();
+			}
 		});
 	});
 });
