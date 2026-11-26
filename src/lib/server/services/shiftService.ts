@@ -110,6 +110,9 @@ export async function getActiveOutstandingLoanItems(db: DbTx = prisma) {
 	const items = await db.loanItem.findMany({
 		where: {
 			returnedAt: null,
+			asset: {
+				status: { notIn: ['LOST', 'RETIRED'] }
+			},
 			loan: {
 				status: 'ACTIVE'
 			}

@@ -554,23 +554,152 @@ export async function changeAssetSpecialStatus(
 		);
 	}
 
+	const trimmedNote = input.note.trim();
+	const now = new Date();
+
 	const updated = await prisma.$transaction(async (tx) => {
-		const asset = await tx.asset.update({
-			where: { id },
+		// Klaim atomik status + version untuk mencegah balapan transisi status khusus (#2)
+		const claimed = await tx.asset.updateMany({
+			where: {
+				id,
+				status: existing.status,
+				version: existing.version
+			},
 			data: {
 				status: input.status,
-				notes: input.note.trim(),
+				notes: trimmedNote,
 				version: { increment: 1 }
 			}
 		});
+
+		if (claimed.count === 0) {
+			throw new AppError(
+				'INVALID_STATUS_TRANSITION',
+				'Status atau versi barang telah berubah oleh proses lain. Muat ulang halaman dan coba lagi.',
+				{
+					assetId: id,
+					expectedStatus: existing.status,
+					expectedVersion: existing.version
+				},
+				409
+			);
+		}
+
+		const asset = await tx.asset.findUniqueOrThrow({ where: { id } });
+
+		let closedLoanItemId: string | null = null;
+		let completedLoanId: string | null = null;
+
+		// Bila barang BORROWED dinyatakan LOST oleh Admin, tutup LoanItem aktif dalam transaksi yang sama:
+		// - returnedAt diisi waktu penetapan LOST agar partial unique index one_active_loan_per_asset dilepas
+		// - returnCondition dibiarkan null (barang tidak dikembalikan fisik dalam kondisi NORMAL/DAMAGED)
+		// - damageNote mencatat alasan penetapan LOST oleh Admin
+		// - Loan induk diselesaikan (COMPLETED) bila tidak ada lagi LoanItem lain yang masih keluar
+		if (existing.status === 'BORROWED' && input.status === 'LOST') {
+			const activeLoanItems = await tx.loanItem.findMany({
+				where: {
+					assetId: id,
+					returnedAt: null
+				}
+			});
+
+			for (const activeItem of activeLoanItems) {
+				const lostNote = `[Dinyatakan HILANG oleh Admin] ${trimmedNote}`;
+				const nextDamageNote = activeItem.damageNote
+					? `${activeItem.damageNote} | ${lostNote}`
+					: lostNote;
+
+				const itemClaim = await tx.loanItem.updateMany({
+					where: {
+						id: activeItem.id,
+						returnedAt: null
+					},
+					data: {
+						returnedAt: now,
+						returnCondition: null,
+						damageNote: nextDamageNote
+					}
+				});
+
+				if (itemClaim.count > 0) {
+					closedLoanItemId = activeItem.id;
+
+					await writeAuditLog(tx, {
+						actorId: adminActor.id,
+						action: 'LOAN_ITEM_CLOSED_AS_LOST',
+						entityType: 'LoanItem',
+						entityId: activeItem.id,
+						before: {
+							returnedAt: null,
+							returnCondition: activeItem.returnCondition,
+							damageNote: activeItem.damageNote
+						},
+						after: {
+							returnedAt: now.toISOString(),
+							returnCondition: null,
+							damageNote: nextDamageNote,
+							assetId: id,
+							loanId: activeItem.loanId
+						},
+						ip: ip ?? null
+					});
+
+					const remainingOpenItems = await tx.loanItem.count({
+						where: {
+							loanId: activeItem.loanId,
+							returnedAt: null
+						}
+					});
+
+					if (remainingOpenItems === 0) {
+						const loanClaim = await tx.loan.updateMany({
+							where: {
+								id: activeItem.loanId,
+								status: 'ACTIVE'
+							},
+							data: {
+								status: 'COMPLETED',
+								completedAt: now
+							}
+						});
+
+						if (loanClaim.count > 0) {
+							completedLoanId = activeItem.loanId;
+
+							await writeAuditLog(tx, {
+								actorId: adminActor.id,
+								action: 'LOAN_COMPLETED',
+								entityType: 'Loan',
+								entityId: activeItem.loanId,
+								before: { status: 'ACTIVE', completedAt: null },
+								after: {
+									status: 'COMPLETED',
+									completedAt: now.toISOString(),
+									reason: 'COMPLETED_ON_ASSET_DECLARED_LOST',
+									closedLoanItemId: activeItem.id,
+									assetId: id
+								},
+								ip: ip ?? null
+							});
+						}
+					}
+				}
+			}
+		}
 
 		await writeAuditLog(tx, {
 			actorId: adminActor.id,
 			action: 'ASSET_STATUS_CHANGED',
 			entityType: 'Asset',
 			entityId: asset.id,
-			before: { status: existing.status },
-			after: { status: asset.status, note: input.note.trim() },
+			before: { status: existing.status, version: existing.version },
+			after: {
+				status: asset.status,
+				version: asset.version,
+				note: trimmedNote,
+				...(closedLoanItemId ? { closedLoanItemId } : {}),
+				...(completedLoanId ? { completedLoanId } : {})
+			},
 			ip: ip ?? null
 		});
 

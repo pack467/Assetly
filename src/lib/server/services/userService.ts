@@ -173,6 +173,9 @@ export async function updateUser(
 		const activeLoanItemsCount = await prisma.loanItem.count({
 			where: {
 				returnedAt: null,
+				asset: {
+					status: { notIn: ['LOST', 'RETIRED'] }
+				},
 				loan: {
 					borrowerId: userId,
 					status: { in: ['ACTIVE', 'PENDING_APPROVAL'] }

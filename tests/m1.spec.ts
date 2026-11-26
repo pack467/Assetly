@@ -29,6 +29,7 @@ import {
 	importAssetsFromCsv
 } from '../src/lib/server/services/assetService';
 import { listAuditLogs } from '../src/lib/server/services/auditService';
+import { getActiveOutstandingLoanItems } from '../src/lib/server/services/shiftService';
 
 describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-19, & Otorisasi', () => {
 	let adminActor: PolicyUser;
@@ -369,6 +370,143 @@ describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-1
 				note: 'Barang ditemukan kembali di ruang panitia'
 			});
 			expect(foundRes.asset.status).toBe('AVAILABLE');
+		});
+
+		it('Transisi BORROWED -> LOST menutup LoanItem aktif, menyelesaikan Loan induk, membebaskan tutup shift & nonaktif user, dapat dipinjam kembali saat LOST -> AVAILABLE, serta mengklaim status+version secara atomik (#2)', async () => {
+			const suffix = randomUUID().slice(0, 8);
+			const holder = await createUser(adminActor, {
+				name: 'Peminjam Barang Hilang',
+				email: `lost-holder-${suffix}@example.com`,
+				password: 'StrongPassword!123',
+				role: 'BORROWER',
+				isActive: true
+			});
+
+			const assetRes = await createAsset(adminActor, {
+				name: 'Kamera Liputan Lapangan',
+				categoryId,
+				homeLocationId: locationId
+			});
+			const lostAssetId = assetRes.asset.id;
+
+			// Simulasikan barang sedang dipinjam aktif (BORROWED)
+			await prisma.asset.update({
+				where: { id: lostAssetId },
+				data: { status: 'BORROWED', version: { increment: 1 } }
+			});
+
+			const loan = await prisma.loan.create({
+				data: {
+					borrowerId: holder.user.id,
+					createdById: adminActor.id,
+					purpose: 'Liputan Luar Kota',
+					expectedReturnAt: new Date(Date.now() + 86400_000),
+					status: 'ACTIVE'
+				}
+			});
+
+			const loanItem = await prisma.loanItem.create({
+				data: {
+					loanId: loan.id,
+					assetId: lostAssetId,
+					returnedAt: null
+				}
+			});
+
+			// Sebelum LOST: muncul di daftar barang keluar tutup shift & menghalangi nonaktif peminjam
+			const outstandingBefore = await getActiveOutstandingLoanItems();
+			expect(outstandingBefore.some((i) => i.loanItemId === loanItem.id)).toBe(true);
+			await expect(
+				updateUser(adminActor, holder.user.id, { isActive: false })
+			).rejects.toMatchObject({ code: 'USER_HOLDS_ASSETS', status: 409 });
+
+			// 1. Uji klaim atomik status+version: 2 panggilan paralel BORROWED -> LOST hanya 1 yang menang
+			const parallelStatusCalls = await Promise.allSettled([
+				changeAssetSpecialStatus(adminActor, lostAssetId, {
+					status: 'LOST',
+					note: 'Hilang di lokasi liputan banjir'
+				}),
+				changeAssetSpecialStatus(adminActor, lostAssetId, {
+					status: 'LOST',
+					note: 'Panggilan paralel duplikat'
+				})
+			]);
+
+			const statusFulfilled = parallelStatusCalls.filter((r) => r.status === 'fulfilled');
+			const statusRejected = parallelStatusCalls.filter((r) => r.status === 'rejected');
+			expect(statusFulfilled).toHaveLength(1);
+			expect(statusRejected).toHaveLength(1);
+
+			// 2. Verifikasi LoanItem ditutup dengan returnedAt terisi, returnCondition null, dan damageNote tercatat
+			const closedItem = await prisma.loanItem.findUniqueOrThrow({
+				where: { id: loanItem.id }
+			});
+			expect(closedItem.returnedAt).not.toBeNull();
+			expect(closedItem.returnCondition).toBeNull();
+			expect(closedItem.damageNote).toContain('[Dinyatakan HILANG oleh Admin]');
+
+			// 3. Verifikasi Loan induk otomatis menjadi COMPLETED karena seluruh itemnya sudah selesai
+			const completedLoan = await prisma.loan.findUniqueOrThrow({
+				where: { id: loan.id }
+			});
+			expect(completedLoan.status).toBe('COMPLETED');
+			expect(completedLoan.completedAt).not.toBeNull();
+
+			// 4. Verifikasi AuditLog tertulis untuk Asset, LoanItem, dan Loan
+			const itemAudit = await listAuditLogs(adminActor, {
+				entityType: 'LoanItem',
+				entityId: loanItem.id,
+				action: 'LOAN_ITEM_CLOSED_AS_LOST'
+			});
+			expect(itemAudit.items).toHaveLength(1);
+
+			const loanAudit = await listAuditLogs(adminActor, {
+				entityType: 'Loan',
+				entityId: loan.id,
+				action: 'LOAN_COMPLETED'
+			});
+			expect(loanAudit.items).toHaveLength(1);
+
+			// 5. Barang LOST tidak lagi muncul di daftar barang keluar saat tutup shift
+			const outstandingAfter = await getActiveOutstandingLoanItems();
+			expect(outstandingAfter.some((i) => i.loanItemId === loanItem.id)).toBe(false);
+
+			// 6. Peminjam tidak lagi terblokir USER_HOLDS_ASSETS saat dinonaktifkan
+			const deactivatedHolder = await updateUser(adminActor, holder.user.id, {
+				isActive: false
+			});
+			expect(deactivatedHolder.user.isActive).toBe(false);
+
+			// 7. Bila barang ditemukan kembali (LOST -> AVAILABLE), barang dapat dipinjam kembali tanpa melanggar one_active_loan_per_asset
+			const recovered = await changeAssetSpecialStatus(adminActor, lostAssetId, {
+				status: 'AVAILABLE',
+				note: 'Ditemukan kembali oleh petugas keamanan gedung'
+			});
+			expect(recovered.asset.status).toBe('AVAILABLE');
+
+			const newLoan = await prisma.loan.create({
+				data: {
+					borrowerId: borrowerActor.id,
+					createdById: adminActor.id,
+					purpose: 'Peminjaman Baru Setelah Ditemukan',
+					expectedReturnAt: new Date(Date.now() + 86400_000),
+					status: 'ACTIVE'
+				}
+			});
+			const newLoanItem = await prisma.loanItem.create({
+				data: {
+					loanId: newLoan.id,
+					assetId: lostAssetId,
+					returnedAt: null
+				}
+			});
+			expect(newLoanItem.id).toBeTruthy();
+
+			// Bersihkan pinjaman uji
+			await prisma.loanItem.update({
+				where: { id: newLoanItem.id },
+				data: { returnedAt: new Date(), returnCondition: 'NORMAL' }
+			});
 		});
 	});
 
