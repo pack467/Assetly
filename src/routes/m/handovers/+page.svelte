@@ -366,8 +366,11 @@
 				showCreateForm = false;
 				capturedDataUrl = null;
 			}
-		} catch {
-			errorMsg = 'Gagal menyimpan serah terima ke antrean lokal HP.';
+		} catch (err) {
+			errorMsg =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menyimpan serah terima ke penyimpanan lokal HP. Data belum tersimpan — periksa ruang penyimpanan HP Anda lalu coba lagi.';
 		} finally {
 			submitting = false;
 		}

@@ -425,8 +425,11 @@
 				activeMode = 'info';
 				capturedDataUrl = null;
 			}
-		} catch {
-			errorMsg = 'Gagal menyimpan operasi ke penyimpanan lokal HP.';
+		} catch (err) {
+			errorMsg =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menyimpan operasi peminjaman ke penyimpanan lokal HP. Data belum tersimpan — periksa ruang penyimpanan HP Anda lalu coba lagi.';
 		} finally {
 			submitting = false;
 		}
@@ -508,8 +511,11 @@
 				activeMode = 'info';
 				capturedDataUrl = null;
 			}
-		} catch {
-			errorMsg = 'Gagal menyimpan operasi pengembalian ke penyimpanan lokal HP.';
+		} catch (err) {
+			errorMsg =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menyimpan operasi pengembalian ke penyimpanan lokal HP. Data belum tersimpan — periksa ruang penyimpanan HP Anda lalu coba lagi.';
 		} finally {
 			submitting = false;
 		}

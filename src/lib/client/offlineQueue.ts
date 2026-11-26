@@ -182,13 +182,19 @@ export function createMemoryOfflineQueueStorage(): OfflineQueueStorage {
 
 /**
  * Adapter IndexedDB untuk browser modern dan Chrome di HP via USB Port Forwarding.
- * Jika browser tidak mendukung IndexedDB (mis. saat SSR), otomatis fallback ke memory adapter.
+ * Fallback ke memory adapter HANYA bila lingkungan tidak mendukung IndexedDB (mis. saat SSR / Node).
+ * Bila IndexedDB didukung tetapi penulisan/pembacaan gagal (mis. penyimpanan penuh), lempar error jujur ke UI (#2).
  */
 export function createIndexedDbOfflineQueueStorage(): OfflineQueueStorage {
 	const fallback = createMemoryOfflineQueueStorage();
 
 	function isIndexedDbSupported(): boolean {
 		return typeof indexedDB !== 'undefined' && indexedDB !== null;
+	}
+
+	function toStorageWriteError(err: unknown, defaultMessage: string): Error {
+		const detail = err instanceof Error && err.message ? ` (${err.message})` : '';
+		return new Error(`${defaultMessage}${detail}`);
 	}
 
 	function openDatabase(): Promise<IDBDatabase> {
@@ -210,7 +216,8 @@ export function createIndexedDbOfflineQueueStorage(): OfflineQueueStorage {
 			};
 
 			request.onsuccess = () => resolve(request.result);
-			request.onerror = () => reject(request.error ?? new Error('Gagal membuka IndexedDB'));
+			request.onerror = () =>
+				reject(request.error ?? new Error('Gagal membuka penyimpanan lokal IndexedDB'));
 		});
 	}
 
@@ -232,13 +239,20 @@ export function createIndexedDbOfflineQueueStorage(): OfflineQueueStorage {
 					};
 					tx.onerror = () => {
 						db.close();
-						reject(tx.error ?? new Error('Gagal menyimpan ke IndexedDB'));
+						reject(tx.error ?? new Error('Gagal menulis ke IndexedDB'));
+					};
+					tx.onabort = () => {
+						db.close();
+						reject(tx.error ?? new Error('Transaksi IndexedDB dibatalkan (ruang penyimpanan penuh)'));
 					};
 				});
 				notifyOfflineQueueChanged();
 				return cloned;
-			} catch {
-				return fallback.put(item);
+			} catch (err) {
+				throw toStorageWriteError(
+					err,
+					'Gagal menyimpan operasi ke penyimpanan lokal HP. Data belum tersimpan — periksa ruang penyimpanan HP Anda lalu coba lagi.'
+				);
 			}
 		},
 
@@ -246,50 +260,42 @@ export function createIndexedDbOfflineQueueStorage(): OfflineQueueStorage {
 			if (!isIndexedDbSupported()) {
 				return fallback.getById(clientOpId);
 			}
-			try {
-				const db = await openDatabase();
-				return await new Promise<OfflineQueueItem | null>((resolve, reject) => {
-					const tx = db.transaction(STORE_NAME, 'readonly');
-					const store = tx.objectStore(STORE_NAME);
-					const req = store.get(clientOpId);
-					req.onsuccess = () => {
-						db.close();
-						resolve((req.result as OfflineQueueItem | undefined) ?? null);
-					};
-					req.onerror = () => {
-						db.close();
-						reject(req.error ?? new Error('Gagal membaca dari IndexedDB'));
-					};
-				});
-			} catch {
-				return fallback.getById(clientOpId);
-			}
+			const db = await openDatabase();
+			return await new Promise<OfflineQueueItem | null>((resolve, reject) => {
+				const tx = db.transaction(STORE_NAME, 'readonly');
+				const store = tx.objectStore(STORE_NAME);
+				const req = store.get(clientOpId);
+				req.onsuccess = () => {
+					db.close();
+					resolve((req.result as OfflineQueueItem | undefined) ?? null);
+				};
+				req.onerror = () => {
+					db.close();
+					reject(req.error ?? new Error('Gagal membaca operasi dari penyimpanan lokal HP.'));
+				};
+			});
 		},
 
 		async listAll(): Promise<OfflineQueueItem[]> {
 			if (!isIndexedDbSupported()) {
 				return fallback.listAll();
 			}
-			try {
-				const db = await openDatabase();
-				const items = await new Promise<OfflineQueueItem[]>((resolve, reject) => {
-					const tx = db.transaction(STORE_NAME, 'readonly');
-					const store = tx.objectStore(STORE_NAME);
-					const req = store.getAll();
-					req.onsuccess = () => {
-						db.close();
-						resolve((req.result as OfflineQueueItem[]) ?? []);
-					};
-					req.onerror = () => {
-						db.close();
-						reject(req.error ?? new Error('Gagal membaca daftar antrean IndexedDB'));
-					};
-				});
-				items.sort((a, b) => a.clientCreatedAt.localeCompare(b.clientCreatedAt));
-				return items;
-			} catch {
-				return fallback.listAll();
-			}
+			const db = await openDatabase();
+			const items = await new Promise<OfflineQueueItem[]>((resolve, reject) => {
+				const tx = db.transaction(STORE_NAME, 'readonly');
+				const store = tx.objectStore(STORE_NAME);
+				const req = store.getAll();
+				req.onsuccess = () => {
+					db.close();
+					resolve((req.result as OfflineQueueItem[]) ?? []);
+				};
+				req.onerror = () => {
+					db.close();
+					reject(req.error ?? new Error('Gagal membaca daftar antrean dari penyimpanan lokal HP.'));
+				};
+			});
+			items.sort((a, b) => a.clientCreatedAt.localeCompare(b.clientCreatedAt));
+			return items;
 		},
 
 		async remove(clientOpId: string): Promise<void> {
@@ -310,10 +316,17 @@ export function createIndexedDbOfflineQueueStorage(): OfflineQueueStorage {
 						db.close();
 						reject(tx.error ?? new Error('Gagal menghapus item dari IndexedDB'));
 					};
+					tx.onabort = () => {
+						db.close();
+						reject(tx.error ?? new Error('Penghapusan item IndexedDB dibatalkan'));
+					};
 				});
 				notifyOfflineQueueChanged();
-			} catch {
-				await fallback.remove(clientOpId);
+			} catch (err) {
+				throw toStorageWriteError(
+					err,
+					'Gagal menghapus catatan dari penyimpanan lokal HP.'
+				);
 			}
 		},
 
@@ -355,10 +368,17 @@ export function createIndexedDbOfflineQueueStorage(): OfflineQueueStorage {
 						db.close();
 						reject(tx.error ?? new Error('Gagal mengosongkan IndexedDB'));
 					};
+					tx.onabort = () => {
+						db.close();
+						reject(tx.error ?? new Error('Pengosongan IndexedDB dibatalkan'));
+					};
 				});
 				notifyOfflineQueueChanged();
-			} catch {
-				await fallback.clearAll();
+			} catch (err) {
+				throw toStorageWriteError(
+					err,
+					'Gagal mengosongkan antrean penyimpanan lokal HP.'
+				);
 			}
 		}
 	};

@@ -6,6 +6,7 @@ import { createMemoryTokenStorage, setTokenStorage } from '../src/lib/client/tok
 import {
 	clearCachedAssets,
 	computeOfflineQueueSummary,
+	createIndexedDbOfflineQueueStorage,
 	createMemoryOfflineQueueStorage,
 	findCachedAssetByCodeOrQr,
 	getCachedAssetsList,
@@ -1167,6 +1168,104 @@ describe('M4 Tahap 4B: Antrean Operasi Offline (/m/*), Unggah Foto Latar Belakan
 			expect(mockSessionStorage.getItem('itam_shift_state_cache')).toBeNull();
 		} finally {
 			(globalThis as unknown as { window?: unknown }).window = prevWindow;
+		}
+	});
+
+	it('11. melempar error jujur saat IndexedDB tersedia tetapi gagal menulis (mis. QuotaExceededError), dan hanya memakai fallback memori ketika IndexedDB tidak didukung (#2)', async () => {
+		const prevIndexedDb = (globalThis as unknown as { indexedDB?: unknown }).indexedDB;
+
+		try {
+			// A. Saat IndexedDB tidak didukung sama sekali (undefined), fallback memori bekerja normal
+			delete (globalThis as unknown as { indexedDB?: unknown }).indexedDB;
+			const noIdbStorage = createIndexedDbOfflineQueueStorage();
+			const fallbackSaved = await enqueueOfflineOperation(
+				{
+					type: 'SHIFT_OPEN',
+					label: 'Buka Shift di Lingkungan Tanpa IndexedDB',
+					payload: { note: 'SSR / Node Fallback' }
+				},
+				noIdbStorage
+			);
+			expect((await noIdbStorage.listAll()).some((i) => i.clientOpId === fallbackSaved.clientOpId)).toBe(
+				true
+			);
+
+			// B. Saat IndexedDB didukung di browser tetapi transaksi tulis gagal (mis. penyimpanan penuh / QuotaExceededError),
+			// adapter WAJIB melempar error yang jujur dan TIDAK boleh diam-diam menyimpan ke fallback memori
+			(globalThis as unknown as { indexedDB: unknown }).indexedDB = {
+				open() {
+					const req: Record<string, unknown> = {
+						result: {
+							objectStoreNames: { contains: () => true },
+							transaction() {
+								const txObj: Record<string, unknown> = {
+									error: new Error('QuotaExceededError: Penyimpanan perangkat penuh'),
+									oncomplete: null as (() => void) | null,
+									onerror: null as (() => void) | null,
+									onabort: null as (() => void) | null,
+									objectStore() {
+										return {
+											put() {
+												queueMicrotask(() => {
+													if (typeof txObj.onabort === 'function') {
+														(txObj.onabort as () => void)();
+													}
+												});
+											},
+											getAll() {
+												const getAllReq: Record<string, unknown> = {
+													result: [],
+													onsuccess: null,
+													onerror: null
+												};
+												queueMicrotask(() => {
+													if (typeof getAllReq.onsuccess === 'function') {
+														(getAllReq.onsuccess as () => void)();
+													}
+												});
+												return getAllReq;
+											}
+										};
+									}
+								};
+								return txObj;
+							},
+							close() {}
+						},
+						onsuccess: null as (() => void) | null,
+						onerror: null as (() => void) | null,
+						onupgradeneeded: null as (() => void) | null
+					};
+					queueMicrotask(() => {
+						if (typeof req.onsuccess === 'function') {
+							(req.onsuccess as () => void)();
+						}
+					});
+					return req;
+				}
+			};
+
+			const idbFailingStorage = createIndexedDbOfflineQueueStorage();
+			await expect(
+				enqueueOfflineOperation(
+					{
+						type: 'LOAN_CREATE',
+						label: 'Pinjam Saat Penyimpanan HP Penuh',
+						payload: { purpose: 'Uji Gagal Tulis' }
+					},
+					idbFailingStorage
+				)
+			).rejects.toThrowError(/Gagal menyimpan operasi ke penyimpanan lokal HP.*Data belum tersimpan/);
+
+			// Pastikan item yang gagal ditulis TIDAK terselip palsu di memori maupun di listAll()
+			const itemsAfterFailedWrite = await idbFailingStorage.listAll();
+			expect(itemsAfterFailedWrite).toHaveLength(0);
+		} finally {
+			if (prevIndexedDb === undefined) {
+				delete (globalThis as unknown as { indexedDB?: unknown }).indexedDB;
+			} else {
+				(globalThis as unknown as { indexedDB: unknown }).indexedDB = prevIndexedDb;
+			}
 		}
 	});
 });

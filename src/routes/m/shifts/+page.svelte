@@ -246,8 +246,11 @@
 					'Tersimpan di Antrean Lokal HP! Pembukaan shift akan dikirim otomatis ke server saat sinyal kembali.';
 				openNote = '';
 			}
-		} catch {
-			errorMsg = 'Gagal menyimpan pembukaan shift ke antrean lokal HP.';
+		} catch (err) {
+			errorMsg =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menyimpan pembukaan shift ke penyimpanan lokal HP. Data belum tersimpan — periksa ruang penyimpanan HP Anda lalu coba lagi.';
 		} finally {
 			submitting = false;
 		}
@@ -318,8 +321,11 @@
 					'Tersimpan di Antrean Lokal HP! Data penutupan shift akan diproses berurutan setelah operasi peminjaman offline sebelumnya terkirim ke server.';
 				closeNote = '';
 			}
-		} catch {
-			errorMsg = 'Gagal menyimpan penutupan shift ke antrean lokal HP.';
+		} catch (err) {
+			errorMsg =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menyimpan penutupan shift ke penyimpanan lokal HP. Data belum tersimpan — periksa ruang penyimpanan HP Anda lalu coba lagi.';
 		} finally {
 			submitting = false;
 		}

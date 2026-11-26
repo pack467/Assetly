@@ -103,17 +103,31 @@
 	}
 
 	async function handleDismissItem(clientOpId: string) {
-		await getOfflineQueueStorage().remove(clientOpId);
-		if (confirmingCancelId === clientOpId) {
-			confirmingCancelId = null;
+		try {
+			await getOfflineQueueStorage().remove(clientOpId);
+			if (confirmingCancelId === clientOpId) {
+				confirmingCancelId = null;
+			}
+			statusFeedback = 'Catatan operasi telah dihapus dari antrean HP.';
+			await refreshQueueList();
+		} catch (err) {
+			statusFeedback =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menghapus catatan dari penyimpanan lokal HP.';
 		}
-		statusFeedback = 'Catatan operasi telah dihapus dari antrean HP.';
-		await refreshQueueList();
 	}
 
 	async function handleResolveConflictAndPickAnother(clientOpId: string) {
-		await getOfflineQueueStorage().remove(clientOpId);
-		await goto('/m/scan');
+		try {
+			await getOfflineQueueStorage().remove(clientOpId);
+			await goto('/m/scan');
+		} catch (err) {
+			statusFeedback =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menghapus catatan dari penyimpanan lokal HP.';
+		}
 	}
 
 	function getShiftSupplementReason(clientOpId: string, assetCode: string): string {
@@ -156,17 +170,29 @@
 					newItem.lastError ||
 					'Pengiriman ulang tutup shift masih memerlukan perhatian.';
 			}
+		} catch (err) {
+			statusFeedback =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal menyimpan pembaruan alasan ke penyimpanan lokal HP.';
 		} finally {
 			syncing = false;
 		}
 	}
 
 	async function handleClearAccepted() {
-		const removed = await getOfflineQueueStorage().clearByStates(['ACCEPTED']);
-		if (removed > 0) {
-			statusFeedback = `${removed} riwayat operasi yang sudah berhasil telah dibersihkan.`;
+		try {
+			const removed = await getOfflineQueueStorage().clearByStates(['ACCEPTED']);
+			if (removed > 0) {
+				statusFeedback = `${removed} riwayat operasi yang sudah berhasil telah dibersihkan.`;
+			}
+			await refreshQueueList();
+		} catch (err) {
+			statusFeedback =
+				err instanceof Error && err.message
+					? err.message
+					: 'Gagal membersihkan riwayat pada penyimpanan lokal HP.';
 		}
-		await refreshQueueList();
 	}
 
 	const filteredItems = $derived.by(() => {
