@@ -168,6 +168,24 @@ export async function updateUser(
 		throw new AppError('NOT_FOUND', 'Pengguna tidak ditemukan.');
 	}
 
+	// #3: Admin tidak boleh menonaktifkan atau menurunkan peran (role) akunnya sendiri
+	if (adminActor.id === userId) {
+		if (input.isActive === false) {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				'Anda tidak dapat menonaktifkan akun Admin Anda sendiri.',
+				{ field: 'isActive' }
+			);
+		}
+		if (input.role !== undefined && input.role !== 'ADMIN') {
+			throw new AppError(
+				'VALIDATION_ERROR',
+				'Anda tidak dapat menurunkan peran (role) akun Admin Anda sendiri.',
+				{ field: 'role' }
+			);
+		}
+	}
+
 	// BR-16: User tidak boleh dinonaktifkan selama masih memegang barang aktif
 	if (input.isActive === false && existing.isActive === true) {
 		const activeLoanItemsCount = await prisma.loanItem.count({
@@ -201,6 +219,45 @@ export async function updateUser(
 	const passwordHash = input.password ? await hashPassword(input.password) : undefined;
 
 	const updated = await prisma.$transaction(async (tx) => {
+		// #3: Kunci advisory & pemeriksaan di dalam transaksi agar selalu tersisa minimal satu ADMIN aktif
+		await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('user_last_admin_guard'))`;
+
+		const freshTarget = await tx.user.findUnique({ where: { id: userId } });
+		if (!freshTarget) {
+			throw new AppError('NOT_FOUND', 'Pengguna tidak ditemukan.');
+		}
+
+		// Pastikan pelaku masih aktif dan berhak mengelola user bila ada aksi paralel antar-admin
+		const freshActor = await tx.user.findUnique({
+			where: { id: adminActor.id },
+			select: { id: true, role: true, isActive: true }
+		});
+		if (!freshActor || !freshActor.isActive || freshActor.role !== 'ADMIN') {
+			throw new AppError('FORBIDDEN', 'Akun Admin pelaku sudah tidak aktif atau tidak berwenang.');
+		}
+
+		const wasActiveAdmin = freshTarget.role === 'ADMIN' && freshTarget.isActive;
+		const effectiveRole = input.role ?? freshTarget.role;
+		const effectiveIsActive = input.isActive ?? freshTarget.isActive;
+		const willRemainActiveAdmin = effectiveRole === 'ADMIN' && effectiveIsActive;
+
+		if (wasActiveAdmin && !willRemainActiveAdmin) {
+			const remainingActiveAdmins = await tx.user.count({
+				where: {
+					id: { not: userId },
+					role: 'ADMIN',
+					isActive: true
+				}
+			});
+			if (remainingActiveAdmins < 1) {
+				throw new AppError(
+					'VALIDATION_ERROR',
+					'Sistem wajib menyisakan minimal satu akun ADMIN yang aktif.',
+					{ field: input.isActive === false ? 'isActive' : 'role' }
+				);
+			}
+		}
+
 		const user = await tx.user.update({
 			where: { id: userId },
 			data: {

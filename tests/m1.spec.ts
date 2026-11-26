@@ -260,6 +260,94 @@ describe('M1: Master Data & Admin Web — CRUD, Impor CSV, Cetak QR, BR-16, BR-1
 			const deactivated = await updateUser(adminActor, holder.user.id, { isActive: false });
 			expect(deactivated.user.isActive).toBe(false);
 		});
+
+		it('Mencegah Admin menonaktifkan atau menurunkan perannya sendiri, serta menjamin minimal satu ADMIN aktif selalu tersisa di dalam transaksi (#3)', async () => {
+			// 1. Admin tidak boleh menonaktifkan akunnya sendiri
+			await expect(
+				updateUser(adminActor, adminActor.id, { isActive: false })
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			// 2. Admin tidak boleh menurunkan peran (role) akunnya sendiri
+			await expect(
+				updateUser(adminActor, adminActor.id, { role: 'OFFICER' })
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			await expect(
+				updateUser(adminActor, adminActor.id, { role: 'BORROWER' })
+			).rejects.toMatchObject({
+				code: 'VALIDATION_ERROR',
+				status: 400
+			});
+
+			// 3. Uji penjaga di dalam transaksi saat hanya ada tepat 2 ADMIN aktif yang saling menonaktifkan secara paralel:
+			// Matikan sementara admin aktif lain di luar pasangan uji agar tepat 2 ADMIN yang aktif
+			const suffix = randomUUID().slice(0, 8);
+			const secondAdminRes = await createUser(adminActor, {
+				name: 'Second Admin Guard Test',
+				email: `second-admin-${suffix}@example.com`,
+				password: 'StrongPassword!123',
+				role: 'ADMIN',
+				isActive: true
+			});
+			const secondAdminActor: PolicyUser = {
+				id: secondAdminRes.user.id,
+				role: 'ADMIN',
+				isActive: true
+			};
+
+			const otherExistingAdmins = await prisma.user.findMany({
+				where: {
+					role: 'ADMIN',
+					isActive: true,
+					id: { notIn: [adminActor.id, secondAdminActor.id] }
+				},
+				select: { id: true }
+			});
+			if (otherExistingAdmins.length > 0) {
+				await prisma.user.updateMany({
+					where: { id: { in: otherExistingAdmins.map((a) => a.id) } },
+					data: { isActive: false }
+				});
+			}
+
+			try {
+				// Admin 1 menonaktifkan Admin 2 DAN Admin 2 menonaktifkan Admin 1 pada saat bersamaan
+				const crossDeactivate = await Promise.allSettled([
+					updateUser(adminActor, secondAdminActor.id, { isActive: false }),
+					updateUser(secondAdminActor, adminActor.id, { isActive: false })
+				]);
+
+				const fulfilled = crossDeactivate.filter((r) => r.status === 'fulfilled');
+				const rejected = crossDeactivate.filter((r) => r.status === 'rejected');
+				expect(fulfilled).toHaveLength(1);
+				expect(rejected).toHaveLength(1);
+
+				// Pastikan tetap ada minimal 1 ADMIN aktif di database
+				const remainingActiveCount = await prisma.user.count({
+					where: { role: 'ADMIN', isActive: true }
+				});
+				expect(remainingActiveCount).toBeGreaterThanOrEqual(1);
+
+				// Pulihkan kedua admin uji agar test berikutnya tetap memiliki adminActor aktif
+				await prisma.user.update({
+					where: { id: adminActor.id },
+					data: { isActive: true, role: 'ADMIN' }
+				});
+			} finally {
+				if (otherExistingAdmins.length > 0) {
+					await prisma.user.updateMany({
+						where: { id: { in: otherExistingAdmins.map((a) => a.id) } },
+						data: { isActive: true }
+					});
+				}
+			}
+		});
 	});
 
 	describe('4. CRUD Barang, Kode & QR Token Acak (BR-23), Cetak Ulang QR (BR-24), & Status Khusus (BR-11)', () => {
